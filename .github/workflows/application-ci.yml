@@ -1,0 +1,136 @@
+name: Application CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  MIX_ENV: test
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_tests: ${{ steps.plan.outputs.has_tests }}
+      timing_key: ${{ steps.history.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Restore timings from a successful main run
+        id: history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TIMING_INPUTS: ${{ hashFiles('.tool-versions', 'mix.lock', 'mix.exs', '.github/workflows/application-ci.yml', 'test/support/ci_timing_formatter.ex') }}
+        run: |
+          key="test-timing-${ImageOS}-${ImageVersion}-${TIMING_INPUTS}"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          prior=$(gh run list --workflow application-ci.yml --branch main --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty') || exit 0
+          if [[ -n "$prior" ]]; then
+            gh run download "$prior" --pattern "${key}-*" --dir timing-history || rm -rf timing-history
+          fi
+      - id: plan
+        run: python3 .github/scripts/plan_tests.py >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CI_CACHE_WRITER: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/beam
+      - run: mix hex.audit
+      - run: mix format --check-formatted
+      - run: mix compile --warnings-as-errors
+
+  test:
+    name: ExUnit shard ${{ matrix.shard }}
+    needs: [plan, build]
+    if: needs.plan.outputs.has_tests == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.4-pg18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_HOST: 127.0.0.1
+      TEST_DATABASE_PORT: '55433'
+      TEST_DATABASE_USERNAME: vgas_test
+      TEST_DATABASE_NAME: vgas_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/beam
+      - name: Create isolated TEST database
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          docker exec -i "$POSTGRES_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U postgres <<SQL
+          CREATE ROLE vgas_test LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$password';
+          CREATE DATABASE vgas_test OWNER vgas_test;
+          \connect vgas_test
+          CREATE EXTENSION vector;
+          SQL
+          echo "TEST_DATABASE_PASSWORD=$password" >> "$GITHUB_ENV"
+      - name: Run assigned test files
+        env:
+          TEST_FILES: ${{ toJSON(matrix.files) }}
+          CI_TIMING_OUTPUT: timing.json
+        run: |
+          mapfile -d '' -t paths < <(python3 -c 'import json, os, sys; sys.stdout.buffer.write(b"".join(os.fsencode(path) + b"\0" for path in json.loads(os.environ["TEST_FILES"])))')
+          (( ${#paths[@]} > 0 ))
+          mix test --seed 0 --formatter ExUnit.CLIFormatter --formatter VoelgoedAi.CITimingFormatter "${paths[@]}"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: ${{ needs.plan.outputs.timing_key }}-shard-${{ matrix.shard }}
+          path: timing.json
+          if-no-files-found: error
+          retention-days: 21
+
+  gate:
+    name: Application CI gate
+    if: always()
+    needs: [plan, build, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      PLAN: ${{ needs.plan.result }}
+      BUILD: ${{ needs.build.result }}
+      TEST: ${{ needs.test.result }}
+      HAS_TESTS: ${{ needs.plan.outputs.has_tests }}
+    steps:
+      - run: |
+          [[ "$PLAN" == success && "$BUILD" == success ]]
+          if [[ "$HAS_TESTS" == true ]]; then
+            [[ "$TEST" == success ]]
+          else
+            [[ "$HAS_TESTS" == false && "$TEST" == skipped ]]
+          fi

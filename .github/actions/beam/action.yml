@@ -1,0 +1,42 @@
+name: Prepare locked BEAM dependencies
+description: Restore the exact dependency cache or build from the lockfile
+runs:
+  using: composite
+  steps:
+    - uses: erlef/setup-beam@v1
+      with:
+        version-file: .tool-versions
+        version-type: strict
+    - id: platform
+      shell: bash
+      run: echo "image=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+    - id: cache
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          deps
+          _build/test/lib
+        key: beam-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.platform.outputs.image }}-${{ hashFiles('.tool-versions', 'mix.exs', 'mix.lock', 'config/**/*.exs', '.github/actions/beam/action.yml') }}
+    - name: Prepare dependencies
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+      run: |
+        prepare() {
+          mix deps.get --check-locked && mix deps.unlock --check-unused && mix deps.compile
+        }
+        if [[ "$CACHE_HIT" != true ]]; then
+          rm -rf deps _build/test
+          prepare
+        elif ! prepare; then
+          rm -rf deps _build/test
+          prepare
+        fi
+    - uses: actions/cache/save@v4
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' && env.CI_CACHE_WRITER == 'true'
+      with:
+        path: |
+          deps
+          _build/test/lib
+        key: ${{ steps.cache.outputs.cache-primary-key }}

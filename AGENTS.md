@@ -17,6 +17,26 @@ Before editing, read the repository's actual instructions, current slice brief a
 - No production credentials, personal data, raw prompts, transcripts or customer payloads in Git, fixtures, CI or logs. Use sanitised fixtures and separate test keys with explicit budget. Never expose secrets in reports. Store minimal operational metadata. No production changes, hosting purchases, DNS changes or deployments without explicit approval. Default automation disabled; assisted fallback if external safety unresolved.
 - Keep changes focused. Raise unrelated findings in existing tracker if authorised, otherwise report them; do not refactor unrelated code. Parallelise only independent slices, never overlapping migration/resource edits.
 
+## Local bootstrap and parallel work
+
+1. Run `git status -sb` and identify the assigned branch or worktree. Use the Erlang and Elixir versions in `.tool-versions`. If the shell uses different versions, run commands through `mise exec -- <command>`.
+2. Read `.devcore/project.conf` and `.devcore/render-map.tsv`, then run `devcore-project doctor`. If the allocation or generated environment is missing or stale, run `devcore-project plan`, then `devcore-project activate` and recheck. Each checkout needs its own ignored `.env.local`. DevCore supplies credentials.
+3. Run `devcore-project run dev -- mix setup` and `devcore-project run test -- mix test`. Both use pre-provisioned databases and apply migrations. Verify locked dependencies with `mix deps.get --check-locked` and run `mix hex.audit` in a separate invocation. Keep the AshAuthentication and Phoenix adapter pins compatible when changing either version.
+4. For a runtime check, choose a free project HTTP port as described below and run `PORT=4186 devcore-project run dev -- mix phx.server`, substituting the assigned port. Confirm `curl --fail http://127.0.0.1:4186/health` returns HTTP 200 on that port. The health route checks HTTP liveness. Use the Repo tests to verify database access and confirm pgvector availability before starting vector-backed work.
+
+### Port allocation
+
+- DEV PostgreSQL uses `127.0.0.1:55432`, database and role `vgas_dev`.
+- TEST PostgreSQL uses `127.0.0.1:55433`, database and role `vgas_test`. ExUnit uses this allocation even when a DEV server is running.
+- Use loopback ports `4186–4205` for local Phoenix sessions. The coordinating agent assigns distinct ports before dispatching parallel work, then each agent checks its port with `ss -ltn` before binding. If it is occupied or startup reports `:eaddrinuse`, coordinate another free port. Leave the existing listener running.
+- Use separate worktrees for independent changes. HTTP ports isolate listeners only. Coordinate local database runs against the shared allocation. Run migration-changing or otherwise database-mutating work serially per database unless separate database allocations have been approved and verified.
+
+### Cleanup and handoff
+
+- Stop the servers, watchers and other processes you started unless the user asks to keep one running. Confirm your ports are free. If a process stays up by request, record its port, purpose and how to stop it.
+- Remove temporary files you created once they are no longer needed. Preserve DevCore services, databases, secrets, other agents' processes, and uncommitted work. Remove a temporary worktree only after checking that its work is retained and the worktree is clean.
+- Run `git status -sb` at handoff. Report the branch, pending changes, checks run and anything still running or blocked. Consult [Application CI](docs/development/application-ci.md) when changing test routing, cache behavior or the GitHub Actions gate.
+
 ## Mandatory verification for each slice
 
 Run supported equivalents for formatting (`mix format --check-formatted`), compile warnings-as-errors, relevant ExUnit and real PostgreSQL tests, fresh/upgrade migration checks and generated snapshot consistency, dependency/advisory and secret scans, Compose validation where applicable. Discover exact tasks against pinned versions; do not claim a task ran if missing. Test negative auth, error paths and concurrency for affected contracts; deterministic external fakes in CI, bounded separate live smoke tests only with approved keys. Do not weaken tests to pass CI. Report exact commands, exit codes, tests and skipped/blocked tests; no false green status. Redact outputs. Do not call untested code implemented-and-verified.
