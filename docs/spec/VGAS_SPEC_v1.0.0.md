@@ -4,6 +4,26 @@ Document: VGAS-SPEC | Version: 1.0.0 | Date: 2026-11-25
 
 Status: **Architecture frozen; 38/38 decisions accepted. Implementation and live verification pending.**
 
+## Amendment A-009 — Public repository and reviewed merges
+
+Accepted by the owner on 2026-11-25. The standing execution authority on
+Plane VGAS-1 records this decision.
+
+- G034 uses the intentionally public GitHub repository
+  `Carpe-Diem-Media/voelgoed-ai-support`. Source and documentation may
+  be published when they contain no secrets or confidential data.
+- The orchestrator may merge a source PR after an independent subagent
+  reviews the exact complete candidate and applicable authorities, all
+  required approvals are recorded, all objections and blockers are
+  resolved, and all required CI passes on the exact candidate head.
+  Follow the merge procedure in `AGENTS.md`. Plane states track delivery
+  and confer no merge authority.
+- Paid inference, deployment, and processing real customer data each
+  require separate authorization.
+
+This amendment supersedes the earlier private-repository proposal and
+records the standing PR merge authority for G034.
+
 ## Amendment A-008 — Final acceptance and freeze
 
 The user explicitly accepted G032–G038, all Option B, and requested the implementation pack and a lean MVP. The full A-007 final-pass contracts are incorporated, subject to their stated verification gates and provisional operational defaults. G001–G031 and VGAS-P001 remain accepted. The historical Dify-first design is superseded per A-001 and subsequent accepted decisions. No further general grilling is required. Start VGAS-000; amendments only for material findings or deliberate scope changes.
