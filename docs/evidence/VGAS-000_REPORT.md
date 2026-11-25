@@ -263,3 +263,118 @@ Their request bodies, provider responses, usage and prices are synthetic.
   disposable F01 cleanup. The new inference tests use no live transport.
 - The read-only model-list check still awaits confirmation of the
   permission change. Credential configuration remains PARTIALLY_VERIFIED.
+
+## F02–F03 durable local run
+
+2026-11-25. VGAS-3 continues from the accepted F01 baseline and temporary
+G036 exception. This run used the standard DevCore TEST allocation
+(`vgas_test`, PostgreSQL 18.6). No shared service was reconfigured. The
+new test-only ledger uses randomly named tables owned by the test role,
+with no migration or production entry point. A post-suite query found
+zero matching feasibility tables. All tests used synthetic inputs and
+deterministic transports.
+
+### F02 · Local PASS, provider verification pending
+
+The supported seam is Req 0.7.5's `adapter` option in ReqLLM 1.31.0
+`req_http_options`. Ash AI 1.5.6's `transform_flow` supplies those options
+per generation attempt. ReqLLM wraps and calls the original adapter. The
+spike delegates only to a local Req.Test plug. It captures a whitelisted
+HTTP result before ReqLLM decoding and Ash business validation, then
+returns the original result. The Ash AI generation path needed no
+direct ReqLLM fallback. The existing ReqLLM embedding path uses the
+same adapter.
+
+Generation uses top-level `openai_structured_output_mode: :json_schema`,
+`max_completion_tokens: 500`, `reasoning_effort: :none`,
+`provider_options: [store: false]` and `max_retries: 0`. The wire request
+has strict JSON schema, no tools, no previous response ID, no streaming,
+and `max_output_tokens: 500`. Embedding uses `dimensions: 1536` and
+`return_usage: true`, and accepts a single input. The pinned embedding
+API rejects `max_retries`. Both paths disable Req retries and redirects
+and set five-second whole-call and receive timeouts. A fake HTTP 503
+produced one outbound invocation per attempt.
+
+The reservation ID identifies the internal attempt. Evidence contains
+the returned model, HTTP status, duration, whitelisted usage, supplied
+provider request/response IDs and transport classification. The
+application disposition is recorded separately, so rejected output
+can still be charged. Missing identifiers remain null. If both IDs
+are absent, usage is missing, or a supplied model differs, the attempt
+stays unknown. A response with correlated usage can settle even on
+HTTP failure. The requested allowlisted model supplies the price when
+the response omits its model. No request/response bodies, prompts or
+credentials are stored. Timeout is simulated after dispatch rather than
+measured against OpenAI.
+
+Source references: [Req adapter 0.7.5](https://hexdocs.pm/req/0.7.5/Req.html),
+[ReqLLM 1.31.0](https://hexdocs.pm/req_llm/1.31.0/),
+[Ash AI 1.5.6](https://hexdocs.pm/ash_ai/1.5.6/). Inspected installed
+`ReqLLM.Transport.attach/1`, `Req.merge/2`, and
+`AshAi.Actions.Prompt.apply_transform_flow/3`.
+
+### F03 · Local PASS at spike scope, provider verification pending
+
+The pinned Postgrex 0.23.0 path uses the existing AshPostgres Repo.
+A short table-lock transaction serializes daily, monthly and concurrency
+admission even with an empty ledger. Four checked-out connections with
+distinct PostgreSQL backend PIDs raced for one allowance. Exactly one
+reserved and three were denied. The transaction commits before dispatch.
+A second committed claim fences duplicate or hidden retries. The
+transport refuses an outer Repo transaction. No lock is held across
+the simulated HTTP call.
+
+The tests kill workers after reservation, after claiming possible
+execution, and after the adapter commits trusted usage but before
+settlement. A fresh process recovered their rows. Recovery releases
+only a reservation whose state proves the worker never claimed a send.
+An uncertain attempt holds its ceiling across UTC day and month rollover
+and frees its local concurrency slot. Late reliable evidence can settle
+an unknown attempt once. Racing settlement callers preserve one charge
+and a second evidence write is rejected. Over-ceiling evidence inhibits
+new claims and admissions, even before settlement. With zero allowance,
+unknown pricing, a missing ledger, or a rejected wire request, no
+provider transport runs. The spike recovery caller must know that the
+worker returned or stopped. Production recovery needs a trusted worker
+lease/fence, durable governance storage and authorized reconciliation.
+
+Price snapshot `vgas-000-openai-standard-v1`, checked 2026-11-25,
+covers the global Standard OpenAI endpoint and the two fixed profiles.
+Luna's published Standard base rates are 100 input and 500 output
+nano-USD per token. Admission uses 500 input and 750 output nano-USD,
+covering published long-context and 12-hour cache-write rates. The
+1,050,000-token full context ceiling covers instructions, history,
+knowledge and schema overhead without a tokenizer estimate. The
+500-token output limit includes reasoning tokens. The conservative
+ceiling is 525,375,000 nano-USD. The 8192-token single embedding limit
+at 20 nano-USD per token reserves 163,840 nano-USD. These conversions
+are exact integers with no fractional rounding. Settlement computes
+a conservative charge from reported usage and the chosen snapshot,
+not an invoice amount. The Luna ceiling exceeds the default $0.25
+development daily budget, so that budget would deny generation.
+Lowering the reserve for a live test would require a separately verified
+tighter cost bound or an explicitly approved budget.
+
+Pricing and limits: [Luna model](https://developers.openai.com/api/docs/models/gpt-6-luna),
+[OpenAI pricing](https://developers.openai.com/api/docs/pricing),
+[Responses output limit](https://developers.openai.com/api/reference/resources/responses/methods/create),
+[Embedding model](https://developers.openai.com/api/docs/models/text-embedding-3-small),
+[Embedding input limit](https://developers.openai.com/api/reference/typescript/resources/embeddings/methods/create).
+
+### Commands and next gate
+
+- `env -u OPENAI_API_KEY devcore-project run test -- mise exec -- mix test`
+  exited 0 with 44 tests passed. The test suite exercises PostgreSQL
+  recovery and admission plus real Ash AI/ReqLLM request handling through
+  deterministic fake HTTP responses.
+- `mise exec -- mix format --check-formatted`, `devcore-project run dev --
+  mise exec -- mix compile --warnings-as-errors`, `mise exec -- mix deps.get
+  --check-locked`, `mise exec -- mix hex.audit`, and `git diff --check`
+  exited 0. The lockfile was unchanged and Hex reported no advisories.
+- `MIX_ENV=test devcore-project run test -- mise exec -- mix run` queried
+  `pg_tables` in the current schema and found zero per-test spike tables.
+- F04–F05 / VGAS-4 is next after the applicable local review gate. The
+  ticket requires an isolated PostgreSQL target with pgvector. The prior
+  disposable approval covered F01 and the shared rollout remains separate.
+  Actual OpenAI model listing and provider tests remain pending. No paid
+  calls, public push, merge or deployment occurred.
