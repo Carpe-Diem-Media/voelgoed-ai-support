@@ -1378,8 +1378,12 @@ Corrected in this branch:
 - The report stated the timeout bound without the real-client limits
   now recorded under the Req timeout paragraph.
 - `decide_current/4` repeated the ingress deadline check after
-  `session_for/3`. The guard under the receipt row lock already covers
-  it, so the unreachable branch was removed.
+  `session_for/3`. The inner check was redundant with the outer guard
+  evaluated under the receipt row lock. The downstream deadline checks
+  in `reserve_read`, `claim` and `authorize_dispatch` cover a session-lock
+  wait that crosses the deadline.
+
+PR #5 review evidence records that merged head `c291faa` passed the full suite with 169 passed and five skipped, planned eight shards, and passed [Application CI run 45688327986](https://github.com/Carpe-Diem-Media/voelgoed-ai-support/actions/runs/45688327986). This supersedes the earlier 135-test and seven-shard figures.
 
 Carried forward without a change to this spike:
 
