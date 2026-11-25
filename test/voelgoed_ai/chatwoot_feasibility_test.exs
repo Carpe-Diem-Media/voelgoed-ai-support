@@ -311,8 +311,13 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
         {"missed takeover", %{"status" => "open"}, "human_active", "ownership_changed"},
         {"resolution", %{"status" => "resolved"}, "closed", "ownership_changed"},
         {"missed reassignment while pending",
-         %{"meta" => %{"sender" => %{"id" => 4}, "assignee" => %{"type" => "user", "id" => 6}}},
-         "human_active", "ownership_changed"},
+         %{
+           "meta" => %{
+             "sender" => %{"id" => 4},
+             "assignee_type" => "User",
+             "assignee" => %{"id" => 6}
+           }
+         }, "human_active", "ownership_changed"},
         {"wrong account", %{"account_id" => 9}, "bot_active", "guard_denied"},
         {"wrong inbox", %{"inbox_id" => 9}, "bot_active", "guard_denied"},
         {"wrong conversation", %{"id" => 9}, "bot_active", "guard_denied"},
@@ -322,7 +327,8 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
          %{
            "meta" => %{
              "sender" => %{"id" => 4},
-             "assignee" => %{"type" => "agent_bot", "id" => 9}
+             "assignee_type" => "AgentBot",
+             "assignee" => %{"id" => 9}
            }
          }, "bot_active", "guard_denied"},
         {"newer input", %{"last_non_activity_message" => %{"id" => 102}}, "bot_active",
@@ -335,6 +341,56 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
       assert %{state: unquote(expected_state)} = session(ctx)
 
       assert %{state: "cancelled", attempts: 0, reason: unquote(reason)} =
+               ChatwootStore.delivery(ctx.prefix, id)
+
+      assert_fake_calls(ctx, [:get, :get])
+    end
+  end
+
+  test "a user assignment on the first customer input prevents a reply", ctx do
+    human =
+      pending(%{
+        "meta" => %{
+          "sender" => %{"id" => 4},
+          "assignee_type" => "User",
+          "assignee" => %{"id" => 6}
+        }
+      })
+
+    ctx = fake(ctx, [get(human)])
+    assert submit(ctx).status == 204
+    assert drain(ctx, :f06_ingress).success == 1
+    assert %{state: "human_active"} = session(ctx)
+    assert counts(ctx) == [1, 1, 1, 0]
+    assert_fake_calls(ctx, [:get])
+  end
+
+  for {status, expected_state} <- [
+        {"pending", "bot_active"},
+        {"open", "human_active"},
+        {"resolved", "closed"},
+        {"snoozed", "bot_active"}
+      ] do
+    test "an unassigned #{status} conversation cannot receive a reply", ctx do
+      ctx = fake(ctx, [get(pending()), get(unassigned(unquote(status)))])
+      id = prepare(ctx)
+      assert drain(ctx, :f06_delivery).success == 1
+      assert %{state: "cancelled", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+      assert %{state: unquote(expected_state)} = session(ctx)
+      assert_fake_calls(ctx, [:get, :get])
+    end
+  end
+
+  for {label, type} <- [{"unrecognised", "Group"}, {"missing", nil}] do
+    test "a pending conversation with #{label} assignee_type cannot receive a reply", ctx do
+      remote = pending()
+      meta = Map.delete(remote["meta"], "assignee_type")
+      meta = if unquote(type), do: Map.put(meta, "assignee_type", unquote(type)), else: meta
+      ctx = fake(ctx, [get(remote), get(%{remote | "meta" => meta})])
+      id = prepare(ctx)
+      assert drain(ctx, :f06_delivery).success == 1
+
+      assert %{state: "cancelled", attempts: 0, reason: "guard_denied"} =
                ChatwootStore.delivery(ctx.prefix, id)
 
       assert_fake_calls(ctx, [:get, :get])
@@ -378,6 +434,126 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert %{state: "human_active"} = session(ctx)
     assert drain(ctx, :f06_delivery).success == 1
     assert %{state: "cancelled", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+    assert_fake_calls(ctx, [:get, :get])
+  end
+
+  for replay? <- [false, true] do
+    test "first human observation stays sticky (replay: #{replay?})", ctx do
+      replay? = unquote(replay?)
+      script = [get(unassigned("open")), get(pending())]
+      script = if replay?, do: script ++ [get(pending())], else: script
+      ctx = fake(ctx, script)
+
+      outbound =
+        payload(%{
+          "id" => 100,
+          "message_type" => "outgoing",
+          "sender" => %{"type" => "user", "id" => 6}
+        })
+
+      assert submit(ctx, body: outbound).status == 204
+      assert drain(ctx, :f06_ingress).success == 1
+
+      if replay? do
+        assert submit(ctx, body: outbound).status == 204
+        assert [1, 1, _, 0] = counts(ctx)
+        assert {:ok, :ok} = ChatwootDelivery.decide(ctx, event_id(ctx, 100))
+      end
+
+      assert submit(ctx).status == 204
+      assert drain(ctx, :f06_ingress).success == 1
+      assert counts(ctx) == [2, 2, 1, 0]
+      assert drain(ctx, :f06_delivery).success == 0
+      assert %{state: "human_active", epoch: 1} = session(ctx)
+      assert_fake_calls(ctx, List.duplicate(:get, length(script)))
+    end
+  end
+
+  test "a handoff can still send after the 45 second reply deadline", ctx do
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(pending()),
+        handoff(response(200, %{"payload" => %{"current_status" => "open"}})),
+        get(unassigned("open"))
+      ])
+
+    id = prepare(ctx)
+    assert drain(%{ctx | now: fn -> DateTime.add(@now, 46) end}, :f06_delivery).success == 1
+    assert %{state: "sent", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+    assert %{state: "human_active"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  test "at the handoff recovery deadline an unsent intent fails and stays inhibited", ctx do
+    later_input = pending(%{"last_non_activity_message" => %{"id" => 102}})
+    ctx = fake(%{ctx | decision: "handoff"}, [get(pending()), get(pending()), get(later_input)])
+    id = prepare(ctx)
+    expired = %{ctx | now: fn -> DateTime.add(@now, 300) end}
+
+    assert drain(expired, :f06_delivery).success == 1
+
+    assert %{
+             state: "failed",
+             attempts: 0,
+             reason: "handoff_deadline_exceeded",
+             finished_at: %DateTime{}
+           } =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending", active_event: nil} = session(ctx)
+    assert :ok = ChatwootDelivery.deliver(expired, id)
+    assert submit(expired, body: payload(%{"id" => 102})).status == 204
+    assert drain(%{expired | decision: "reply"}, :f06_ingress).success == 1
+    assert counts(ctx) == [2, 3, 1, 1]
+    assert_fake_calls(ctx, [:get, :get, :get])
+  end
+
+  test "handoff exhausts three safe preflight attempts without issuing a status POST", ctx do
+    timeout = {:get, @path, write_result(:timeout)}
+    ctx = fake(%{ctx | decision: "handoff"}, [get(pending()), timeout, timeout, timeout])
+    id = prepare(ctx)
+
+    assert drain(ctx, :f06_delivery).failure == 1
+    assert %{state: "pending", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+    assert drain(ctx, :f06_delivery, with_scheduled: true).failure == 1
+    assert %{state: "pending", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+    assert drain(ctx, :f06_delivery, with_scheduled: true).success == 1
+
+    assert %{state: "failed", attempts: 0, reason: "handoff_preflight_exhausted"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending", active_event: nil} = session(ctx)
+    assert :ok = ChatwootDelivery.deliver(ctx, id)
+    assert_fake_calls(ctx, [:get, :get, :get, :get])
+  end
+
+  test "handoff can claim its first write after a safe preflight retry", ctx do
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        {:get, @path, write_result(:timeout)},
+        get(pending()),
+        handoff(write_result(:timeout))
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).failure == 1
+    assert drain(ctx, :f06_delivery, with_scheduled: true).success == 1
+    assert %{state: "unknown", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+    assert :ok = ChatwootDelivery.deliver(ctx, id)
+    assert_fake_calls(ctx, [:get, :get, :get, :handoff])
+  end
+
+  test "unknown handoff assignment fails closed without issuing a status POST", ctx do
+    ctx = fake(%{ctx | decision: "handoff"}, [get(pending()), get(unassigned("pending"))])
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).success == 1
+
+    assert %{state: "failed", attempts: 0, reason: "handoff_ownership_unverified"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending"} = session(ctx)
     assert_fake_calls(ctx, [:get, :get])
   end
 
@@ -530,7 +706,8 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert_fake_calls(ctx, [:get, :get, :reply, :get, :get, :get])
   end
 
-  test "handoff timeout stays inhibited until a read confirms the goal", ctx do
+  test "handoff timeout stays inhibited until a read confirms the goal after the reply deadline",
+       ctx do
     ctx =
       fake(%{ctx | decision: "handoff"}, [
         get(pending()),
@@ -544,7 +721,8 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert %{state: "unknown", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
     assert %{state: "handoff_pending"} = session(ctx)
     assert :ok == ChatwootDelivery.deliver(ctx, id)
-    assert {:ok, _} = ChatwootDelivery.reconcile(ctx, id)
+    advanced = %{ctx | now: fn -> DateTime.add(@now, 46) end}
+    assert {:ok, _} = ChatwootDelivery.reconcile(advanced, id)
 
     assert %{state: "sent", attempts: 1, reason: "goal_observed"} =
              ChatwootStore.delivery(ctx.prefix, id)
@@ -663,11 +841,11 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
   end
 
   defp intent_id(ctx, message \\ 101) do
-    %{rows: [[id, %{"delivery_id" => same_id} = args, 1]]} =
+    %{rows: [[id, %{"delivery_id" => same_id} = args]]} =
       sql!(
         ctx,
         """
-        SELECT d.id::text, j.args, j.max_attempts
+        SELECT d.id::text, j.args
         FROM @schema.deliveries d
         JOIN @schema.inbound_events e ON d.event_id = e.id
         JOIN @schema.oban_jobs j ON j.args->>'delivery_id' = d.id::text
@@ -697,12 +875,12 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     Repo.query!(String.replace(statement, "@schema", ctx.prefix), params, log: false)
   end
 
-  defp drain(ctx, queue) do
+  defp drain(ctx, queue, opts \\ []) do
     key = {ChatwootDelivery, ctx.prefix}
     Process.put(key, ctx)
 
     try do
-      Oban.drain_queue(ctx.oban, queue: queue, with_safety: false)
+      Oban.drain_queue(ctx.oban, [queue: queue, with_safety: false] ++ opts)
     after
       Process.delete(key)
     end
@@ -796,11 +974,19 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
         "id" => 3,
         "status" => "pending",
         "can_reply" => true,
-        "meta" => %{"sender" => %{"id" => 4}, "assignee" => %{"type" => "agent_bot", "id" => 5}},
+        "meta" => %{
+          "sender" => %{"id" => 4},
+          "assignee_type" => "AgentBot",
+          "assignee" => %{"id" => 5}
+        },
         "last_non_activity_message" => %{"id" => 101}
       },
       changes
     )
+  end
+
+  defp unassigned(status) do
+    pending(%{"status" => status, "meta" => %{"sender" => %{"id" => 4}}})
   end
 
   defp reply_body do

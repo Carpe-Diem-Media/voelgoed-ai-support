@@ -546,6 +546,11 @@ endpoint runs with `server: false`. The Req adapter has no network path.
   and [webhook trigger](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/lib/webhooks/trigger.rb).
   It signs timestamp, dot, and the original JSON bytes, with an inclusive
   300-second window in either direction and a 64 KiB body limit.
+  The conversation GET fixtures follow the pinned
+  [conversation serializer](https://raw.githubusercontent.com/chatwoot/chatwoot/9f920b549c14491a4e587687a3eed5d21c6ccc7d/app/views/api/v1/conversations/partials/_conversation.json.jbuilder),
+  which puts `AgentBot` or `User` in `meta.assignee_type` and the ID
+  in `meta.assignee.id`. The serializer omits both assignee fields for an
+  unassigned CE conversation.
 
 ### Local acceptance
 
@@ -575,16 +580,46 @@ endpoint runs with `server: false`. The Req adapter has no network path.
    exactly one POST for each successful reply and handoff. The handoff
    test required a confirming GET, and a forced rollback restored the
    prior epoch and pending reply. A committed handoff intent cancelled the
-   unsent reply. Scope drift, expired or fenced work, a timed-out GET,
-   newer input, resolution and human takeover produced zero POSTs for
-   those paths. Human ownership stayed sticky after stale pending state.
+   unsent reply. Scope drift, expired or fenced reply work, a timed-out
+   reply ownership GET, newer input, resolution and human takeover
+   produced zero POSTs for those paths.
    A simulated remote commit followed by timeout, disconnect, 503,
    redirect, malformed acceptance or a failed read-back each left an
    UNKNOWN intent after one POST. Claim expiry after simulated process
    death, replay of both worker phases, a new event and read-only
    reconciliation produced no additional POST for the unknown reply.
-   A later qualified GET confirmed the unknown handoff without repeating
-   the status POST.
+   A read-only reconciliation at 46 seconds confirmed that an unknown
+   handoff had reached its goal. The adapter still recorded one status POST.
+
+### Review corrections
+
+1. **Ownership response.** A configured bot in a qualified pending
+   conversation can send. Human assignment at admission or before
+   delivery prevents a POST. Unassigned pending, open, resolved and
+   snoozed fixtures also prevent a POST. Missing or unrecognised
+   `assignee_type` denies a pending reply. Unverified handoff ownership
+   records a failure and keeps the session inhibited.
+2. **First human observation.** A signed human outbound event followed by a
+   qualified GET showing `open` creates a durable human-owned session even
+   before the first customer message. A later bot-assigned pending GET
+   leaves that session human-owned with zero POSTs. The duplicate webhook
+   and ingress job replay exercise the same sequence.
+3. **Handoff recovery.** A reply expires 45 seconds after receipt. G013's
+   five-minute handoff window starts when the intent is created. Oban
+   allows up to three pre-write reads on transport failures. The worker
+   can send at 46 seconds. At the handoff deadline or after the third
+   failed read, it records a terminal FAILED intent with a reason code and
+   keeps the session in HANDOFF_PENDING for operator inspection. The spike
+   stores that signal locally. It has no staff notification integration.
+   The durable write claim still allows one POST. Ambiguous writes stay
+   UNKNOWN pending read-only reconciliation.
+
+Each correction's tests were rerun with that fix temporarily reverted
+while the other fixes were in place. Under seed 0, the ownership case
+failed because the bot GET produced no reply intent (0/1, exit 2).
+Both first-observation cases queued a reply intent (0/2, exit 2).
+The five handoff tests failed on cancellation or missing preflight
+retries (0/5, exit 2). All passed after restoration.
 
 The optional loopback Bandit request was omitted. The raw bytes reached
 the test endpoint through Phoenix.ConnTest. A signed human outbound event,
@@ -597,24 +632,24 @@ and exercises recovery after simulated process death.
 
 The three focused runs used
 `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs`
-with `--seed 0`, `--seed 21427`, and no seed flag (ExUnit chose 793636).
-Each exited 0 with 34 passed, zero failures and zero skips.
+with `--seed 0`, `--seed 21427`, and `--seed 793636`.
+Each exited 0 with 48 passed, zero failures and zero skips.
 
-- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
-  exited 0 with seed 884620. Of 83 tests, 78 passed and the five pre-existing
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --seed 884620`
+  exited 0. Of 97 tests, 92 passed and the five pre-existing
   F04 disposable tests skipped.
 - `devcore-project doctor`, `mise exec -- mix format --check-formatted`,
   `MIX_ENV=test mise exec -- mix compile --warnings-as-errors`,
   `mise exec -- mix deps.get --check-locked`, `mise exec -- mix hex.audit`,
   and `git diff --check` exited 0. Hex found no security advisories or
-  retired packages. The fixture diff was checked for secrets and actual
-  customer data.
+  retired packages. `mise exec gitleaks@8.30.1 -- gitleaks git --staged --redact`
+  exited 0 with no leaks. The fixtures use synthetic IDs and data.
 - `python3 .github/scripts/plan_tests.py` exited 0 and assigned
   `test/voelgoed_ai/chatwoot_feasibility_test.exs` to shard 2.
-- A `psql -X -v ON_ERROR_STOP=1` session through
-  `devcore-project run test -- env -u OPENAI_API_KEY` ran
-  `SELECT count(*) FROM pg_namespace WHERE left(nspname, 9) = 'vgas_f06_';`
-  and returned 0 with exit 0. No Phoenix HTTP listener was started.
+- `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix run -e ...`
+  used the Repo to check the TEST role and database, then counted schemas
+  with `left(nspname, 9) = 'vgas_f06_'`. The count and exit status were both
+  0. No Phoenix HTTP listener was started.
 
 ### F07 live gaps
 

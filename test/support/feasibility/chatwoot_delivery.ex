@@ -19,15 +19,19 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     Store.decide(ctx, event_id, event, ownership(ctx, event, event.purpose == "input"))
   end
 
-  def deliver(ctx, delivery_id) do
+  def deliver(ctx, delivery_id, retry_preflight? \\ false) do
     case Store.delivery(ctx.prefix, delivery_id) do
       %{state: "pending"} = delivery ->
         ownership = ownership(ctx, delivery, delivery.kind == "reply")
 
-        case Store.claim(ctx, delivery, ownership) do
+        case Store.claim(ctx, delivery, ownership, retry_preflight?) do
           {:ok, {:send, generation}} ->
             result = write(ctx, delivery)
             Store.settle(ctx, delivery, generation, result)
+            :ok
+
+          {:ok, :retry_preflight} ->
+            {:error, :handoff_preflight_unavailable}
 
           {:ok, _no_write} ->
             :ok
@@ -35,6 +39,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
 
       %{state: "sending"} = delivery ->
         Store.recover(ctx, delivery)
+        :ok
 
       _ ->
         :ok
@@ -63,6 +68,9 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
              conversation === scope.conversation_id and contact === scope.contact_id ->
         classify(ctx, scope, body, check_message?)
 
+      {:error, %Req.TransportError{}} ->
+        :transient_read_error
+
       _ ->
         :unknown
     end
@@ -74,7 +82,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
   defp classify(
          _ctx,
          _scope,
-         %{"status" => "pending", "meta" => %{"assignee" => %{"type" => "user", "id" => id}}},
+         %{"meta" => %{"assignee_type" => "User", "assignee" => %{"id" => id}}},
          _check_message?
        )
        when is_integer(id) and id > 0, do: :human
@@ -85,7 +93,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
          %{
            "status" => "pending",
            "can_reply" => true,
-           "meta" => %{"assignee" => %{"type" => "agent_bot", "id" => bot}}
+           "meta" => %{"assignee_type" => "AgentBot", "assignee" => %{"id" => bot}}
          } = body,
          check_message?
        )
@@ -193,9 +201,11 @@ defmodule VoelgoedAi.Feasibility.ChatwootDeliveryJob do
   alias VoelgoedAi.Feasibility.ChatwootDelivery
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"delivery_id" => id}, conf: conf}) do
+  def backoff(%Oban.Job{attempt: attempt}), do: 2 * attempt - 1
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{args: %{"delivery_id" => id}, conf: conf} = job) do
     ctx = Process.get({ChatwootDelivery, conf.prefix})
-    ChatwootDelivery.deliver(ctx, id)
-    :ok
+    ChatwootDelivery.deliver(ctx, id, job.attempt < job.max_attempts)
   end
 end

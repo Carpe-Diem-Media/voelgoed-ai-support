@@ -76,6 +76,12 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
   alias VoelgoedAi.Feasibility.{ChatwootDeliveryJob, ChatwootIngressJob, ChatwootMigration}
   alias VoelgoedAi.Repo
 
+  @reply_deadline_seconds 45
+  # G013 gives operational handoff its own five-minute recovery window and three
+  # safe attempts. This budget never authorizes a second POST.
+  @handoff_recovery_seconds 300
+  @handoff_max_attempts 3
+
   @columns Map.new(
              ~w(id installation account_id inbox_id conversation_id contact_id message_id event_type outcome
        purpose received_at processed decision state epoch last_verified_at active_event session_id
@@ -199,7 +205,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
                 INSERT INTO #{p}.deliveries (id, session_id, event_id, kind, state, epoch, deadline)
                 VALUES ($1::text::uuid,$2,$3::text::uuid,$4,'pending',$5,$6)
                 """,
-                [delivery_id, session.id, id, kind, epoch, DateTime.add(event.received_at, 45)]
+                [delivery_id, session.id, id, kind, epoch, deadline(ctx, event, kind)]
               )
 
               query!("UPDATE #{p}.sessions SET active_event = $2::text::uuid WHERE id = $1", [
@@ -207,7 +213,15 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
                 id
               ])
 
-              enqueue!(oban, ChatwootDeliveryJob.new(%{"delivery_id" => delivery_id}))
+              max_attempts = if kind == "handoff", do: @handoff_max_attempts, else: 1
+
+              enqueue!(
+                oban,
+                ChatwootDeliveryJob.new(%{"delivery_id" => delivery_id},
+                  max_attempts: max_attempts
+                )
+              )
+
               checkpoint(ctx, :after_decision_enqueue)
               kind
 
@@ -225,7 +239,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
     end)
   end
 
-  def claim(%{prefix: p} = ctx, delivery, ownership) do
+  def claim(%{prefix: p} = ctx, delivery, ownership, retry_preflight?) do
     Repo.transaction(fn ->
       session = lock_session(p, delivery.session_id)
       current = lock_delivery(p, delivery.id)
@@ -243,9 +257,25 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
           ownership == :human ->
             observe(ctx, session, :human)
 
-          ownership == :bot and session.epoch == current.epoch and
-            session.active_event == current.event_id and allowed?(session.state, current.kind) and
-              DateTime.before?(ctx.now.(), current.deadline) ->
+          session.epoch != current.epoch or session.active_event != current.event_id or
+              not allowed?(session.state, current.kind) ->
+            finish(ctx, current, "cancelled", "guard_denied", nil)
+
+          current.kind == "handoff" and not DateTime.before?(ctx.now.(), current.deadline) ->
+            # FAILED with this reason is the durable operator signal. The session
+            # stays inhibited in HANDOFF_PENDING until human control is verified.
+            finish(ctx, current, "failed", "handoff_deadline_exceeded", nil)
+
+          current.kind == "handoff" and ownership == :transient_read_error and retry_preflight? ->
+            :retry_preflight
+
+          current.kind == "handoff" and ownership == :transient_read_error ->
+            finish(ctx, current, "failed", "handoff_preflight_exhausted", nil)
+
+          current.kind == "handoff" and ownership == :unknown ->
+            finish(ctx, current, "failed", "handoff_ownership_unverified", nil)
+
+          ownership == :bot and DateTime.before?(ctx.now.(), current.deadline) ->
             %{rows: [[generation]]} =
               query!(
                 """
@@ -313,10 +343,17 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
     end)
   end
 
+  defp deadline(ctx, _event, "handoff"), do: DateTime.add(ctx.now.(), @handoff_recovery_seconds)
+
+  defp deadline(_ctx, event, "reply"),
+    do: DateTime.add(event.received_at, @reply_deadline_seconds)
+
   defp session_for(p, event, ownership) do
     key = [event.installation, event.account_id, event.conversation_id]
 
-    if event.purpose == "input" and ownership in [:bot, :human, :closed] do
+    # An observation can arrive before any input. Persist verified human control
+    # under the same qualified key and lock that later inputs use.
+    if ownership == :human or (event.purpose == "input" and ownership in [:bot, :closed]) do
       query!(
         """
         INSERT INTO #{p}.sessions (installation, account_id, conversation_id, id, inbox_id, contact_id, state)
