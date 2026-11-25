@@ -524,3 +524,110 @@ synthetic Chatwoot events, isolated PostgreSQL/Oban work and fake
 reply/handoff transport. VGAS-4 awaits exact-source and staff-fixture
 review. The temporary G036 exception remains feasibility-only. No
 public push, merge, deployment or paid provider call occurred.
+
+## F06 | VGAS-5 signed Chatwoot ingress and fixed delivery
+
+Evidence from `feat/vgas-5-f06-chatwoot-ingress`, based on
+`324cb105d749de50b31f3ea007cabd931a915ff0`. The candidate head is the
+commit containing this section. The tests use synthetic IDs and JSON, and
+generate signing keys and fake API tokens in ExUnit. The test-only Phoenix
+endpoint runs with `server: false`. The Req adapter has no network path.
+
+- Toolchain and storage. Elixir 1.20.5, Erlang 29.1.2, Phoenix 1.8.17,
+  Plug 1.20.4, Ecto SQL 3.14.0, Postgrex 0.23.0, Oban 2.24.2, Req 0.7.5,
+  and PostgreSQL 18.6 on the DevCore TEST allocation (role and database
+  `vgas_test`). The TEST role created the test-owned schema without
+  CREATEDB or grants. Each test applied Oban schema version 14 and spike
+  tables under its own prefix, then dropped the prefix and checked
+  `pg_namespace`.
+- Reference candidate. Chatwoot CE v4.18.0,
+  `9f920b549c14491a4e587687a3eed5d21c6ccc7d`. The fixture follows the
+  [Agent Bot listener](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/app/listeners/agent_bot_listener.rb)
+  and [webhook trigger](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/lib/webhooks/trigger.rb).
+  It signs timestamp, dot, and the original JSON bytes, with an inclusive
+  300-second window in either direction and a 64 KiB body limit.
+
+### Local acceptance
+
+1. **PASS. Signed receipt and atomic dispatch (T01).** An independent
+   PostgreSQL connection saw zero receipts and jobs while the transaction
+   paused after enqueue. The same observer saw both rows at the before-send
+   barrier, where the request had left the transaction and still owed
+   its 204. Two concurrent requests held distinct backends. PostgreSQL
+   reported the second backend waiting on the first. Both returned 204
+   after commit. A sequential replay left one receipt and one job whose
+   sole argument was the event UUIDv7.
+2. **PASS. Rejection, rollback and ignored events.** Invalid key, missing,
+   duplicate or malformed signing headers, changed JSON whitespace, and
+   timestamps at ±301 seconds returned 401. Both ±300 boundaries passed
+   with valid signatures. Malformed JSON, oversized bodies and scope
+   conflicts returned 400, 413 and 403 respectively, with zero receipts
+   or jobs. Outgoing bot, private, activity, attachments and unsupported
+   fixtures committed ignored receipts with zero jobs. A forced rollback
+   after enqueue and a database constraint rejecting the Oban insert
+   each returned 500 with zero durable rows. A new signed attempt after
+   the first rollback committed the pair.
+3. **PASS. Guarded fixed reply, explicit handoff and ambiguous writes
+   (T02, T04–T06).** Both queues used actual Oban inserts and manual drains.
+   A fresh GET qualified each write. A separate backend observed SENDING,
+   generation 1 and one attempt at the adapter boundary, with the expected
+   ownership epoch and HANDOFF_PENDING for handoff. The adapter counted
+   exactly one POST for each successful reply and handoff. The handoff
+   test required a confirming GET, and a forced rollback restored the
+   prior epoch and pending reply. A committed handoff intent cancelled the
+   unsent reply. Scope drift, expired or fenced work, a timed-out GET,
+   newer input, resolution and human takeover produced zero POSTs for
+   those paths. Human ownership stayed sticky after stale pending state.
+   A simulated remote commit followed by timeout, disconnect, 503,
+   redirect, malformed acceptance or a failed read-back each left an
+   UNKNOWN intent after one POST. Claim expiry after simulated process
+   death, replay of both worker phases, a new event and read-only
+   reconciliation produced no additional POST for the unknown reply.
+   A later qualified GET confirmed the unknown handoff without repeating
+   the status POST.
+
+The optional loopback Bandit request was omitted. The raw bytes reached
+the test endpoint through Phoenix.ConnTest. A signed human outbound event,
+a fresh GET before delivery and explicit reconciliation cover local
+ownership changes. Status and assignment event subscriptions and payloads
+remain F07 checks. The one-attempt claim test replays a persisted intent
+and exercises recovery after simulated process death.
+
+### Verification
+
+The three focused runs used
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs`
+with `--seed 0`, `--seed 21427`, and no seed flag (ExUnit chose 793636).
+Each exited 0 with 34 passed, zero failures and zero skips.
+
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 with seed 884620. Of 83 tests, 78 passed and the five pre-existing
+  F04 disposable tests skipped.
+- `devcore-project doctor`, `mise exec -- mix format --check-formatted`,
+  `MIX_ENV=test mise exec -- mix compile --warnings-as-errors`,
+  `mise exec -- mix deps.get --check-locked`, `mise exec -- mix hex.audit`,
+  and `git diff --check` exited 0. Hex found no security advisories or
+  retired packages. The fixture diff was checked for secrets and actual
+  customer data.
+- `python3 .github/scripts/plan_tests.py` exited 0 and assigned
+  `test/voelgoed_ai/chatwoot_feasibility_test.exs` to shard 2.
+- A `psql -X -v ON_ERROR_STOP=1` session through
+  `devcore-project run test -- env -u OPENAI_API_KEY` ran
+  `SELECT count(*) FROM pg_namespace WHERE left(nspname, 9) = 'vgas_f06_';`
+  and returned 0 with exit 0. No Phoenix HTTP listener was started.
+
+### F07 live gaps
+
+Verify the installed CE tag and digest, bot secret provisioning, real
+webhook bodies, retry/fallback behavior, API token privileges and
+pending/open/human assignment semantics against an approved staging
+inbox. Confirm the show response supplies usable reply capability and
+message context, and test whether the channel exposes durable correlation
+and read visibility after a lost response. The fake accepts a 403 as
+a definitive no-effect rejection. Staging must verify that classification.
+
+A takeover can race between the final qualified ownership GET or local
+claim and the remote POST. Local fencing prevents later attempts and
+protects settlement, while the remote race remains. Keep assisted operation
+while ownership and delivery ambiguity are unresolved. F06 local checks
+are complete. Live Chatwoot and hosted PR CI were outside this run.
