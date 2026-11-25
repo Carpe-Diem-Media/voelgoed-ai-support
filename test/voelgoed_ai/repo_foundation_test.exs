@@ -5,11 +5,13 @@ defmodule VoelgoedAi.RepoFoundationTest do
   alias VoelgoedAi.Repo
 
   test "the restricted test allocation runs PostgreSQL 18 with the foundation migration" do
-    assert %{rows: [["vgas_test", "vgas_test", false, false, false, false, 18, "UTC"]]} =
+    # DevCore reports the session zone as UTC and the CI image as Etc/UTC.
+    # Assert the zero offset rather than the zone name.
+    assert %{rows: [["vgas_test", "vgas_test", false, false, false, false, 18, true]]} =
              SQL.query!(Repo, """
              SELECT current_database(), current_user, rolsuper, rolcreatedb, rolcreaterole,
                     rolreplication, current_setting('server_version_num')::integer / 10000,
-                    current_setting('TimeZone')
+                    EXTRACT(TIMEZONE FROM now()) = 0
              FROM pg_roles WHERE rolname = current_user
              """)
 

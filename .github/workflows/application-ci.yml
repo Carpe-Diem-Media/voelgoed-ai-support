@@ -120,6 +120,15 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # config/runtime.exs requires the TEST connection settings at boot.
+    # Snapshot comparison opens no connection, so these point at an unused
+    # port and the password is a non-secret placeholder.
+    env:
+      TEST_DATABASE_HOST: 127.0.0.1
+      TEST_DATABASE_PORT: '1'
+      TEST_DATABASE_USERNAME: vgas_snapshot_check
+      TEST_DATABASE_NAME: vgas_snapshot_check
+      TEST_DATABASE_PASSWORD: not-a-credential
     steps:
       - uses: actions/checkout@v4
         with:
