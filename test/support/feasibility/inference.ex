@@ -42,7 +42,8 @@ defmodule VoelgoedAi.Feasibility.Inference do
   defp transport_options do
     [
       total_timeout: @timeout,
-      req_http_options: [receive_timeout: @timeout, retry: false]
+      # ReqLLM's retry step replaces `retry: false`; `max_retries` sets its attempt limit.
+      req_http_options: [receive_timeout: @timeout, retry: false, max_retries: 0]
     ]
   end
 
