@@ -1378,8 +1378,25 @@ Corrected in this branch:
 - The report stated the timeout bound without the real-client limits
   now recorded under the Req timeout paragraph.
 - `decide_current/4` repeated the ingress deadline check after
-  `session_for/3`. The guard under the receipt row lock already covers
-  it, so the unreachable branch was removed.
+  `session_for/3`. The inner check was redundant with the outer guard
+  evaluated under the receipt row lock. For a reply, the downstream
+  deadline checks in `reserve_read`, `claim` and `authorize_dispatch`
+  stop an input whose session-lock wait crosses the ingress deadline,
+  because a reply's deadline is the ingress deadline. A handoff is not
+  covered: admission gives it a fresh five-minute deadline after the
+  session lock, so an input that crosses the 45 s deadline while
+  waiting on that lock can still be admitted as a handoff and post a
+  status change. `observe/3` also applies the ownership result in that
+  window. The late action hands the conversation to a human, so it
+  fails towards human ownership, but it qualifies the lifecycle statement
+  above that the spike sends no late status change.
+
+The PR #5 description records that merged head `c291faa` passed the
+full suite with 169 passed and five skipped, and that `plan_tests.py`
+planned eight shards.
+[Application CI run 45688327986](https://github.com/Carpe-Diem-Media/voelgoed-ai-support/actions/runs/45688327986)
+passed on `c291faa`. These figures supersede the earlier 135-test and
+seven-shard figures.
 
 Carried forward without a change to this spike:
 
@@ -1396,4 +1413,103 @@ Carried forward without a change to this spike:
   `ownership_changed`, while a human observed at claim time records
   SENT `goal_observed`. Both keep the bot inhibited; the reason codes
   should be unified.
+- VGAS-004: recheck the ingress deadline after acquiring the session
+  lock, or derive the handoff admission cutoff from the ingress
+  deadline, so a late input cannot be admitted as a handoff.
 - F07: the Finch timeout and HTTP/2 retry limits above.
+
+## VGAS-000 exit assessment
+
+2026-11-25. **CONDITIONAL GO (local MVP only).** The essential local
+feasibility gates passed at spike scope. The authoring agent's own
+check of the evidence at `bbb83c5` is not independent review. An
+independent review of PR #6 at head `f58ec54` against base `bbb83c5`
+checked the feasibility brief, G036–G038 and this report. It found that
+the essential local gates pass at spike scope and found no unresolved
+core architectural failure. Its findings are corrected in PR #6. The
+owner's mandate makes both the local pass and independent review
+conditions of this decision. An unconditional GO remains gated on
+real-provider evidence.
+
+[Amendment A-010](../spec/VGAS_SPEC_v1.0.0.md#amendment-a-010--vgas-000-conditional-go-and-application-first-sequencing)
+allows the team to build the complete, locally testable MVP, including
+real integration interfaces and adapters tested against verified candidate
+contracts, synthetic fixtures and deterministic transport fakes. Missing
+external credentials, provider access, tenant setup and hosting access
+do not by themselves prevent that work. Every live integration and
+operational acceptance gate remains in place for staff use, activation
+and release. Parent phases may stay incomplete while external acceptance
+is blocked. This decision does not authorize live customer operation,
+production deployment, paid inference without separate approval,
+processing real customer data, or production authentication.
+
+[Amendment A-011](../spec/VGAS_SPEC_v1.0.0.md#amendment-a-011--vgas-001-authentication-release-candidate-exception)
+permits the audited release-candidate authentication chain in VGAS-001
+code. Staff authentication routes stay off by default. Recheck for a
+patched stable chain before VGAS-9 live testing and before production.
+Any pin change requires the full authentication test suite.
+
+### Gate results and next actions
+
+PASS denotes a completed feasibility gate at its defined scope. PARTIAL
+denotes a local pass with further evidence outstanding. BLOCKED denotes
+an external gate without a verified run. The Plane states below come
+from the supplied handoff. Next-action owners are listed by role.
+
+| Gate | Result | Evidence | Remaining external gate or setup | Next-action owner |
+|---|---|---|---|---|
+| F01 · Pinned baseline (VGAS-2, Done) | PASS (G036 exception, now A-011) | [F01 authorized execution](#f01-authorized-execution), PR #2 (`324cb10`). Fresh migration, PostgreSQL 18.7 with pgvector 0.8.7, cosine probe and 17 passed under the feasibility exception. | A-011 stable-pin rechecks before VGAS-9 and production. | VGAS-001 and VGAS-9 maintainers |
+| F02 · Typed Luna inference (VGAS-3, Done) | PARTIAL | [F02 durable local run](#f02--local-pass-provider-verification-pending), `9a58c53`, PR #2 (`324cb10`) and retry correction PR #3 (`a731a06`). Native Ash AI typed output and bounded wire options passed with fakes. | VGAS-7 is blocked on entitlement and spend approval. Approve model-list read access and a capped staging test. Verify the exact model, actual usage, latency, bounds, retry behavior and storage options. | Project owner approves access and spend. VGAS-7 maintainer verifies. |
+| F03 · Inference control (VGAS-3, Done) | PARTIAL | [F03 durable local run](#f03--local-pass-at-spike-scope-provider-verification-pending) and [retry correction](#correction--reqllm-embedding-retries), `9a58c53`, PR #2 (`324cb10`) and PR #3 (`a731a06`). PostgreSQL reservation, denial, settlement and uncertain spend passed with fakes. | Same VGAS-7 access and spend gate. Verify request-level usage and correlation for generation and embedding, including rejected output, and the live cost bound. | Project owner approves access and spend. VGAS-7 maintainer verifies. |
+| F04 · Approved FAQ vectorization (VGAS-4, Blocked) | PARTIAL | [F04 local PASS](#f04--local-pass) and [review outcomes](#review-outcomes), `1f7150d`, PR #2 (`324cb10`). The isolated run used 28 synthetic bilingual revisions and 56 fake embedding jobs. | VGAS-7 needs staging provider entitlement and spend approval for real embedding proof. VGAS-4 is Blocked in Plane on VGAS-11 (source-verified bilingual FAQs and evaluation cases), which awaits source-owner access. The report records that VGAS-4 awaits exact-source and staff-fixture review. | Project owner approves access and spend. VGAS-7 maintainer verifies. Source owner provides access for VGAS-11. |
+| F05 · Authorised hybrid retrieval (VGAS-4, Blocked) | PARTIAL | [F05 local PASS](#f05--local-pass-for-retrieval-mechanics) and [review outcomes](#review-outcomes), `1f7150d`, PR #2 (`324cb10`). All 20 synthetic expectations matched. The review accepted local mechanics with follow-ups. | Actual bilingual embedding quality needs the VGAS-7 provider check and VGAS-11 staff-labelled validation. VGAS-4 is Blocked in Plane on VGAS-11 (source-verified bilingual FAQs and evaluation cases), which awaits source-owner access. The report records that VGAS-4 awaits exact-source and staff-fixture review. | VGAS-7 maintainer verifies provider behavior. Staff reviewers label and validate retrieval for VGAS-11. |
+| F06 · Signed local Chatwoot ingress and delivery (VGAS-5, Done) | PASS | [F06 local acceptance](#local-acceptance) and [independent review](#independent-review-of-d25868e), PR #5 (`c291faa`, merge `bbb83c5`). Signed receipt, atomic Oban enqueue, fenced delivery and handoff passed with deterministic fakes. | F07 owns the deployed contract and live transport checks. | VGAS-8 maintainer |
+| F07 · Live Chatwoot (VGAS-8, Blocked) | BLOCKED | [F07 live gaps](#f07-live-gaps), PR #5 (head `c291faa`, merge `bbb83c5`). The report records a CE v4.18.0 reference candidate and local tests. No deployed inbox evidence is recorded. | Approved staging test inbox and dedicated bot token and signing secret. Verify deployed version, event coverage, privileges, channel behavior, handoff and delivery correlation. | Chatwoot owner provides staging access. VGAS-8 maintainer verifies. |
+| F08 · Entra and staff authorisation (VGAS-6 local, Done; VGAS-9 live, Blocked) | PARTIAL | [F08 local evidence](#f08--entra-and-staff-authorisation-vgas-6) and [independent review](#independent-review-of-71d3069-and-low-finding-fixes), PR #4 (head `c8d705e`, fixes in `cd78a33`, merge `2f7b592`). Fixture OIDC, allowlisting and session denial passed. | Approved test tenant, app registration, consent, callback and test users. Verify real claims, signing keys, browser cookie delivery and revocation. | Entra tenant owner provides access and approves setup. VGAS-9 maintainer verifies. |
+| F09 · Hosting readiness (VGAS-10, Blocked) | BLOCKED | [F01 pinned baseline](#f01-pinned-baseline) records no new F09 external evidence. No host assessment, PR or commit is cited in this report. | Read-only host access for capacity and topology, staging separation, TLS and backup/restore assessment. [Feasibility brief](../briefs/VGAS-000_FEASIBILITY_BRIEF.md#prerequisites-request-only-missing-access-continue-local-work). | Hosting owner grants read-only access. VGAS-10 assessor records findings. |
+
+F01 and the F04–F05 pgvector tests used an approved disposable target.
+The shared DevCore pgvector rollout is a separate item.
+[F01 authorized execution](#f01-authorized-execution),
+[F04–F05 environment](#verified-environment-and-cleanup).
+
+The report records an OpenAI model-list HTTP 403 for missing
+`api.model.read`. It records no successful retry, Luna entitlement or
+paid provider result. The conservative Luna reserve exceeds the default
+development budget. A live run needs separate spend approval and an
+approved budget that covers the reserve, or a separately verified
+tighter bound. [Credential checks](#credential-and-repository-checks),
+[generation cost-bound follow-up](#generation-cost-bound-follow-up).
+
+### Carry-forward work
+
+- **VGAS-004.** Append separately keyed late usage evidence for attempts
+  already holding timeout evidence. Fence recovery against the still
+  running ReqLLM request task and assert real admission lock waits.
+  Recheck the ingress deadline after the session lock so a late input
+  cannot be admitted as a handoff.
+  Close a denied dispatch as CANCELLED when non-send is provable so it
+  does not leave the conversation silent. Add operational handoff or
+  idle-routing for overdue ingress. Unify the human-ownership handoff
+  reason codes. [Inference review](#review-outcomes),
+  [F06 review](#independent-review-of-d25868e).
+- **VGAS-003.** Recheck revision validity at worker completion. Keep
+  uncertain embedding outcomes out of ordinary requeue. Assert wire
+  scope and canonical hash. Test revocation between ranking and
+  projection. [Review outcomes](#review-outcomes).
+- **F07 / VGAS-8.** Bound Finch pool checkout, connect and request time
+  below the remaining lease with a margin. Pin HTTP/1 or rule out the
+  transparent HTTP/2 retry. Verify deployed signing and subscriptions,
+  fallback, handoff, correlation and the assumption that a 403 proves
+  no effect. Keep assisted operation while ownership and delivery
+  ambiguity remain. [Delivery lifecycle](#inbound-receipt-and-delivery-lifecycle),
+  [F07 live gaps](#f07-live-gaps).
+- **VGAS-9.** Recheck the authentication pins, validate the local subject
+  format and response bounds with the approved registration, and check
+  real claims, cookies, keys and revocation. Carry the review notes on
+  duplicate JSON members, token lifetime, future `iat` and separately
+  untested issuer and tenant comparisons. Recheck authorisation on each
+  protected event of an existing LiveView socket when that integration
+  is added. [F08 re-review](#identity-and-discovery-re-review-fixes),
+  [response and subject bounds](#malformed-provider-responses-and-subject-format),
+  [independent review](#independent-review-of-71d3069-and-low-finding-fixes).

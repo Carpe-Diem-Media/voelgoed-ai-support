@@ -227,9 +227,19 @@ One Phoenix release including Oban workers plus PostgreSQL/pgvector; existing Ch
 
 ## G036 — Bounded feasibility and narrow fallbacks
 
+[Amendment A-010](VGAS_SPEC_v1.0.0.md#amendment-a-010--vgas-000-conditional-go-and-application-first-sequencing)
+governs the conditional local exit and the timing of live verification.
+[Amendment A-011](VGAS_SPEC_v1.0.0.md#amendment-a-011--vgas-001-authentication-release-candidate-exception)
+records the narrow stable-pin exception and conditions for VGAS-001.
+
 First coding work is a small local disposable spike, target one focused 4–6 engineering-hour session (not delivery promise), with integration blockers separated from framework feasibility. Read current upstream Hex packages/release notes, pin mutually compatible stable Elixir/OTP/Phoenix/Ash/AshPostgres/Ash AI/ReqLLM/Oban/AshOban/AshAuthentication/AshStateMachine as applicable; verify actual lockfile, migrations, advisory status; do not copy unverified version claims from earlier discussion. Prove live Luna exact ID, typed output, trusted usage (including reasoning where charged), supported output bound, timeouts, retry controls, storage options; Ash AI prompt path first, direct ReqLLM only if required. Prove approved FAQ indexing and authorized pgvector search for 20–30 sample FAQs, approximately 20 representative bilingual/ambiguous/off-topic cases, exclusion of revoked/expired/cross-scope records, verify multilingual vector storage and profile. Fixture-based signed webhook/raw body validation, durable enqueue/rollback and fixed reply adapter test; then actual test inbox integration, bot signing/events, token privileges, explicit handover, ownership check and correlation roundtrip on deployed version. Verify Entra test app login, local allowlisted roles, disabled-session rejection, exact claims/tenant; separate external prerequisite from core Ash feasibility. Use synthetic or approved sanitised data, test keys, no production automatic bot. Capture commands, versions, outputs, timings, known limitations and pass/fail/blocked evidence. GO native when core typed inference/accounting and authorized retrieval pass; fix bounded minor issues. If Ash AI wrapper lacks control, use direct ReqLLM narrow fallback; if indexing DSL insufficient, minimal explicit pgvector adapter; if native approach materially delays release after bounded investigation, evaluate Dify behind same Ash boundary, explicit amendment required; do not install both by default. Chatwoot/Entra/host/credential blocker does not by itself disprove Ash; continue independent local slice tests but block affected staging/production gate. No claim of pass without evidence, no open-ended technology comparison.
 
 ## G037 — Functional vertical slices
+
+Apply [Amendment A-010](VGAS_SPEC_v1.0.0.md#amendment-a-010--vgas-000-conditional-go-and-application-first-sequencing)
+to the slices below. Live verification and operational acceptance gate
+staff use, activation and release under [G038](#g038--evidence-based-release-and-staged-rollout).
+Parent phases may stay incomplete while external acceptance is blocked.
 
 VGAS-000 feasibility and authority verification; VGAS-001 foundation; VGAS-002 fixed-reply Chatwoot slice; VGAS-003 Knowledge; VGAS-004 Intelligence; VGAS-005 production hardening; VGAS-006 controlled launch; VGAS-007 future backlog only. Each slice must implement necessary safety contracts at first use rather than postponing correctness to hardening. No public customer reply until final acceptance. In particular signed ingress, dedupe, ownership/handoff and no blind retries required in fixed-reply test slice; reservation, bounded retries, scope and evidence validation required before any external inference using production budget. Earlier slices may be isolated/local fixture tests; no reliance on eventual future safeguards to justify live unsafe testing.
 

@@ -2,7 +2,52 @@
 
 Document: VGAS-SPEC | Version: 1.0.0 | Date: 2026-11-25
 
-Status: **Architecture frozen; 38/38 decisions accepted. Implementation and live verification pending.**
+Status: **Architecture frozen; 38/38 decisions accepted, with accepted amendments. VGAS-000 CONDITIONAL GO for local MVP development. Live verification pending.**
+
+## Amendment A-011 — VGAS-001 authentication release-candidate exception
+
+Accepted by the owner on 2026-11-25 as a narrow G036 exception.
+
+- VGAS-001 production code may use the audited pins AshAuthentication
+  `5.0.0-rc.18`, `ash_authentication_phoenix` `3.0.0-rc.12`, and Assent
+  `0.3.2`. The stable AshAuthentication `4.15.1` and
+  `ash_authentication_phoenix` `2.17.4` chain can only resolve Assent
+  `0.2.x`. The trial resolved `0.2.13`, and the audit reported critical
+  advisory `EEF-CVE-2026-117656`.
+  [Stable authentication trial](../evidence/VGAS-000_REPORT.md#vgas-2-stable-authentication-trial).
+- Staff authentication routes stay off by default.
+- Recheck the pins for a patched stable chain before VGAS-9 live testing
+  and again before production.
+- Rerun the full authentication test suite after any pin change.
+
+This exception applies to the listed VGAS-001 pins. Production
+authentication requires separate authorization.
+
+## Amendment A-010 — VGAS-000 CONDITIONAL GO and application-first sequencing
+
+Accepted by the owner on 2026-11-25 for G036 and G037.
+
+- Proceed from VGAS-000 into safe, locally testable MVP development
+  under a documented **CONDITIONAL GO** when the essential local
+  feasibility gates pass and an independent subagent review confirms
+  there is no unresolved core architectural failure. Missing external
+  credentials, live provider access, tenant setup and hosting access do
+  not by themselves prevent this authorization. Do not claim an
+  unconditional GO while required real-provider evidence is outstanding.
+- Build the complete, locally testable MVP before requiring real
+  external-service configuration. Implement the real integration
+  interfaces and adapters now, using verified candidate contracts,
+  synthetic fixtures and deterministic transport fakes.
+- Keep every live integration verification and operational acceptance
+  gate. Live gates move from being prerequisites of local slices to
+  being prerequisites of staff use, activation and release. Parent
+  phases may stay incomplete while external acceptance is blocked.
+- This authorization does not permit live customer operation, production
+  deployment, paid inference without separate approval, processing real
+  customer data, or production authentication.
+
+The [VGAS-000 exit assessment](../evidence/VGAS-000_REPORT.md#vgas-000-exit-assessment)
+records the local evidence and the remaining gates.
 
 ## Amendment A-009 — Public repository and reviewed merges
 
