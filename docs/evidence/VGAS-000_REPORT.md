@@ -954,3 +954,446 @@ member names resolve consistently across Jason, Elixir `JSON` and JOSE;
 there is no maximum token lifetime or future `iat` rule; and the signed
 issuer and tenant comparisons are redundant with Assent and the database
 filter, so no test isolates them.
+
+## F06 | VGAS-5 signed Chatwoot ingress and fixed delivery
+
+Evidence from `feat/vgas-5-f06-chatwoot-ingress`. The first follow-up started at
+`c8fd5868be45807e69fe54b386595375c579abe2`. The implementation commit is
+`34ff8988a391dde5a5c2c9cc8eef98e99ea8d3a9`. The next review fixes start at
+`c092c05e58887a6f2243d958f767b7fa19bdcf96`. The tests use synthetic IDs and JSON, and
+generate signing keys and fake API tokens in ExUnit. The test-only Phoenix
+endpoint runs with `server: false`. The Req adapter has no network path.
+
+- Toolchain and storage. Elixir 1.20.5, Erlang 29.1.2, Phoenix 1.8.17,
+  Plug 1.20.4, Ecto SQL 3.14.0, Postgrex 0.23.0, Oban 2.24.2, Req 0.7.5,
+  and PostgreSQL 18.6 on the DevCore TEST allocation (role and database
+  `vgas_test`). The TEST role created the test-owned schema without
+  CREATEDB or grants. Each test applied Oban schema version 14 and spike
+  tables under its own prefix, then dropped the prefix and checked
+  `pg_namespace`.
+- Reference candidate. Chatwoot CE v4.18.0,
+  `9f920b549c14491a4e587687a3eed5d21c6ccc7d`. The fixture follows the
+  [Agent Bot listener](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/app/listeners/agent_bot_listener.rb)
+  and [webhook trigger](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/lib/webhooks/trigger.rb).
+  It signs timestamp, dot, and the original JSON bytes, with an inclusive
+  300-second window in either direction and a 64 KiB body limit.
+  The conversation GET fixtures follow the pinned
+  [conversation serializer](https://raw.githubusercontent.com/chatwoot/chatwoot/9f920b549c14491a4e587687a3eed5d21c6ccc7d/app/views/api/v1/conversations/partials/_conversation.json.jbuilder),
+  which puts `AgentBot` or `User` in `meta.assignee_type` and the ID
+  in `meta.assignee.id`. The serializer omits both assignee fields for an
+  unassigned CE conversation.
+
+### Local acceptance
+
+1. **PASS. Signed receipt and atomic dispatch (T01).** An independent
+   PostgreSQL connection saw zero receipts and jobs while the transaction
+   paused after enqueue. The same observer saw both rows at the before-send
+   barrier, where the request had left the transaction and still owed
+   its 204. Two concurrent requests held distinct backends. PostgreSQL
+   reported the second backend waiting on the first. Both returned 204
+   after commit. A sequential replay left one receipt and one job whose
+   sole argument was the event UUIDv7.
+2. **PASS. Rejection, rollback and ignored events.** Invalid key, missing,
+   duplicate or malformed signing headers, changed JSON whitespace, and
+   timestamps at ±301 seconds returned 401. Both ±300 boundaries passed
+   with valid signatures. Malformed JSON, oversized bodies and scope
+   conflicts returned 400, 413 and 403 respectively, with zero receipts
+   or jobs. Outgoing bot, private, activity, attachments and unsupported
+   fixtures committed ignored receipts with zero jobs. A forced rollback
+   after enqueue and a database constraint rejecting the Oban insert
+   each returned 500 with zero durable rows. A new signed attempt after
+   the first rollback committed the pair.
+3. **PASS. Guarded fixed reply, explicit handoff and ambiguous writes
+   (T02, T04–T06).** Ingress, delivery and recovery used actual Oban
+   inserts and manual drains. A fresh GET qualified each write. A separate
+   backend observed SENDING,
+   generation 1 and one attempt at the adapter boundary, with the expected
+   ownership epoch and HANDOFF_PENDING for handoff. The adapter counted
+   exactly one POST for each successful reply and handoff. The handoff
+   test required a confirming GET, and a forced rollback restored the
+   prior epoch and pending reply. A committed handoff intent cancelled the
+   unsent reply. Scope drift, expired or fenced reply work, a timed-out
+   reply ownership GET, newer input, resolution and human takeover
+   produced zero POSTs for those paths.
+   A simulated remote commit followed by timeout, disconnect, 503,
+   redirect, malformed acceptance or a failed read-back each left an
+   UNKNOWN intent after one POST. After Oban discarded a lost delivery
+   job, the recovery job recorded UNKNOWN at claim expiry. Worker
+   replays, a new event and a duplicate reconciliation job produced no
+   additional POST for the unknown reply. The scheduled read-only job
+   confirmed an unknown handoff at 46 seconds. The adapter recorded one
+   status POST.
+
+### Review corrections
+
+1. **Ownership response.** A configured bot in a qualified pending
+   conversation can send. Human assignment at admission or before
+   delivery prevents a POST. Unassigned pending, open, resolved and
+   snoozed fixtures also prevent a POST. Missing or unrecognised
+   `assignee_type` denies a pending reply. Unverified handoff ownership
+   records a failure and keeps the session inhibited.
+2. **First human observation.** A signed human outbound event followed by a
+   qualified GET showing `open` creates a durable human-owned session even
+   before the first customer message. A later bot-assigned pending GET
+   leaves that session human-owned with zero POSTs. The duplicate webhook
+   and ingress job replay exercise the same sequence.
+3. **Handoff recovery.** A reply expires 45 seconds after receipt. G013's
+   five-minute handoff window starts when the intent is created. The
+   first review used Oban attempts to cap pre-write reads. The worker
+   can send at 46 seconds. At the handoff deadline or after the third
+   failed read, it records a terminal FAILED intent with a reason code and
+   keeps the session in HANDOFF_PENDING for operator inspection. The spike
+   stores that signal locally. It has no staff notification integration.
+   The durable write claim still allows one POST. Ambiguous writes stay
+   UNKNOWN pending read-only reconciliation.
+
+Each correction's tests were rerun with that fix temporarily reverted
+while the other fixes were in place. Under seed 0, the ownership case
+failed because the bot GET produced no reply intent (0/1, exit 2).
+Both first-observation cases queued a reply intent (0/2, exit 2).
+The five handoff tests failed on cancellation or missing preflight
+retries (0/5, exit 2). All passed after restoration.
+
+### Follow-up review corrections
+
+1. A qualified signed public human reply commits HUMAN_ACTIVE and fences
+   pending work in the receipt and enqueue transaction. A rollback undoes
+   the inhibit along with the receipt and job. Later bot-assigned pending
+   GETs leave the inhibit in place. Private notes and AgentBot messages
+   are ignored. The pinned CE callback for opening a pending conversation
+   on a human reply requires Captain. The test leaves the conversation
+   pending throughout. [Chatwoot message model](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/app/models/message.rb#L380-L390)
+2. A public reply requires `can_reply: true`. An explicit handoff can
+   open a qualified pending conversation assigned to the configured bot
+   when the reply window is closed. The test records one status POST
+   followed by a confirming GET. [Chatwoot status controller](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/app/controllers/api/v1/accounts/conversations_controller.rb#L74-L90)
+3. HTTP 429 and 5xx join transport errors and timeouts in the safe
+   pre-write retry path. Handoff allows at most three preflight attempts
+   over five minutes. The tests retry 429 and 503 after 46 seconds, verify
+   the existing exhaustion reason, and show that a queued retry at the
+   five-minute boundary makes no additional preflight request. The
+   session stays inhibited after definitive failure. An ambiguous POST
+   still results in UNKNOWN after one write.
+4. The claim transaction schedules a separate Oban job for the five-second
+   lease expiry. Recovery locks the same session and delivery rows as
+   settlement and requires the matching generation in SENDING. It records
+   UNKNOWN without HTTP. The test kills the actual Oban drain at the fake
+   POST, observes the attempt-one job in `executing`, and runs Oban 2.24.2's
+   rescue engine. It observes the exhausted job in `discarded`. The
+   claim stays SENDING at four seconds, and the recovery job marks it
+   UNKNOWN at five seconds. Recovery of an already settled reply is a no-op.
+
+All five selected regressions failed against the original implementation
+at `c8fd586`, then passed with the fixes restored. The selection command
+was `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs:453:594:613:746 --seed 0`.
+It exited 2 on the original implementation, with five failures and 47
+excluded. With the other fixes in place, removing each fix in isolation
+also failed on the intended assertion. Each mutation used the same test
+command with a single line selector.
+
+- `:453`, receipt inhibit removed. The adapter recorded a reply POST.
+  Exit 2, one failure and 51 excluded.
+- `:594`, `can_reply` reapplied to handoff. The status intent failed
+  before its POST. Exit 2, one failure and 51 excluded.
+- `:613`, transient HTTP classification removed. The 429 and 503 tests
+  observed no retry. Exit 2, two failures and 50 excluded.
+- `:746`, recovery enqueue removed. The intent stayed SENDING after Oban
+  discarded the delivery job. Exit 2, one failure and 51 excluded.
+
+### Inbound receipt and delivery lifecycle
+
+The receipt and its first Oban job commit together. The qualified message
+key deduplicates signed retries and preserves the receipt time. The
+decision transaction inserts any delivery intent and its deadline job.
+The recurring Oban Cron job sweeps overdue receipts and intents using
+PostgreSQL only. The F06 tests use the real Oban queues and rescue
+engine in a disposable TEST schema. All Req calls use the fake adapter
+outside transactions.
+
+| Non-terminal state | Concurrent actors and fence | Lost, duplicate or late work | Local evidence |
+|---|---|---|---|
+| Inbound DISPATCHED, awaiting a decision | The original and replacement ingress jobs can read before 45 seconds. The receipt row lock orders those results with the deadline sweep. Only the first decision can update ownership and create an intent. A genuine public human reply inhibits in the receipt transaction. | A lost ingress job leaves a durable receipt for Cron. A signed replay acknowledges without enqueueing again. A replacement can decide before expiry. A terminal or expired receipt cannot admit a late GET result. Delivery recovery and reconciliation have no receipt operation. | Receipt replay and rollback tests, discarded ingress rescue and Cron, overdue original job, original and replacement race, late read with and without the sweep, and lost human observation. |
+| Reply PENDING | Original and replacement delivery jobs share one ownership read. The reservation checks the deadline after locking the row and returns a sequence. Claim checks that sequence, the session epoch, active event and deadline. Deadline or Cron can cancel and release the active slot. A qualified human observation can fence the reply. | A duplicate cannot spend a second read or claim a write. A lost preflight ends in CANCELLED at the deadline. A stale or late GET cannot claim a POST. Lease recovery and reconciliation have no PENDING operation. | Duplicate delivery, late preflight, read blocked on PostgreSQL, human receipt fence, discarded preflight and Cron fallback. |
+| Handoff PENDING | Original and replacement delivery jobs reserve from the same three reads. The latest reservation can claim the write while the session remains eligible. Qualified human ownership confirms the goal without POST. Qualified resolution cancels. Deadline or Cron can record definitive failure before claim. | Safe transient failures may retry within budget. A duplicate spends from that same budget and fences earlier reads. If the last preflight is lost, the deadline records FAILED and keeps the inhibit. Lease recovery and reconciliation have no PENDING operation. | Safe retry, concurrent final reservation, older preflight, discarded final preflight, replacement and deadline tests. |
+| Reply SENDING | The writer rechecks the committed state, claim generation, session epoch and available lease before dispatch. Settlement checks generation, state, ownership and lease. The lease job or deadline can record UNKNOWN under the same locks. | Replacement delivery and reconciliation jobs cannot send. If Oban loses the writer, lease recovery records UNKNOWN. Deadline and Cron cover a lost lease job. A response that returns after expiry or after recovery cannot settle the reply. | Lost executing POST, replacement and reconciliation no-ops, pause at claim commit, intervening human takeover, insufficient lease, and late response tests. |
+| Handoff SENDING | The same dispatch and lease rules apply. The writer can reserve a read for confirmation after POST. Settlement requires the current claim and read reservation. Deadline or recovery can record UNKNOWN and give any remaining read to reconciliation. | A replacement cannot write or spend the confirmation read. Late POST and GET results cannot take over after recovery. If the individual deadline job is lost, Cron closes the window. | Immediate confirmation, exhausted immediate read budget, lost POST, stale writer after recovery and immediate confirmation at the deadline. |
+| Handoff UNKNOWN, recovery still open | Original and replacement reconciliation jobs can reserve GETs. The latest reservation can settle only while the row remains UNKNOWN, the deadline is open and no recovery failure is recorded. Deadline or Cron can close the recovery window. | A discarded reconciliation job can never cause a repeated POST. The deadline records failure if work is lost. A delayed older result cannot displace the latest reservation or a recorded failure. Delivery and lease recovery jobs cannot write here. | Lost reconciliation, replacement budget, older/newer results in both orders, latest result after deadline failure, and qualified resolution. |
+
+An ignored receipt or a dispatched receipt with a durable decision is
+terminal for ingress. SENT, FAILED and CANCELLED are terminal for
+delivery. Reply UNKNOWN is terminal for automation in this spike.
+Handoff UNKNOWN with a recorded recovery failure is terminal for
+automated recovery. The original reason and uncertain outcome remain
+available for operator review.
+
+Under G012, a qualified `resolved` read closes the session even when
+it follows our explicit `open` POST. It cannot prove that our POST
+achieved the open handoff goal. Immediate confirmation and scheduled
+reconciliation therefore both preserve UNKNOWN and record
+`handoff_conversation_closed`. Both stop further reads and writes.
+The spike never reopens a resolved conversation or auto-resolves one.
+
+G009 separates durable dispatch from processing the receipt. G013 sets
+the provisional 45-second interactive window and calls for visible
+operational recovery. If a dispatched receipt missed that window,
+the ingress worker or a bounded Cron sweep records
+`ingress_deadline_exceeded` for operator triage. The spike cannot
+establish automated handoff eligibility for an input it never safely
+processed. It sends no late reply or status change and preserves any
+existing inhibit, including one committed with a human reply. A
+handoff already created within the interactive window retains its
+separate five-minute budget under G012 and G013.
+
+Req receive and response timeout options use the smaller of 500 ms
+and the remaining applicable deadline or claim lease. The injected
+clock is checked after PostgreSQL grants the read reservation lock.
+Rows are unlocked before the Req adapter runs. The interval between
+the final local claim check and dispatch therefore still permits a
+human or recovery process to change the database, or Chatwoot to change
+ownership. The timeout settings and local fences reduce that interval
+without providing a remote conditional write. The bound holds only for
+the fake adapter. The pinned Finch client bounds pool checkout with
+`pool_timeout` and connection setup with a connect timeout, both
+defaulting to 5,000 ms, separately from the receive timeout this
+adapter sets. Either default alone can reach the whole lease. Finch
+also documents a transparent retry when an HTTP/2 pool is draining. A real POST could therefore reach Chatwoot
+after recovery has recorded UNKNOWN or after a human takeover. F07 must
+bound pool checkout, connect and request time below the remaining lease
+with a margin, and pin HTTP/1 or exclude that retry. F07 owns live
+timeout, ownership and channel validation.
+
+### Verification
+
+- `devcore-project doctor` exited 0 after `devcore-project plan` and
+  `devcore-project activate` created the missing local environment.
+  Both bootstrap commands exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix format --check-formatted`, and
+  `mise exec -- mix hex.audit` each exited 0 in separate invocations.
+  Hex reported no retired or advisory packages.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs --seed 0`
+  and the same command with `--seed 371486` each exited 0, with 52 passed
+  and zero skips. Both include the earlier assignee, human observation
+  and handoff deadline regressions.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 at seed 175627, with 98 passed and five pre-existing F04 skips.
+  The generated replay tests that this branch adds to
+  `chatwoot_feasibility_test.exs` emitted compiler warnings about
+  constant branches. `main` emits none. CI does not compile test files
+  with warnings as errors.
+- `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0. Gitleaks reported no leaks.
+
+The Phoenix.ConnTest fixture exercised raw request bytes with the
+endpoint disabled as a server. F07 still owns live status and assignment
+subscriptions, response payload and channel checks.
+
+### Deadline and read-back review fixes
+
+Implementation commit `e40d43bab3168661ff58665a0b73fc5fcd9151be`.
+Comparison base `a731a06a0d54d61438c6e709e5a3170e6b60b7ed`
+(`origin/main`). The deadline job now closes an unclaimed handoff as
+FAILED even after Oban discards its last preflight. A discarded reply
+preflight ends in CANCELLED and releases its active slot. A claimed
+write stays UNKNOWN on expiry, and a late response cannot overwrite it.
+Each GET after intent creation reserves a read on the delivery row
+before entering Req. Handoff preflight, immediate confirmation and
+scheduled read-back share the same three reads. A scheduled read-back
+can confirm qualified open status or human ownership. The recovery
+failure reason records budget exhaustion, deadline expiry or a
+qualified resolution without asserting the write's outcome.
+
+Each mutation below changed one guard, ran the affected ExUnit
+selection and restored the source. The command was
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs<selector> --seed 0`.
+Each mutated selection exited 2 on test assertions. The positions
+refer to the implementation commit.
+
+| Guard changed | Selection | Observed failures |
+|---|---|---|
+| Route away the deadline job inserted with the intent | `:831:854` | Both discarded preflight cases stayed pending |
+| Remove the atomic read cap | `:902:831` | The concurrent handoff duplicate and replacement reply entered GET |
+| Allow a retry after the third failed preflight | `:884` | The replacement handoff job attempted a retry |
+| Remove the deadline check before reserving a read | `:969:537` | Both the rescued reconciliation and expired preflight entered GET |
+| Accept a preflight result at the deadline | `:1148` | The late preflight entered POST |
+| Accept a scheduled read-back result at the deadline | `:1090` | The late read-back marked the handoff SENT |
+| Accept an immediate confirmation at the deadline | `:1230` | The late confirmation marked the handoff SENT |
+| Route away the read-back job inserted with UNKNOWN | `:805:996` | Neither timeout nor lost claim queued the expected read-back |
+| Skip pending intents in the recurring sweep | `:1021` | The discarded deadline left the reply pending |
+| Skip claimed intents in the deadline handler | `:1059` | The discarded lease check left the reply SENDING. The lease race still passed |
+| Allow a late write result to settle UNKNOWN | `:1059` | Both reply races overwrote claim recovery |
+| Remove the state check from read reservation | `:1200` | A stale write worker consumed the recovery read |
+| Allow reads after recovery records a failure | `:1177` | A replacement reconciliation read after qualified resolution |
+| Omit the read budget exhaustion reason | `:937` | The unconfirmed handoff lacked the recovery failure |
+| Bypass read reservation on immediate confirmation | `:1122` | The successful POST response triggered a fourth GET |
+| Omit account qualification on GET | `:937` | A wrong-account response marked the handoff SENT |
+
+### Deadline and read-back verification
+
+- `devcore-project doctor` exited 1 with no local environment.
+  `devcore-project plan` and `devcore-project activate` each exited 0.
+  `devcore-project doctor` then exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix format --check-formatted` and
+  `mise exec -- mix hex.audit` each exited 0. Hex reported no retired
+  or advisory packages.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs --seed 0`
+  and the same command with seeds 371486 and 739021 each exited 0.
+  Each run passed 68 tests with zero skips.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 at seed 817750 with 114 passed and five existing F04 skips.
+  The replay cases added by this branch still emitted constant-branch
+  warnings.
+- `python3 .github/scripts/plan_tests.py` exited 0 and planned seven
+  shards, including F06.
+- `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0 for the implementation commit. Gitleaks reported no leaks.
+
+### Follow-up review at f26225a
+
+The first regression commit was
+`42af20c32b05f8ce3a6b398ef39c63e1a163507c`. On that commit, the
+`--only f06_followup --seed 0` selection exited 2 with ten failures,
+one pass and 68 excluded. All five suspected failures reproduced.
+The invalid-signature, wrong-inbox and non-human sender case passed
+without a source change.
+
+1. A late, older reconciliation read overwrote durable budget
+   exhaustion. The reservation counter is now the read sequence.
+   Preflight, immediate confirmation and reconciliation check the
+   sequence and expected state. Reconciliation also checks for a
+   recorded recovery failure before evaluating the result.
+2. A preflight blocked on a PostgreSQL row used a clock value taken
+   before the lock wait. The reservation now locks the row and checks
+   the injected clock before spending the read, in the same transaction.
+   Req applies the remaining time at request entry.
+3. Immediate confirmation discarded a qualified resolution. It now
+   uses the same G012 outcome logic as scheduled reconciliation, as
+   described in the lifecycle table.
+4. A writer paused at claim commit entered POST after recovery. The
+   writer now checks the committed claim and session fence in a fresh
+   transaction, checks that the lease can cover the request, and
+   releases the transaction before Req. Settlement rejects expired
+   claims even if the recovery job has yet to run.
+5. Oban could discard the first ingress job without recording a
+   decision. The existing Cron deadline worker now processes up to
+   100 overdue receipts per tick. Each ingress decision checks the
+   receipt under its row lock before applying a GET result. The
+   G009/G013 expiry outcome and G012 inhibit rules are in the table.
+6. Invalid signatures, wrong inbox and signed non-human outgoing
+   events already preserved active work. The regression verifies the
+   response codes, unchanged session state, and exactly one reply POST.
+
+Actor and terminal-state tests are in
+`0d22ef2f4d32fa37092e7a3a4fc7ed4cba053b5f` and
+`02fe44d632ad2607ec98c35e946d3f1304cb1274`. The implementation is in
+`827d082d6e14ea40b30c358a0640861cd5ee3504`.
+
+#### Mutation checks
+
+Each mutation was restored after running
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs<selector> --seed 0`.
+Every selection below exited 2 on test assertions. Line selectors
+refer to `02fe44d632ad2607ec98c35e946d3f1304cb1274`.
+
+| Selector | Guard disabled | Observed regression |
+|---|---|---|
+| `:1244` | Reconciliation ignores both the read sequence and recorded failure | Both older results could change the handoff. |
+| `:1244` | Reconciliation ignores only the read sequence | The older result could settle while the latest read was still in flight. |
+| `:1509` | Reconciliation ignores only the recorded failure | The latest read could overwrite deadline failure. |
+| `:1302` | Capture reservation time before acquiring the delivery row lock | The overdue worker consumed a read. The request boundary still prevented HTTP. |
+| `:1347` | Use the fixed Req receive and response timeouts | The fake saw 500 ms with only 125 ms left. |
+| `:1363` | Discard qualified resolution in immediate confirmation | The session stayed handoff pending and recovery lacked the closure reason. |
+| `:1385` | Dispatch ignores the recovered claim state | The stalled writer entered POST after recovery. |
+| `:1402` | Preflight ignores the read sequence | The older read entered POST after the replacement reserved a read. |
+| `:1439` | Dispatch only requires a positive lease | The writer entered POST with less than one request timeout left. |
+| `:1461` | Dispatch ignores the session fence | The writer entered POST after public human takeover. |
+| `:1486` | Settlement accepts results after lease expiry | The late reply settled before recovery. |
+| `:1584:1620:1676` | Cron skips dispatched receipts | The lost original ingress job and lost human observation kept an undecided receipt. The late GET alone could still record expiry. |
+| `:1607` | Allow Req entry when remaining time is zero | The overdue first ingress job entered GET. |
+| `:1620:1703` | Apply ownership observations even when the receipt is terminal | The late GET changed ownership after expiry or a replacement decision. |
+| `:1651` | Remove the receipt deadline guard before applying the ownership result | The late read created a session after expiry. |
+| `:163:524:798` | Permit a replacement to read a terminal receipt | The rescued-reply case made an extra ingress GET. |
+| `:1738` | Bypass HMAC, inbox qualification or human sender qualification, in three separate runs | Each change failed the active-reply regression. |
+| `:1789` | Omit pending, sending or unknown handoffs from the sweep, in three separate runs | Each change left the corresponding handoff without its deadline outcome. |
+| `:1069:1209` | Accept handoff observations after the deadline | Immediate and scheduled confirmation incorrectly recorded success. |
+
+#### Follow-up verification
+
+- `devcore-project doctor` initially exited 1 because this checkout
+  lacked a generated environment. `devcore-project plan` and
+  `devcore-project activate` each exited 0. The next doctor and the
+  final doctor each exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix format --check-formatted` and
+  `mise exec -- mix hex.audit` each exited 0 in separate invocations.
+  Hex reported no retired packages or security advisories.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs --seed 0`
+  and the same command with seeds `371486` and `739021` each exited 0.
+  Each run passed 89 tests and skipped none.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 at seed `626599` with 135 passed and five existing F04 skips.
+- `python3 .github/scripts/plan_tests.py` exited 0 and included F06
+  in the seven planned shards.
+- `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0. Gitleaks reported no leaks.
+
+### F07 live gaps
+
+Verify the installed CE tag and digest, bot secret provisioning, real
+webhook bodies, retry/fallback behavior, API token privileges and
+pending/open/human assignment semantics against an approved staging
+inbox. Confirm the show response supplies usable reply capability and
+message context, and test whether the channel exposes durable correlation
+and read visibility after a lost response. The fake accepts a 403 as
+a definitive no-effect rejection. Staging must verify that classification.
+
+A takeover can race between the final qualified ownership GET or local
+claim and the remote POST. Local fencing prevents later attempts and
+protects settlement, while the remote race remains. Keep assisted operation
+while ownership and delivery ambiguity are unresolved. F06 local checks
+are complete. Live Chatwoot and hosted PR CI were outside this run.
+
+### Independent review of d25868e
+
+An independent Claude review approved `d25868e` with no blocking
+findings. It reran the F06 file on three seeds (89 passed each), the
+full suite (135 passed, five F04 skips) and 17 single-change mutations,
+each of which failed the targeted test. It confirmed that `resolved`
+after a handoff write leaves the write UNKNOWN and closes the session.
+
+Corrected in this branch:
+
+- The report attributed the constant-branch compiler warnings to
+  existing tests. This branch adds those tests.
+- The report stated the timeout bound without the real-client limits
+  now recorded under the Req timeout paragraph.
+- `decide_current/4` repeated the ingress deadline check after
+  `session_for/3`. The guard under the receipt row lock already covers
+  it, so the unreachable branch was removed.
+
+Carried forward without a change to this spike:
+
+- VGAS-004: when `authorize_dispatch` denies a claimed writer, no POST
+  occurs, but the row stays SENDING and recovery records UNKNOWN
+  `claim_expired`. The active event then keeps the bot silent in that
+  conversation. G011 permits CANCELLED for a provable non-send.
+- VGAS-004: an input closed as `ingress_deadline_exceeded` leaves the
+  session `bot_active` without a handoff or alert. G010 forbids
+  discarding a message only because it is late, and G012 lists
+  operational failure as a handoff trigger. The production slice needs
+  an operational handoff intent or the G012 idle-routing monitor.
+- VGAS-004: a signed public human reply cancels a pending handoff as
+  `ownership_changed`, while a human observed at claim time records
+  SENT `goal_observed`. Both keep the bot inhibited; the reason codes
+  should be unified.
+- F07: the Finch timeout and HTTP/2 retry limits above.
