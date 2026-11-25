@@ -71,7 +71,7 @@ defmodule VoelgoedAi.Feasibility.EntraClaims do
   use Ash.Resource.Preparation
   require Ash.Query
 
-  alias VoelgoedAi.Feasibility.EntraProvider
+  alias VoelgoedAi.Feasibility.{EntraOIDCCallback, EntraProvider}
 
   @impl true
   def prepare(query, _, %{actor: %{kind: :entra_callback, schema: schema}, tenant: schema}) do
@@ -86,8 +86,8 @@ defmodule VoelgoedAi.Feasibility.EntraClaims do
          %{"sub" => sub, "tid" => tenant} <- info,
          true <- is_binary(sub) and byte_size(sub) in 1..255,
          true <- tenant == EntraProvider.tenant(),
-         %{fields: %{"iss" => issuer, "tid" => ^tenant, "sub" => ^sub} = claims} <-
-           JOSE.JWT.peek_payload(tokens["id_token"]),
+         {:ok, %{"iss" => issuer, "tid" => ^tenant, "sub" => ^sub} = claims} <-
+           EntraOIDCCallback.peek_claims(tokens["id_token"]),
          true <- issuer == EntraProvider.issuer(),
          true <- valid_times?(claims) do
       Ash.Query.filter(

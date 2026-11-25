@@ -4,6 +4,7 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
 
   alias VoelgoedAi.Feasibility.{
     EntraAudit,
+    EntraOIDCCallback,
     EntraOIDCResponse,
     EntraProvider,
     EntraSession,
@@ -373,6 +374,17 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
 
     assert log =~ "entra_oidc_callback_exception"
     refute log =~ "synthetic adapter detail"
+  end
+
+  test "a JOSE payload parse failure returns only the fixed reason" do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, :entra_oidc_callback_exception} =
+                 EntraOIDCCallback.peek_claims("malformed-fixture-payload")
+      end)
+
+    assert log =~ "entra_oidc_callback_exception"
+    refute log =~ "malformed-fixture-payload"
   end
 
   test "the sign-in action rejects caller-supplied claim maps", context do

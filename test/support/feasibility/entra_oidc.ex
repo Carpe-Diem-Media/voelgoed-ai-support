@@ -110,11 +110,18 @@ defmodule VoelgoedAi.Feasibility.EntraOIDCCallback do
   @impl true
   defdelegate authorize_url(config), to: Assent.Strategy.OIDC
 
-  # Isolate dependency exceptions from the Ash sign-in action and controller.
-  # Both run after this call returns and retain their normal error handling.
   @impl true
   def callback(config, params) do
-    Assent.Strategy.OIDC.callback(config, params)
+    decode(fn -> Assent.Strategy.OIDC.callback(config, params) end)
+  end
+
+  def peek_claims(token) do
+    decode(fn -> {:ok, JOSE.JWT.peek_payload(token).fields} end)
+  end
+
+  # Keep both dependency calls separate from policy and activation code.
+  defp decode(dependency_call) do
+    dependency_call.()
   rescue
     _ ->
       Logger.warning("entra_oidc_callback_exception")
