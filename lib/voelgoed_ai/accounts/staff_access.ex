@@ -40,10 +40,20 @@ defmodule VoelgoedAi.Accounts.StaffAccess do
 
     defp scoped_match?(_, _), do: false
 
+    defp matches_target?(:sign_in_with_entra, binding, %Ash.Query{context: context}) do
+      with true <- get_in(context, [:private, :ash_authentication?]),
+           {:ok, registration} <- EntraConfig.enabled() do
+        binding == VoelgoedAi.Accounts.StaffAccess.registration_binding(registration)
+      else
+        _ -> false
+      end
+    end
+
     defp matches_target?(:bootstrap_check, :first_staff, %Ash.Query{}), do: true
 
-    defp matches_target?(:resolve_staff, id, %Ash.Query{} = query),
-      do: id == Ash.Query.get_argument(query, :id)
+    defp matches_target?(action, id, %Ash.Query{} = query)
+         when action in [:resolve_staff, :read_self, :read_staff],
+         do: id == Ash.Query.get_argument(query, :id)
 
     defp matches_target?(:staff_security_history, id, %Ash.Query{} = query),
       do: id == Ash.Query.get_argument(query, :target_id)
@@ -142,27 +152,24 @@ defmodule VoelgoedAi.Accounts.StaffAccess do
 
   def with_current(_, _, _), do: {:error, :denied}
 
-  def read_self(session), do: with_current(session, nil, &{:ok, projection(&1)})
+  def read_self(session),
+    do: with_current(session, nil, &projected_read(:read_self, &1.id))
 
   def read_staff(session, id) do
     if EntraConfig.uuid_text?(id) do
-      with_current(session, :admin, fn admin ->
-        if admin.id == id do
-          {:ok, projection(admin)}
-        else
-          StaffUser
-          |> Ash.Query.for_read(:resolve_staff, %{id: id},
-            actor: %Scope{action: :resolve_staff, target: id}
-          )
-          |> Ash.read_one()
-          |> case do
-            {:ok, %StaffUser{} = staff} -> {:ok, projection(staff)}
-            _ -> {:error, :denied}
-          end
-        end
-      end)
+      with_current(session, :admin, fn _admin -> projected_read(:read_staff, id) end)
     else
       {:error, :denied}
+    end
+  end
+
+  defp projected_read(action, id) do
+    StaffUser
+    |> Ash.Query.for_read(action, %{id: id}, actor: %Scope{action: action, target: id})
+    |> Ash.read_one()
+    |> case do
+      {:ok, %StaffUser{} = staff} -> {:ok, projection(staff)}
+      _ -> {:error, :denied}
     end
   end
 

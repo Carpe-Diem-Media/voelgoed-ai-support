@@ -80,6 +80,11 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
     assert {:ok, %{id: id}} = Accounts.provision(session, invited, [:support_operator])
     assert {:ok, operator} = authenticate(id)
     assert {:ok, :authorized} = Accounts.require_role(operator, :support_operator)
+
+    assert {:ok, %{id: ^id, roles: [:support_operator]} = projection} =
+             Accounts.read_staff(session, id)
+
+    assert Map.keys(projection) |> Enum.sort() == [:id, :last_authenticated_at, :roles, :status]
     assert {:error, :denied} = Accounts.read_staff(operator, session.id)
     assert {:error, :denied} = Accounts.disable(operator, session.id)
 
@@ -235,6 +240,21 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
         Process.sleep(10)
         assert_waiting(backend, deadline)
     end
+  end
+
+  test "the operator invitation input requires an explicit grant and contains only allowlist fields",
+       %{admin: identity} do
+    input = Map.put(identity, :roles, ["ADMIN"])
+
+    assert {:error, :invalid_bootstrap_input} =
+             VoelgoedAi.Accounts.StaffBootstrap.from_json(
+               Jason.encode!(Map.put(input, :unexpected, true))
+             )
+
+    assert :ok = VoelgoedAi.Accounts.StaffBootstrap.from_json(Jason.encode!(input))
+
+    assert {:error, :bootstrap_closed} =
+             VoelgoedAi.Accounts.StaffBootstrap.from_json(Jason.encode!(input))
   end
 
   defp race(operation) do

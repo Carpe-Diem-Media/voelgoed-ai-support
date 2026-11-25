@@ -4,7 +4,8 @@ defmodule VoelgoedAi.Accounts.StaffUser do
   use Ash.Resource,
     domain: VoelgoedAi.Accounts,
     data_layer: AshPostgres.DataLayer,
-    authorizers: [Ash.Policy.Authorizer]
+    authorizers: [Ash.Policy.Authorizer],
+    extensions: [AshAuthentication]
 
   alias VoelgoedAi.Accounts.{EntraConfig, StaffAccess}
   alias VoelgoedAi.Accounts.StaffAccess.Scope
@@ -32,6 +33,27 @@ defmodule VoelgoedAi.Accounts.StaffUser do
       check_constraint(:session_generation, "staff_users_generation_nonnegative",
         check: "session_generation >= 0"
       )
+    end
+  end
+
+  authentication do
+    subject_name(:staff)
+
+    strategies do
+      oidc :entra do
+        base_url(EntraConfig)
+        client_id(EntraConfig)
+        client_secret(EntraConfig)
+        redirect_uri(EntraConfig)
+        client_authentication_method("client_secret_post")
+        registration_enabled?(false)
+        identity_resource(false)
+        warn_on_missing_identity_resource?(false)
+        trust_email_verified?(false)
+        code_verifier(true)
+        nonce(true)
+        sign_in_action_name(:sign_in_with_entra)
+      end
     end
   end
 
@@ -94,6 +116,13 @@ defmodule VoelgoedAi.Accounts.StaffUser do
   end
 
   actions do
+    read :sign_in_with_entra do
+      argument(:user_info, :map, allow_nil?: false, sensitive?: true)
+      argument(:oauth_tokens, :map, allow_nil?: false, sensitive?: true)
+      prepare(VoelgoedAi.Accounts.EntraOIDC.Claims)
+      prepare(AshAuthentication.Strategy.OAuth2.SignInPreparation)
+    end
+
     read :bootstrap_check do
       primary?(true)
     end
@@ -101,6 +130,18 @@ defmodule VoelgoedAi.Accounts.StaffUser do
     read :resolve_staff do
       argument(:id, :uuid, allow_nil?: false)
       filter(expr(id == ^arg(:id)))
+    end
+
+    read :read_self do
+      argument(:id, :uuid, allow_nil?: false)
+      filter(expr(id == ^arg(:id)))
+      prepare(build(select: [:id, :status, :roles, :last_authenticated_at]))
+    end
+
+    read :read_staff do
+      argument(:id, :uuid, allow_nil?: false)
+      filter(expr(id == ^arg(:id)))
+      prepare(build(select: [:id, :status, :roles, :last_authenticated_at]))
     end
 
     create :provision do
@@ -152,9 +193,16 @@ defmodule VoelgoedAi.Accounts.StaffUser do
   end
 
   policies do
+    policy action(:sign_in_with_entra) do
+      forbid_unless(context_equals([:private, :ash_authentication?], true))
+      authorize_if(Scope)
+    end
+
     policy action([
              :bootstrap_check,
              :resolve_staff,
+             :read_self,
+             :read_staff,
              :provision,
              :authenticate,
              :set_roles,
@@ -178,6 +226,7 @@ defmodule VoelgoedAi.Accounts.StaffUser do
       :email,
       :display_name
     ] do
+      forbid_if(action([:read_self, :read_staff]))
       authorize_if({Scope, field_access?: true})
     end
 

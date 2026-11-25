@@ -22,12 +22,11 @@ defmodule VoelgoedAi.StaffFixtures do
       redirect_uri: @redirect
     )
 
-    endpoint = Application.fetch_env!(:voelgoed_ai, VoelgoedAiWeb.Endpoint)
-
-    replace_config(
-      VoelgoedAiWeb.Endpoint,
-      Keyword.put(endpoint, :secret_key_base, Base.encode64(:crypto.strong_rand_bytes(64)))
-    )
+    endpoint = VoelgoedAiWeb.Endpoint
+    original = Application.fetch_env!(:voelgoed_ai, endpoint)
+    key = Base.encode64(:crypto.strong_rand_bytes(64))
+    :ok = endpoint.config_change([{endpoint, Keyword.put(original, :secret_key_base, key)}], [])
+    ExUnit.Callbacks.on_exit(fn -> endpoint.config_change([{endpoint, original}], []) end)
 
     # Every example owns its identifiers. Cleanup matches only this example's
     # fixture rows and their audit references, even after a failed assertion.

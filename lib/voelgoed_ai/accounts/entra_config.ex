@@ -4,6 +4,8 @@ defmodule VoelgoedAi.Accounts.EntraConfig do
   The registration can be specified before the staff routes are enabled.
   """
 
+  use AshAuthentication.Secret
+
   @tenant_pattern ~r/\A[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\z/
   @subject_pattern ~r/\A[!-~](?:[ -~]{0,253}[!-~])?\z/
   @origin "https://login.microsoftonline.com"
@@ -38,12 +40,28 @@ defmodule VoelgoedAi.Accounts.EntraConfig do
          true <- valid_text?(settings[:client_secret], 4096),
          true <- valid_callback?(settings[:redirect_uri]),
          key when is_binary(key) and byte_size(key) >= 64 <-
-           Application.get_env(:voelgoed_ai, VoelgoedAiWeb.Endpoint, [])[:secret_key_base] do
+           VoelgoedAiWeb.Endpoint.config(:secret_key_base) do
       {:ok, registration}
     else
       _ -> {:error, :staff_auth_unavailable}
     end
   end
+
+  @impl true
+  def secret_for([:authentication, :strategies, :entra, field], _, _, _)
+      when field in [:base_url, :client_id, :client_secret, :redirect_uri] do
+    with {:ok, registration} <- enabled() do
+      case field do
+        :base_url -> {:ok, registration.issuer}
+        :client_id -> {:ok, registration.client_id}
+        _ -> {:ok, Application.fetch_env!(:voelgoed_ai, :entra)[field]}
+      end
+    else
+      _ -> :error
+    end
+  end
+
+  def secret_for(_, _, _, _), do: :error
 
   defp valid_callback?(value) when is_binary(value) and byte_size(value) <= 2048 do
     case URI.new(value) do
