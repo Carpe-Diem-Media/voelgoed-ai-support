@@ -1,8 +1,16 @@
 # VGAS — Implementation roadmap
 
-Version 1.0.0 | 2026-11-25 | Architecture accepted; no implementation completed.
+Version 1.0.0 | 2026-11-25 | Architecture accepted. VGAS-000 CONDITIONAL GO for local MVP development.
 
 Authority: VGAS_IMPLEMENTATION_SPEC_v1.0.0.md, VGAS_RESOURCE_CONTRACTS_v1.0.0.md, frozen decision history, AGENTS.md. All phases planned. Build only resources needed for the current slice; prerequisites that are blocked do not preclude unrelated local work. Acceptance and production activation are separate. No further general grilling.
+
+Apply [Amendment A-010](spec/VGAS_SPEC_v1.0.0.md#amendment-a-010--vgas-000-conditional-go-and-application-first-sequencing)
+to the original slice dependencies below. Build and test each local slice
+with verified candidate contracts and deterministic fakes. Live checks
+remain gates for staff use, activation and release. Parent phases may
+stay incomplete while external acceptance is blocked.
+[Amendment A-011](spec/VGAS_SPEC_v1.0.0.md#amendment-a-011--vgas-001-authentication-release-candidate-exception)
+governs the VGAS-001 authentication pins and route conditions.
 
 | Slice | Goal | Scope/exit evidence | Dependencies |
 |---|---|---|---|
@@ -34,6 +42,6 @@ Authority: VGAS_IMPLEMENTATION_SPEC_v1.0.0.md, VGAS_RESOURCE_CONTRACTS_v1.0.0.md
 - Proposed quality targets: ≥95% supported accuracy, ≥98% scope and unanswerable handling each on labelled subsets, 100% high-risk exact/handoff, zero observed critical financial/policy fabrication, privacy/cross-scope disclosure, duplicate fault-test sends, post-detected-human-takeover sends, unauthorised publication or budget violations. Any critical failure blocks launch. ≥100 cases, report counts; not a guarantee. Proposed p95 <15s, 45s deadline, measure actual usage/cost. No auto-resolution or false deflection metric.
 - Global switch, binding detach/routing, fenced outstanding jobs, unknown cost/send reconciliation; restore starts disabled. Rollback documented and rehearsed. Explicit owner approval of quotas, cost, retention, support SLA/idle triage and residual risks.
 
-## Status and non-goals
+## Original status and non-goals
 
 All slices NOT STARTED; VGAS-000 is next. Exact dependency pins, environment, API guarantees, privacy and budget approvals remain unverified. No hosting purchase, live repo creation, DNS or deployment performed by this pack. Numbers are provisional. Do not create every resource at once, overbuild UI or expand scope. See VGAS-000_FEASIBILITY_BRIEF.md for first assignment.
