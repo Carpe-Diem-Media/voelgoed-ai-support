@@ -778,6 +778,69 @@ The Phoenix.ConnTest fixture exercised raw request bytes with the
 endpoint disabled as a server. F07 still owns live status and assignment
 subscriptions, response payload and channel checks.
 
+### Deadline and read-back review fixes
+
+Implementation commit `e40d43bab3168661ff58665a0b73fc5fcd9151be`.
+Comparison base `a731a06a0d54d61438c6e709e5a3170e6b60b7ed`
+(`origin/main`). The deadline job now closes an unclaimed handoff as
+FAILED even after Oban discards its last preflight. A discarded reply
+preflight ends in CANCELLED and releases its active slot. A claimed
+write stays UNKNOWN on expiry, and a late response cannot overwrite it.
+Each GET after intent creation reserves a read on the delivery row
+before entering Req. Handoff preflight, immediate confirmation and
+scheduled read-back share the same three reads. A scheduled read-back
+can confirm qualified open status or human ownership. The recovery
+failure reason records budget exhaustion, deadline expiry or a
+qualified resolution without asserting the write's outcome.
+
+Each mutation below changed one guard, ran the affected ExUnit
+selection and restored the source. The command was
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs<selector> --seed 0`.
+Each mutated selection exited 2 on test assertions. The positions
+refer to the implementation commit.
+
+| Guard changed | Selection | Observed failures |
+|---|---|---|
+| Route away the deadline job inserted with the intent | `:831:854` | Both discarded preflight cases stayed pending |
+| Remove the atomic read cap | `:902:831` | The concurrent handoff duplicate and replacement reply entered GET |
+| Allow a retry after the third failed preflight | `:884` | The replacement handoff job attempted a retry |
+| Remove the deadline check before reserving a read | `:969:537` | Both the rescued reconciliation and expired preflight entered GET |
+| Accept a preflight result at the deadline | `:1148` | The late preflight entered POST |
+| Accept a scheduled read-back result at the deadline | `:1090` | The late read-back marked the handoff SENT |
+| Accept an immediate confirmation at the deadline | `:1230` | The late confirmation marked the handoff SENT |
+| Route away the read-back job inserted with UNKNOWN | `:805:996` | Neither timeout nor lost claim queued the expected read-back |
+| Skip pending intents in the recurring sweep | `:1021` | The discarded deadline left the reply pending |
+| Skip claimed intents in the deadline handler | `:1059` | The discarded lease check left the reply SENDING. The lease race still passed |
+| Allow a late write result to settle UNKNOWN | `:1059` | Both reply races overwrote claim recovery |
+| Remove the state check from read reservation | `:1200` | A stale write worker consumed the recovery read |
+| Allow reads after recovery records a failure | `:1177` | A replacement reconciliation read after qualified resolution |
+| Omit the read budget exhaustion reason | `:937` | The unconfirmed handoff lacked the recovery failure |
+| Bypass read reservation on immediate confirmation | `:1122` | The successful POST response triggered a fourth GET |
+| Omit account qualification on GET | `:937` | A wrong-account response marked the handoff SENT |
+
+### Deadline and read-back verification
+
+- `devcore-project doctor` exited 1 with no local environment.
+  `devcore-project plan` and `devcore-project activate` each exited 0.
+  `devcore-project doctor` then exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix format --check-formatted` and
+  `mise exec -- mix hex.audit` each exited 0. Hex reported no retired
+  or advisory packages.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs --seed 0`
+  and the same command with seeds 371486 and 739021 each exited 0.
+  Each run passed 68 tests with zero skips.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 at seed 817750 with 114 passed and five existing F04 skips.
+  The existing replay cases still emitted constant-branch warnings.
+- `python3 .github/scripts/plan_tests.py` exited 0 and planned seven
+  shards, including F06.
+- `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0 for the implementation commit. Gitleaks reported no leaks.
+
 ### F07 live gaps
 
 Verify the installed CE tag and digest, bot secret provisioning, real
