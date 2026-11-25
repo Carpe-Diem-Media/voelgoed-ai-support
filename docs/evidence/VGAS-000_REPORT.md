@@ -738,6 +738,72 @@ Review-fix verification on DevCore TEST, with all mutations reverted:
   The staged scan found no leaks. GitHub Actions on the review-fix
   candidate remains unverified.
 
+### Identity and discovery re-review fixes
+
+The re-review of `e35b85af91b27489447a832a9afbd318e1a2c4e2` found
+that Ash trimmed an invited subject and that Assent used malformed
+discovery metadata. The fixes and five regression tests are in
+`306d0015b7a39c2c98685a82f07b850fa40c82c8`.
+
+- **Exact identity.** The fixture keeps issuer, subject and tenant text
+  as supplied. Ash 3.38.1 documents `trim?` and `allow_empty?` in
+  `deps/ash/lib/ash/type/string.ex`. The tenant keeps the UUID shape
+  without going through Ash's trimming and lowercasing UUID cast. The
+  signed tenant still has to match the configured tenant exactly. A
+  PostgreSQL read returned the subject with its original space and tab.
+  Signing in with the distinct unpadded subject returned 401, issued no
+  session and left the row invited with only its provisioning audit event.
+  The exact padded subject activated successfully. The fixture treats
+  subject bytes as opaque and preserves padding.
+- **Provider metadata.** The adapter validates all three endpoints as
+  absolute HTTPS URLs with a host, a valid port and valid percent escapes.
+  It rejects userinfo and fragments. An advertised authentication-method
+  list must contain only strings and include the configured method.
+  Assent 0.3.2 reads these fields and the issuer in this flow. Its optional
+  userinfo path is unused. The fixture accepts omitted method metadata.
+  Each invalid endpoint or method case returned 401 in both phases with
+  no redirect, session or token exchange.
+
+The new regressions run against DevCore TEST and private provider stubs.
+Before the fixes, the focused run exited 2. It observed 204 for the
+unpadded subject and a callback exception for a numeric method value.
+For each mutation, the command was
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs:<line> --seed 0`.
+Each of the 22 runs below exited 2 with 0 of 1 selected tests passing
+and 23 excluded. The source was restored after each run.
+
+- Line 64 caught subject trimming.
+- Line 76 caught issuer and tenant trimming, removal of the tenant UUID
+  shape check, and empty issuer or subject acceptance.
+- Line 141 caught the removal of each endpoint check, the endpoint type
+  check, HTTPS, the missing and empty host checks, userinfo, fragments,
+  the port range, URI syntax and percent-escape checks.
+- Line 163 caught removal of the method list type, item type and
+  configured-method membership checks.
+- Line 174 caught denial when the optional method field was absent.
+
+The following checks ran with the mutations reverted.
+
+- `devcore-project doctor` exited 1 with `.env.local` missing.
+  `devcore-project plan` and `devcore-project activate` each exited 0.
+  The second `devcore-project doctor` exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix deps.unlock --check-unused`,
+  `mise exec -- mix format --check-formatted` and
+  `mise exec -- mix hex.audit` each exited 0. Hex reported no retired
+  packages or advisories.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+  exited 0 on seeds `0`, `17` and `2026`, each with 24 passed and no skips.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 on seed `113341`, with 70 passed and five existing F04
+  disposable-target skips.
+- `python3 .github/scripts/plan_tests.py` included F08 and exited 0.
+  `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0. Gitleaks found no leaks.
+
 VGAS-9 still needs real tenant, app, consent and callback approval.
 Its smoke test must check actual claims, browser cookie delivery, signing
 keys and revocation with approved test users. A later LiveView integration
