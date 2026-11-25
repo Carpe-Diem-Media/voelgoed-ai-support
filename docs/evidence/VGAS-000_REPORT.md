@@ -593,7 +593,7 @@ VGAS-9 owns proof against an authorised live Entra test registration.
 The feasibility brief classifies F08 as **PARTIAL** while that live
 proof is pending.
 
-The 2026-11-25 run used branch `feat/vgas-6-f08-entra-authz` at base
+The initial 2026-11-25 run used branch `feat/vgas-6-f08-entra-authz` at base
 `324cb105d749de50b31f3ea007cabd931a915ff0`. The diff for
 `config`, `lib`, `test` and `mix.exs` against that base has SHA-256
 `fe0ae4b9cbb3b30467253b3fabbab2dbc7a42dd4e6996e312ca6800f207d0adf`.
@@ -686,6 +686,57 @@ pairwise subjects. The relevant pinned implementation is
   `git diff --check`, `git diff --cached --check` and
   `mise exec gitleaks@8.30.1 -- gitleaks git --staged --redact` exited 0.
   Gitleaks found no leaks. GitHub Actions on the candidate remains unverified.
+
+### Review fixes after integrating main
+
+The independent review of `e5f6029230ae4bf5276a596881e17baf4c8f7ad2`
+found that Assent 0.3.2 used discovery endpoints before the signed-issuer
+check ran. The test-only HTTP adapter now checks the discovery issuer
+against the configured issuer by exact string comparison before handing
+the response to Assent in either phase. It also requires authorization,
+token and JWKS endpoints. Both phases return 401 with no redirect or
+session for invalid discovery. A callback with valid saved state and
+PKCE never reaches the fake token endpoint when discovery fails.
+[OIDC Discovery §4.3](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationValidation).
+
+An authenticated staff member with an empty local role grant fails both
+privileged probes despite provider role claims. For disablement and role
+changes, a PostgreSQL constraint rejects the audit append. Both management
+calls return an invalid `Ash.Changeset`. The transaction preserves the
+staff row and the existing session's access. These tests cover the existing
+role check and transaction in `EntraStore`.
+
+With only the discovery issuer comparison removed, the request returned
+302 and the callback hit the token endpoint once. Bypassing the adapter
+raised a `BadMapError` on empty metadata. Omitting each required endpoint
+check separately allowed a redirect or an exchange. Letting empty role
+grants pass returned 204 on an admin probe that should return 403.
+Removing the management transaction separately for each action caused
+the persisted state assertion to fail. Each mutated ExUnit run exited 2.
+All mutations were reverted.
+
+The review-fix branch incorporates main
+`a731a06a0d54d61438c6e709e5a3170e6b60b7ed`. The diff for
+`config`, `lib`, `test` and `mix.exs` against that main has SHA-256
+`570c6df3d262c0a668dc3641d878b50b83e6ccf2df78c5a16f8c669fdea60e17`.
+
+Review-fix verification on DevCore TEST, with all mutations reverted:
+
+- `mise exec -- mix format --check-formatted` and
+  `rm -rf _build/test && MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0. The build emitted dependency warnings during the clean compile.
+- `mise exec -- mix deps.get --check-locked` and `mise exec -- mix hex.audit`
+  exited 0. Hex reported no retired packages or advisories.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --no-color test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+  exited 0 on seeds `0`, `17` and `2026`. Each run passed all 19 F08 tests.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --no-color`
+  exited 0 on seed `934318`, with 65 passed and five existing F04
+  disposable-target skips.
+- `python3 .github/scripts/plan_tests.py` exited 0 and included F08.
+  `git diff --check`, `git diff --cached --check` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --staged --redact` exited 0.
+  The staged scan found no leaks. GitHub Actions on the review-fix
+  candidate remains unverified.
 
 VGAS-9 still needs real tenant, app, consent and callback approval.
 Its smoke test must check actual claims, browser cookie delivery, signing

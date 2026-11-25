@@ -1,3 +1,41 @@
+defmodule VoelgoedAi.Feasibility.EntraDiscoveryAdapter do
+  @moduledoc false
+  @behaviour Assent.HTTPAdapter
+
+  alias Assent.HTTPAdapter.{HTTPResponse, Req}
+  alias VoelgoedAi.Feasibility.EntraProvider
+
+  @required_endpoints ~w(authorization_endpoint token_endpoint jwks_uri)
+
+  @impl true
+  def request(method, url, body, headers, opts) do
+    response = Req.request(method, url, body, headers, opts)
+    issuer = EntraProvider.issuer()
+
+    if method == :get and url == issuer <> "/.well-known/openid-configuration" do
+      validate_discovery(response, issuer)
+    else
+      response
+    end
+  end
+
+  # Assent 0.3.2 uses discovery endpoints before it checks the signed token.
+  # Validate the metadata on both the redirect and the callback (OIDC Discovery §4.3).
+  defp validate_discovery({:ok, %HTTPResponse{status: 200, body: metadata}} = response, issuer) do
+    with %{"issuer" => discovered_issuer} <- metadata,
+         true <- discovered_issuer === issuer,
+         true <- Enum.all?(@required_endpoints, &endpoint_present?(metadata[&1])) do
+      response
+    else
+      _ -> {:error, :invalid_discovery_metadata}
+    end
+  end
+
+  defp validate_discovery(response, _issuer), do: response
+
+  defp endpoint_present?(value), do: is_binary(value) and String.trim(value) != ""
+end
+
 defmodule VoelgoedAi.Feasibility.EntraClaims do
   @moduledoc false
   use Ash.Resource.Preparation

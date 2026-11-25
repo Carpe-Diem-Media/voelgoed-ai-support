@@ -15,6 +15,6 @@ if config_env() == :test do
 
   config :ash_authentication,
          :http_adapter,
-         {Assent.HTTPAdapter.Req,
+         {VoelgoedAi.Feasibility.EntraDiscoveryAdapter,
           [plug: {Req.Test, VoelgoedAi.Feasibility.EntraProvider}, retry: false, redirect: false]}
 end

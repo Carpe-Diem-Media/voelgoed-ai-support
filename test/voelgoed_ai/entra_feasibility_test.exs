@@ -43,7 +43,6 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
       missing_tenant: [omit: ["tid"]],
       wrong_issuer: [claims: %{"iss" => other_issuer}],
       missing_issuer: [omit: ["iss"]],
-      substituted_issuer: [metadata_issuer: other_issuer, claims: %{"iss" => other_issuer}],
       substituted_subject: [claims: %{"sub" => "another-subject"}],
       missing_subject: [omit: ["sub"]],
       empty_subject: [claims: %{"sub" => ""}],
@@ -59,6 +58,50 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
     end
 
     assert EntraStore.staff_snapshot(context.schema) == [[staff.id, "invited", 0]]
+  end
+
+  test "an inexact discovery issuer prevents the authorization redirect", context do
+    metadata = EntraProvider.metadata(metadata_issuer: EntraProvider.issuer() <> "/")
+    flow = EntraProvider.start_sign_in(context, "staff-subject", callback_metadata: metadata)
+
+    assert_sign_in_denied(EntraProvider.request(context, "/staff/entra"))
+    assert :atomics.get(flow.exchange_count, 1) == 0
+  end
+
+  test "a substituted discovery issuer prevents exchange of a valid code", context do
+    assert {:ok, staff} = EntraStore.invite(context.schema, "staff-subject", [:admin])
+    issuer = "https://other-issuer.example.test/v2.0"
+
+    flow =
+      EntraProvider.start_sign_in(context, "staff-subject",
+        callback_metadata: EntraProvider.metadata(metadata_issuer: issuer),
+        claims: %{"iss" => issuer}
+      )
+
+    denied = EntraProvider.callback(flow)
+    assert :atomics.get(flow.exchange_count, 1) == 0
+    assert_sign_in_denied(denied)
+    assert EntraStore.staff_snapshot(context.schema) == [[staff.id, "invited", 0]]
+  end
+
+  test "empty discovery denies both phases before using endpoints", context do
+    for document <- [nil, "", %{}] do
+      assert_discovery_denied(context, document)
+    end
+  end
+
+  test "incomplete discovery denies both phases before using endpoints", context do
+    metadata = EntraProvider.metadata()
+
+    for document <- [
+          Map.delete(metadata, "issuer"),
+          Map.delete(metadata, "authorization_endpoint"),
+          Map.delete(metadata, "token_endpoint"),
+          Map.delete(metadata, "jwks_uri"),
+          %{metadata | "token_endpoint" => ""}
+        ] do
+      assert_discovery_denied(context, document)
+    end
   end
 
   test "valid but unlisted identity is denied", context do
@@ -304,6 +347,15 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
              [:append, :evidence]
   end
 
+  test "an empty local role grant confers no privilege", context do
+    assert {:ok, staff} = EntraStore.invite(context.schema, "staff-subject", [])
+    callback = EntraProvider.sign_in(context, "staff-subject")
+    assert callback.status == 204
+    assert {:ok, %{status: :active, roles: []}} = EntraStore.member(context.schema, staff.id)
+    assert EntraProvider.request(context, "/admin", callback).status == 403
+    assert EntraProvider.request(context, "/review", callback).status == 403
+  end
+
   test "audit rejection rolls activation back and prevents session issuance", context do
     assert {:ok, staff} = EntraStore.invite(context.schema, "staff-subject", [:admin])
 
@@ -333,6 +385,50 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
     assert [%{target_id: id}] = audit(other_schema)
     assert id == other.id
     assert Enum.all?(audit(context.schema), &(&1.target_id == staff.id))
+  end
+
+  test "audit rejection rolls back management and preserves existing session access", context do
+    assert {:ok, staff} = EntraStore.invite(context.schema, "staff-subject", [:admin])
+    callback = EntraProvider.sign_in(context, "staff-subject")
+    assert callback.status == 204
+    actor = EntraSession.actor(callback)
+    assert {:ok, before} = EntraStore.member(context.schema, staff.id)
+    assert EntraProvider.request(context, "/admin", callback).status == 204
+    assert EntraProvider.request(context, "/review", callback).status == 403
+
+    Repo.query!("""
+    ALTER TABLE #{context.schema}.audit
+    ADD CONSTRAINT reject_management CHECK (action NOT IN ('disable', 'change_roles'))
+    """)
+
+    for {action, attrs} <- [disable: %{}, change_roles: %{roles: [:knowledge_reviewer]}] do
+      result = EntraStore.manage(context.schema, actor, staff.id, action, attrs)
+      assert {:ok, after_attempt} = EntraStore.member(context.schema, staff.id)
+
+      fields = [:status, :roles, :generation, :disabled_at, :updated_at]
+      assert Map.take(after_attempt, fields) == Map.take(before, fields)
+      assert EntraProvider.request(context, "/admin", callback).status == 204
+      assert EntraProvider.request(context, "/review", callback).status == 403
+      assert {:error, %Ash.Changeset{valid?: false}} = result
+    end
+
+    assert Enum.sort(Enum.map(audit(context.schema), & &1.action)) == [:activate, :provision]
+  end
+
+  defp assert_discovery_denied(context, document) do
+    flow = EntraProvider.start_sign_in(context, "staff-subject", callback_metadata: document)
+    request = EntraProvider.request(context, "/staff/entra")
+    callback = EntraProvider.callback(flow)
+
+    assert :atomics.get(flow.exchange_count, 1) == 0
+    assert_sign_in_denied(request)
+    assert_sign_in_denied(callback)
+  end
+
+  defp assert_sign_in_denied(conn) do
+    assert conn.status == 401
+    assert Plug.Conn.get_resp_header(conn, "location") == []
+    assert Plug.Conn.get_session(conn) == %{}
   end
 
   defp audit(schema) do

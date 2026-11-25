@@ -54,6 +54,7 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
 
     stub(fn
       %{method: "POST", host: @host, request_path: "/token"} = conn ->
+        attempt = :atomics.add_get(exchange_count, 1, 1)
         {:ok, body, conn} = read_body(conn)
 
         assert %{
@@ -65,7 +66,7 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
 
         assert Base.url_encode64(:crypto.hash(:sha256, verifier), padding: false) == challenge
 
-        if :atomics.add_get(exchange_count, 1, 1) == 1 and opts[:unavailable] != :token do
+        if attempt == 1 and opts[:unavailable] != :token do
           Req.Test.json(conn, %{"id_token" => token, "access_token" => "synthetic-access"})
         else
           send_resp(conn, 400, "")
@@ -79,7 +80,7 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
         end
 
       conn ->
-        discovery(conn, metadata, opts[:unavailable])
+        discovery(conn, Keyword.get(opts, :callback_metadata, metadata), opts[:unavailable])
     end)
 
     flow
@@ -102,7 +103,7 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
     EntraRouter.call(conn, EntraRouter.init([]))
   end
 
-  defp metadata(opts) do
+  def metadata(opts \\ []) do
     %{
       "issuer" => opts[:metadata_issuer] || @issuer,
       "authorization_endpoint" => @authorize,
