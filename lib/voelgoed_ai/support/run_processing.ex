@@ -498,7 +498,11 @@ defmodule VoelgoedAi.Support.RunProcessing do
       })
 
   @doc false
-  def job_result({:ok, _}), do: :ok
+  def job_result({:ok, result}) do
+    unless Repo.in_transaction?(), do: VoelgoedAi.Support.OperationalAlert.report(result)
+    :ok
+  end
+
   def job_result({:error, reason}) when is_atom(reason), do: {:error, reason}
   def job_result({:error, _}), do: {:error, :storage_failure}
 end

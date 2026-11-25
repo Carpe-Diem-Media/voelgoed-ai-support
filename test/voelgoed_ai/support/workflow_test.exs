@@ -63,10 +63,22 @@ defmodule VoelgoedAi.Support.WorkflowTest do
     assert {:ok, %{id: receipt_id}} = SupportDBCase.signed_receipt(ctx)
     assert :ok = ProcessEvent.perform(%Oban.Job{args: %{"event_id" => receipt_id}})
 
-    assert %{rows: [[run_id]]} =
+    revision = ctx.revision.id
+
+    assert %{rows: [[run_id, ^revision, true, true, true, true]]} =
              SQL.query!(
                Repo,
-               "SELECT id::text FROM support_runs WHERE session_id IN (SELECT id FROM support_sessions WHERE conversation_id = $1)",
+               """
+               SELECT r.id::text, r.assistant_revision_id::text,
+                      r.ownership_epoch = s.ownership_epoch, r.binding_epoch = b.security_epoch,
+                      r.assistant_epoch = a.security_epoch, r.control_epoch = c.security_epoch
+               FROM support_runs r
+               JOIN support_sessions s ON s.id = r.session_id
+               JOIN inbox_bindings b ON b.id = s.binding_id
+               JOIN assistants a ON a.id = b.assistant_id
+               CROSS JOIN automation_controls c
+               WHERE s.conversation_id = $1
+               """,
                [ctx.event.conversation_id]
              )
 
@@ -78,6 +90,163 @@ defmodule VoelgoedAi.Support.WorkflowTest do
     assert %{rows: [["sent", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
     assert [{:reply, destination, "Synthetic fixture", _operation}] = SupportDBCase.writes(ctx)
     assert destination.conversation == ctx.event.conversation_id
+  end
+
+  test "a signed request on an unconfigured installation creates no receipt", ctx do
+    assert SupportDBCase.signed_request(ctx, & &1, "unconfigured").status == 404
+
+    assert %{rows: [[0]]} =
+             SQL.query!(Repo, "SELECT count(*) FROM inbound_events WHERE message_id = $1", [
+               ctx.event.message_id
+             ])
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "concurrent deliveries of the same signed receipt register one event and one job", ctx do
+    assert {:ok, waiter} =
+             Repo.transact(fn ->
+               assert SupportDBCase.signed_request(ctx, & &1).status == 204
+
+               waiter =
+                 VoelgoedAi.SupportFixtures.blocked_task(fn ->
+                   SupportDBCase.signed_request(ctx, & &1).status
+                 end)
+
+               {:ok, waiter}
+             end)
+
+    assert 204 = Task.await(waiter, 5_000)
+
+    assert %{rows: [[id]]} =
+             SQL.query!(Repo, "SELECT id::text FROM inbound_events WHERE message_id = $1", [
+               ctx.event.message_id
+             ])
+
+    assert %{rows: [[1]]} =
+             SQL.query!(Repo, "SELECT count(*) FROM oban_jobs WHERE args->>'event_id' = $1", [id])
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "restoring global control cannot replay a pending public reply", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.disable_automation(ctx)
+    SupportDBCase.enable_automation(ctx)
+    assert :ok = Delivery.deliver(id)
+    assert :ok = Recovery.sweep()
+    assert %{rows: [["cancelled", 0]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "an unassigned pending conversation never admits a run", ctx do
+    Agent.update(ctx.fake, &%{&1 | observation: %{&1.observation | assignee: :unassigned}})
+    assert {:ok, id} = Ingress.accept(ctx.event)
+    assert :ok = RunProcessing.process_event(id)
+
+    assert %{rows: [["triage", "scope_denied"]]} =
+             SQL.query!(
+               Repo,
+               "SELECT disposition, reason_code FROM inbound_events WHERE id = $1",
+               [Ecto.UUID.dump!(id)]
+             )
+
+    assert %{rows: [[0]]} =
+             SQL.query!(Repo, "SELECT count(*) FROM support_runs WHERE session_id = $1", [
+               Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+             ])
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "an out-of-order receipt is batched by verified history without moving the hard cutoff",
+       ctx do
+    assert {:ok, first} = Ingress.accept(ctx.event)
+    assert :ok = RunProcessing.process_event(first)
+    SupportDBCase.advance_clock(ctx, 4)
+
+    older = %{
+      ctx.event
+      | message_id: ctx.event.message_id + 1,
+        received_at: DateTime.add(ctx.event.received_at, 4)
+    }
+
+    Agent.update(ctx.fake, fn state ->
+      [first] = state.history
+      %{state | history: [%{first | id: older.message_id}, first]}
+    end)
+
+    assert {:ok, late} = Ingress.accept(older)
+    assert :ok = RunProcessing.process_event(late)
+    session = Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+
+    assert %{rows: [[run, cutoff, deadline]]} =
+             SQL.query!(
+               Repo,
+               "SELECT id::text, batch_cutoff_at, deadline_at FROM support_runs WHERE session_id = $1",
+               [session]
+             )
+
+    assert cutoff == ctx.event.received_at |> DateTime.add(5) |> DateTime.to_naive()
+    assert deadline == ctx.event.received_at |> DateTime.add(45) |> DateTime.to_naive()
+    assert :ok = RunProcessing.process_run(run)
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "state")
+
+    SupportDBCase.advance_clock(ctx, 1)
+    assert :ok = RunProcessing.process_run(run)
+
+    assert %{rows: [[^late, 0], [^first, 1]]} =
+             SQL.query!(
+               Repo,
+               "SELECT event_id::text, position FROM run_inputs WHERE run_id = $1 ORDER BY position",
+               [Ecto.UUID.dump!(run)]
+             )
+
+    assert %{rows: [["pending"]]} = SupportDBCase.delivery_rows(ctx, "state")
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "oversize input is stored as triage with no work or text", ctx do
+    assert SupportDBCase.signed_request(ctx, &Map.put(&1, "content", String.duplicate("x", 3001))).status ==
+             204
+
+    assert %{rows: [[id, "quarantined", "triage", "oversize"]]} =
+             SQL.query!(
+               Repo,
+               "SELECT id::text, state, disposition, reason_code FROM inbound_events WHERE message_id = $1",
+               [ctx.event.message_id]
+             )
+
+    assert %{rows: [[0]]} =
+             SQL.query!(Repo, "SELECT count(*) FROM oban_jobs WHERE args->>'event_id' = $1", [id])
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "the recovery sweep requeues at most 25 stranded receipts per pass", ctx do
+    ids =
+      for offset <- 1..26 do
+        assert {:ok, id} =
+                 Ingress.accept(%{ctx.event | message_id: ctx.event.message_id + offset})
+
+        id
+      end
+
+    assert %{num_rows: 26} =
+             SQL.query!(Repo, "DELETE FROM oban_jobs WHERE args->>'event_id' = ANY($1::text[])", [
+               ids
+             ])
+
+    assert :ok = Recovery.sweep()
+
+    assert %{rows: [[25]]} =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM oban_jobs WHERE args->>'event_id' = ANY($1::text[])",
+               [ids]
+             )
+
+    assert [] = SupportDBCase.writes(ctx)
   end
 
   for response <- [:fixed_reply, :handoff] do
@@ -267,6 +436,29 @@ defmodule VoelgoedAi.Support.WorkflowTest do
 
     assert %{rows: [["pending"]]} = SupportDBCase.delivery_rows(ctx, "state")
     assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "PostgreSQL rejects a second active run for the same session", ctx do
+    assert {:ok, receipt} = Ingress.accept(ctx.event)
+    assert :ok = RunProcessing.process_event(receipt)
+    session = Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+
+    assert {:error,
+            %Postgrex.Error{
+              postgres: %{code: :unique_violation, constraint: "support_runs_one_active"}
+            }} =
+             Repo.transact(fn ->
+               SQL.query(
+                 Repo,
+                 """
+                 INSERT INTO support_runs
+                 SELECT (jsonb_populate_record(NULL::support_runs,
+                         to_jsonb(r) || jsonb_build_object('id', uuidv7(), 'turn_ref', uuidv7()))).*
+                 FROM support_runs r WHERE r.session_id = $1 AND r.state = 'queued'
+                 """,
+                 [session]
+               )
+             end)
   end
 
   test "reopening inherits human inhibit and unresolved delivery across generations", ctx do

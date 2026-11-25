@@ -162,7 +162,7 @@ defmodule VoelgoedAi.SupportDBCase do
     {:ok, %{id: id}}
   end
 
-  def signed_request(%{event: event, fake: fake}, transform) do
+  def signed_request(%{event: event, fake: fake}, transform, installation \\ "synthetic") do
     timestamp = Agent.get(fake, &Integer.to_string(DateTime.to_unix(&1.now)))
 
     bytes =
@@ -190,11 +190,34 @@ defmodule VoelgoedAi.SupportDBCase do
       :crypto.mac(:hmac, :sha256, @signing_key, [timestamp, ".", bytes])
       |> Base.encode16(case: :lower)
 
-    Plug.Test.conn(:post, "/webhooks/chatwoot/synthetic", bytes)
+    Plug.Test.conn(:post, "/webhooks/chatwoot/#{installation}", bytes)
     |> put_req_header("content-type", "application/json")
     |> put_req_header("x-chatwoot-timestamp", timestamp)
     |> put_req_header("x-chatwoot-signature", "sha256=" <> digest)
     |> Endpoint.call(Endpoint.init([]))
+  end
+
+  def next_conversation(ctx, increment) do
+    now = Agent.get(ctx.fake, & &1.now)
+
+    event = %{
+      ctx.event
+      | conversation_id: ctx.event.conversation_id + increment,
+        message_id: ctx.event.message_id + increment,
+        received_at: now
+    }
+
+    Agent.update(ctx.fake, fn state ->
+      destination = %{state.observation.destination | conversation: event.conversation_id}
+
+      %{
+        state
+        | observation: %{state.observation | destination: destination},
+          history: [%Message{id: event.message_id, sender: :contact, visibility: :public}]
+      }
+    end)
+
+    %{ctx | event: event}
   end
 
   def advance_clock(%{fake: fake}, seconds),

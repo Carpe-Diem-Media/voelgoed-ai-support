@@ -109,7 +109,7 @@ defmodule VoelgoedAi.Support.Recovery do
       else: exhausted(row)
   end
 
-  defp exhausted(%{reason_code: :read_exhausted} = row), do: {:ok, row}
+  defp exhausted(%{reason_code: :read_exhausted}), do: {:ok, :finished}
 
   defp exhausted(row),
     do: WorkStore.update(row, :reconcile, %{reason_code: :read_exhausted})

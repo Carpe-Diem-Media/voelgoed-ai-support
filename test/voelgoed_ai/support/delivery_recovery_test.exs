@@ -66,7 +66,7 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert :ok = Delivery.deliver(id)
     assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
 
-    another = next_conversation(ctx, 1)
+    another = SupportDBCase.next_conversation(ctx, 1)
     another_id = SupportDBCase.prepare_reply(another)
     SupportDBCase.write_mode(ctx, :accepted)
     assert :ok = Delivery.deliver(another_id)
@@ -77,11 +77,11 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert [_] = SupportDBCase.writes(ctx)
 
     SupportDBCase.advance_clock(ctx, 61)
-    probe = next_conversation(ctx, 2)
+    probe = SupportDBCase.next_conversation(ctx, 2)
     probe_id = SupportDBCase.prepare_reply(probe)
-    competing = next_conversation(ctx, 3)
+    competing = SupportDBCase.next_conversation(ctx, 3)
     competing_id = SupportDBCase.prepare_reply(competing)
-    next_conversation(ctx, 2)
+    SupportDBCase.next_conversation(ctx, 2)
 
     SupportDBCase.block_next_conversation(ctx, self())
     task = Task.async(fn -> Delivery.deliver(probe_id) end)
@@ -102,34 +102,52 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
 
     assert [_] = SupportDBCase.writes(ctx)
 
-    fresh = next_conversation(ctx, 4)
+    fresh = SupportDBCase.next_conversation(ctx, 4)
     fresh_id = SupportDBCase.prepare_reply(fresh)
     assert :ok = Delivery.deliver(fresh_id)
     assert %{rows: [["sent", 1]]} = SupportDBCase.delivery_rows(fresh, "state, attempt_count")
     assert [_, _] = SupportDBCase.writes(ctx)
   end
 
-  defp next_conversation(ctx, increment) do
-    now = Agent.get(ctx.fake, & &1.now)
+  test "five consecutive transient failures open the binding and a failed probe keeps it open",
+       ctx do
+    SupportDBCase.write_mode(ctx, :timeout)
 
-    event = %{
-      ctx.event
-      | conversation_id: ctx.event.conversation_id + increment,
-        message_id: ctx.event.message_id + increment,
-        received_at: now
-    }
+    for number <- 1..5 do
+      conversation = SupportDBCase.next_conversation(ctx, number)
+      id = SupportDBCase.prepare_reply(conversation)
+      assert :ok = Delivery.deliver(id)
 
-    Agent.update(ctx.fake, fn state ->
-      destination = %{state.observation.destination | conversation: event.conversation_id}
+      assert %{rows: [["unknown", 1]]} =
+               SupportDBCase.delivery_rows(conversation, "state, attempt_count")
+    end
 
-      %{
-        state
-        | observation: %{state.observation | destination: destination},
-          history: [%Message{id: event.message_id, sender: :contact, visibility: :public}]
-      }
-    end)
+    sixth = SupportDBCase.next_conversation(ctx, 6)
+    id = SupportDBCase.prepare_reply(sixth)
+    assert :ok = Delivery.deliver(id)
 
-    %{ctx | event: event}
+    assert %{rows: [["cancelled", 0]]} =
+             SupportDBCase.delivery_rows(sixth, "state, attempt_count")
+
+    assert length(SupportDBCase.writes(ctx)) == 5
+
+    SupportDBCase.advance_clock(ctx, 61)
+    probe = SupportDBCase.next_conversation(ctx, 7)
+    probe_id = SupportDBCase.prepare_reply(probe)
+    Agent.update(ctx.fake, &Map.put(&1, :conversation_result, {:error, :unavailable}))
+    assert :ok = Delivery.deliver(probe_id)
+    Agent.update(ctx.fake, &Map.delete(&1, :conversation_result))
+
+    still_open = SupportDBCase.next_conversation(ctx, 8)
+    still_open_id = SupportDBCase.prepare_reply(still_open)
+    reads = read_count(ctx)
+    assert :ok = Delivery.deliver(still_open_id)
+    assert read_count(ctx) == reads
+
+    assert %{rows: [["cancelled", 0]]} =
+             SupportDBCase.delivery_rows(still_open, "state, attempt_count")
+
+    assert length(SupportDBCase.writes(ctx)) == 5
   end
 
   test "qualified no-effect before dispatch differs from an absent read-back", ctx do
@@ -438,6 +456,13 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}, 1_000
 
+    assert %{num_rows: 1} =
+             SQL.query!(
+               Repo,
+               "UPDATE oban_jobs SET state = 'discarded', discarded_at = now() WHERE worker LIKE '%Deliver' AND args->>'delivery_id' = $1",
+               [id]
+             )
+
     assert %{num_rows: count} =
              SQL.query!(
                Repo,
@@ -496,6 +521,10 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     SupportDBCase.write_mode(ctx, :timeout)
     assert :ok = Delivery.deliver(id)
 
+    assert {:ok, receipt} = Ingress.accept(ctx.event)
+    assert :ok = RunProcessing.process_event(receipt)
+    assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+
     SupportDBCase.append_public_input(ctx, ctx.event.message_id + 1)
 
     assert {:ok, event_id} =
@@ -542,6 +571,23 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
     assert :ok = Recovery.reconcile(id)
     assert %{rows: [["sent", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  test "an expired writer cannot settle even before recovery starts", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.block_next_write(ctx, self())
+    task = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:chatwoot_write, worker}, 1_000
+    SupportDBCase.advance_clock(ctx, 6)
+    send(worker, :resume_chatwoot_write)
+    assert :ok = Task.await(task)
+
+    assert %{rows: [["sending", 1, nil]]} =
+             SupportDBCase.delivery_rows(ctx, "state, attempt_count, external_message_id")
+
+    assert :ok = Recovery.delivery_deadline(id)
+    assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
     assert [_] = SupportDBCase.writes(ctx)
   end
 
@@ -597,5 +643,88 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert :ok = Task.await(delivery)
     assert %{rows: [["cancelled", 0]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
     assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "disabling the binding after claim cancels the public write", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.block_after_claim(ctx, self())
+    task = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:delivery_claimed, worker}, 1_000
+
+    assert {:ok, _} =
+             VoelgoedAi.SupportFixtures.invoke(
+               VoelgoedAi.Support.InboxBinding,
+               :disable,
+               %{id: ctx.binding_id},
+               ctx.admin
+             )
+
+    send(worker, :resume_delivery_claim)
+    assert :ok = Task.await(task)
+    assert %{rows: [["cancelled", 0]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "the operator projection exposes only internal intent references and safe reasons", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    session = SupportDBCase.session_id(ctx)
+    SupportDBCase.write_mode(ctx, :timeout)
+    assert :ok = Delivery.deliver(id)
+    assert {:error, :denied} = Support.reconciliation_projection(ctx.admin, session)
+
+    assert {:error, :scope_denied} =
+             Support.reconciliation_projection(ctx.operator, Ash.UUIDv7.generate())
+
+    assert {:ok,
+            [
+              %{
+                id: ^id,
+                session_id: ^session,
+                state: :unknown,
+                purpose: :public_reply,
+                attempt_count: 1,
+                reason_code: nil,
+                uncertainty_reason: :ambiguous_write,
+                correlation_id: correlation
+              } = row
+            ]} = Support.reconciliation_projection(ctx.operator, session)
+
+    assert {:ok, _} = Ecto.UUID.cast(correlation)
+    assert map_size(row) == 8
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  test "an ambiguous write emits one alert with only internal references and a safe reason",
+       ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    subscriber = self()
+    handler = {__MODULE__, make_ref()}
+    signal = [:voelgoed_ai, :support, :delivery_attention]
+
+    assert :ok = :telemetry.attach(handler, signal, &__MODULE__.forward_signal/4, subscriber)
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    SupportDBCase.write_mode(ctx, :timeout)
+    assert :ok = Delivery.deliver(id)
+    assert_receive {^signal, %{count: 1}, metadata}
+
+    assert %{
+             delivery_id: ^id,
+             correlation_id: correlation,
+             state: :unknown,
+             reason: :ambiguous_write
+           } =
+             metadata
+
+    assert {:ok, _} = Ecto.UUID.cast(correlation)
+    assert map_size(metadata) == 4
+
+    assert :ok = Delivery.deliver(id)
+    refute_received {^signal, _, _}
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  def forward_signal(event, measurements, metadata, destination) do
+    send(destination, {event, measurements, metadata})
   end
 end

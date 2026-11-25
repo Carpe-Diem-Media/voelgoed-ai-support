@@ -54,6 +54,12 @@ defmodule VoelgoedAiWeb.ChatwootWebhookTest do
     assert {:reject, 413} = authenticate(put_req_header(signed(body), "content-length", "65537"))
   end
 
+  test "authenticates literal bytes across body chunks" do
+    body = Jason.encode!(payload()) <> String.duplicate(" ", 17_000)
+    assert {:ok, %{kind: :input}, _} = authenticate(signed(body))
+    assert {:reject, 401} = authenticate(signed(body <> "\n", 0, body))
+  end
+
   test "qualifies identity and keeps private, unsupported, and invalid senders out of reply work" do
     for other <- [
           put_in(payload()["account"]["id"], 99),

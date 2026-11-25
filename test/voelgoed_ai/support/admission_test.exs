@@ -106,6 +106,83 @@ defmodule VoelgoedAi.Support.AdmissionTest do
     end
   end
 
+  test "100 waiting receipts cap pre-admission work before it can become queued runs" do
+    ctx = SupportDBCase.setup()
+
+    for offset <- 1..100 do
+      assert {:ok, _} = Ingress.accept(%{ctx.event | message_id: ctx.event.message_id + offset})
+    end
+
+    assert {:ok, overflow} = Ingress.accept(ctx.event)
+
+    assert %{rows: [["quarantined", "triage", "admission_limited"]]} =
+             SQL.query!(
+               Repo,
+               "SELECT state, disposition, reason_code FROM inbound_events WHERE id = $1",
+               [Ecto.UUID.dump!(overflow)]
+             )
+
+    assert %{rows: [[0]]} =
+             SQL.query!(Repo, "SELECT count(*) FROM oban_jobs WHERE args->>'event_id' = $1", [
+               overflow
+             ])
+
+    assert [] = counters(ctx)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "five distinct conversations can run while a sixth waits for global capacity" do
+    ctx = SupportDBCase.setup()
+
+    runs =
+      for number <- 1..6 do
+        conversation = SupportDBCase.next_conversation(ctx, number)
+        assert {:ok, receipt} = Ingress.accept(conversation.event)
+        assert :ok = RunProcessing.process_event(receipt)
+
+        assert %{rows: [[run]]} =
+                 SQL.query!(Repo, "SELECT id::text FROM support_runs WHERE session_id = $1", [
+                   Ecto.UUID.dump!(SupportDBCase.session_id(conversation))
+                 ])
+
+        {number, run}
+      end
+
+    SupportDBCase.advance_clock(ctx, 2)
+
+    running =
+      for {number, run} <- Enum.take(runs, 5) do
+        SupportDBCase.next_conversation(ctx, number)
+        SupportDBCase.block_next_conversation(ctx, self())
+        task = Task.async(fn -> RunProcessing.process_run(run) end)
+        assert_receive {:chatwoot_read, worker}, 1_000
+        {task, worker}
+      end
+
+    {6, sixth} = List.last(runs)
+    assert :ok = RunProcessing.process_run(sixth)
+
+    assert %{rows: [["queued", 0]]} =
+             SQL.query!(Repo, "SELECT state, attempt_count FROM support_runs WHERE id = $1", [
+               Ecto.UUID.dump!(sixth)
+             ])
+
+    for {task, worker} <- running do
+      send(worker, :resume_chatwoot_read)
+      assert :ok = Task.await(task)
+    end
+
+    SupportDBCase.next_conversation(ctx, 6)
+    assert :ok = RunProcessing.process_run(sixth)
+
+    assert %{rows: [["completed", 1]]} =
+             SQL.query!(Repo, "SELECT state, attempt_count FROM support_runs WHERE id = $1", [
+               Ecto.UUID.dump!(sixth)
+             ])
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   defp counters(ctx) do
     SQL.query!(
       Repo,
