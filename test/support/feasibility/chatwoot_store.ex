@@ -216,14 +216,11 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
     end)
   end
 
+  # The caller checks the ingress deadline under the receipt row lock,
+  # before session_for/3 can create a session for an expired input.
   defp decide_current(%{prefix: p} = ctx, id, event, ownership) do
     session = session_for(p, event, ownership)
-
-    if DateTime.before?(ctx.now.(), ingress_deadline(event)) do
-      finish_event(p, id, admit(ctx, session, id, event, ownership))
-    else
-      finish_event(p, id, "ingress_deadline_exceeded")
-    end
+    finish_event(p, id, admit(ctx, session, id, event, ownership))
   end
 
   defp admit(%{prefix: p, oban: oban} = ctx, session, id, event, ownership) do

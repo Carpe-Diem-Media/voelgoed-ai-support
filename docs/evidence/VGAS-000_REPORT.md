@@ -781,8 +781,16 @@ Rows are unlocked before the Req adapter runs. The interval between
 the final local claim check and dispatch therefore still permits a
 human or recovery process to change the database, or Chatwoot to change
 ownership. The timeout settings and local fences reduce that interval
-without providing a remote conditional write. F07 owns live timeout,
-ownership and channel validation.
+without providing a remote conditional write. The bound holds only for
+the fake adapter. The pinned Finch client bounds pool checkout with
+`pool_timeout` and connection setup with a connect timeout, both
+defaulting to 5,000 ms, separately from the receive timeout this
+adapter sets. Either default alone can reach the whole lease. Finch
+also documents a transparent retry when an HTTP/2 pool is draining. A real POST could therefore reach Chatwoot
+after recovery has recorded UNKNOWN or after a human takeover. F07 must
+bound pool checkout, connect and request time below the remaining lease
+with a margin, and pin HTTP/1 or exclude that retry. F07 owns live
+timeout, ownership and channel validation.
 
 ### Verification
 
@@ -801,8 +809,10 @@ ownership and channel validation.
   and handoff deadline regressions.
 - `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
   exited 0 at seed 175627, with 98 passed and five pre-existing F04 skips.
-  The existing generated replay tests emitted compiler warnings about
-  constant branches.
+  The generated replay tests that this branch adds to
+  `chatwoot_feasibility_test.exs` emitted compiler warnings about
+  constant branches. `main` emits none. CI does not compile test files
+  with warnings as errors.
 - `git diff --check origin/main...HEAD` and
   `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
   exited 0. Gitleaks reported no leaks.
@@ -867,7 +877,8 @@ refer to the implementation commit.
   Each run passed 68 tests with zero skips.
 - `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
   exited 0 at seed 817750 with 114 passed and five existing F04 skips.
-  The existing replay cases still emitted constant-branch warnings.
+  The replay cases added by this branch still emitted constant-branch
+  warnings.
 - `python3 .github/scripts/plan_tests.py` exited 0 and planned seven
   shards, including F06.
 - `git diff --check origin/main...HEAD` and
@@ -981,3 +992,38 @@ claim and the remote POST. Local fencing prevents later attempts and
 protects settlement, while the remote race remains. Keep assisted operation
 while ownership and delivery ambiguity are unresolved. F06 local checks
 are complete. Live Chatwoot and hosted PR CI were outside this run.
+
+### Independent review of d25868e
+
+An independent Claude review approved `d25868e` with no blocking
+findings. It reran the F06 file on three seeds (89 passed each), the
+full suite (135 passed, five F04 skips) and 17 single-change mutations,
+each of which failed the targeted test. It confirmed that `resolved`
+after a handoff write leaves the write UNKNOWN and closes the session.
+
+Corrected in this branch:
+
+- The report attributed the constant-branch compiler warnings to
+  existing tests. This branch adds those tests.
+- The report stated the timeout bound without the real-client limits
+  now recorded under the Req timeout paragraph.
+- `decide_current/4` repeated the ingress deadline check after
+  `session_for/3`. The guard under the receipt row lock already covers
+  it, so the unreachable branch was removed.
+
+Carried forward without a change to this spike:
+
+- VGAS-004: when `authorize_dispatch` denies a claimed writer, no POST
+  occurs, but the row stays SENDING and recovery records UNKNOWN
+  `claim_expired`. The active event then keeps the bot silent in that
+  conversation. G011 permits CANCELLED for a provable non-send.
+- VGAS-004: an input closed as `ingress_deadline_exceeded` leaves the
+  session `bot_active` without a handoff or alert. G010 forbids
+  discarding a message only because it is late, and G012 lists
+  operational failure as a handoff trigger. The production slice needs
+  an operational handoff intent or the G012 idle-routing monitor.
+- VGAS-004: a signed public human reply cancels a pending handoff as
+  `ownership_changed`, while a human observed at claim time records
+  SENT `goal_observed`. Both keep the bot inhibited; the reason codes
+  should be unified.
+- F07: the Finch timeout and HTTP/2 retry limits above.
