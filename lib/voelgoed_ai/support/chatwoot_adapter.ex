@@ -35,12 +35,13 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
 
   defmodule Message do
     @moduledoc "One public message fact in verified history order."
-    @enforce_keys [:id, :sender]
+    @enforce_keys [:id, :sender, :visibility]
     defstruct @enforce_keys ++ [:operation]
 
     @type t :: %__MODULE__{
             id: pos_integer(),
             sender: :contact | :bot | :human,
+            visibility: :public | :private,
             operation: String.t() | nil
           }
   end
@@ -131,7 +132,9 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
       case call(:history, destination, [limit], deadline) do
         {:ok, %History{destination: ^destination, messages: messages}}
         when is_list(messages) and length(messages) <= limit ->
-          {:ok, messages}
+          if Enum.all?(messages, &public_message?/1),
+            do: {:ok, messages},
+            else: {:error, :scope_denied}
 
         {:error, _} = error ->
           error
@@ -143,6 +146,12 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
       {:error, :unavailable}
     end
   end
+
+  defp public_message?(%Message{visibility: :public, id: id, sender: sender}),
+    do:
+      is_integer(id) and id in 1..9_223_372_036_854_775_807 and sender in [:contact, :bot, :human]
+
+  defp public_message?(_), do: false
 
   @doc false
   if Mix.env() == :test do

@@ -164,6 +164,16 @@ defmodule VoelgoedAi.Support.SupportRun do
   end
 
   actions do
+    action :process_run, :atom do
+      argument(:id, :uuid, allow_nil?: false)
+      run(VoelgoedAi.Support.JobAction)
+    end
+
+    action :recover_run, :atom do
+      argument(:id, :uuid, allow_nil?: false)
+      run(VoelgoedAi.Support.JobAction)
+    end
+
     read :by_id do
     end
 
@@ -366,6 +376,10 @@ defmodule VoelgoedAi.Support.SupportRun do
   end
 
   policies do
+    policy action([:process_run, :recover_run]) do
+      authorize_if(VoelgoedAi.Support.ActionScope)
+    end
+
     policy action([
              :by_id,
              :active,

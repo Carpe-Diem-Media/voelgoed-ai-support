@@ -57,7 +57,11 @@ defmodule VoelgoedAiWeb.ChatwootWebhookTest do
   test "qualifies identity and keeps private, unsupported, and invalid senders out of reply work" do
     for other <- [
           put_in(payload()["account"]["id"], 99),
-          put_in(payload()["conversation"]["inbox_id"], 99)
+          put_in(payload()["conversation"]["inbox_id"], 99),
+          payload()
+          |> put_in(["account", "id"], 99)
+          |> put_in(["conversation", "account", "id"], 99),
+          Map.put(payload(), "conversation_id", 99)
         ] do
       assert {:reject, 403} = authenticate(signed(Jason.encode!(other)))
     end
@@ -69,6 +73,20 @@ defmodule VoelgoedAiWeb.ChatwootWebhookTest do
           put_in(payload()["sender"]["id"], 99)
         ] do
       assert {:ok, %{kind: :ignored}, _} = authenticate(signed(Jason.encode!(other)))
+    end
+  end
+
+  test "oversized text is triage and status observations never become customer input" do
+    oversized = Map.put(payload(), "content", String.duplicate("x", 3_001))
+    assert {:ok, %{kind: :oversize}, _} = authenticate(signed(Jason.encode!(oversized)))
+
+    for type <- ["conversation_status_changed", "conversation_updated"] do
+      observation = payload() |> Map.delete("id") |> Map.put("event", type)
+
+      assert {:ok, %{kind: :observation} = receipt, _} =
+               authenticate(signed(Jason.encode!(observation)))
+
+      refute Map.has_key?(receipt, :message_id)
     end
   end
 

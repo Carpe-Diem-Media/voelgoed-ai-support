@@ -52,7 +52,7 @@ defmodule VoelgoedAi.SupportDBCase do
          %{
            now: now,
            observation: observation,
-           history: [%Message{id: message_id, sender: :contact}],
+           history: [%Message{id: message_id, sender: :contact, visibility: :public}],
            read_barrier: nil,
            writes: [],
            write_mode: :accepted
@@ -67,6 +67,14 @@ defmodule VoelgoedAi.SupportDBCase do
         signing_key: @signing_key,
         clock: fn -> Agent.get(fake, & &1.now) end,
         after_claim: fn -> pause_after_claim(fake) end,
+        after_authorization: fn ->
+          pause_delivery(
+            fake,
+            :authorization_barrier,
+            :delivery_authorized,
+            :resume_delivery_authorization
+          )
+        end,
         batch_size: 5,
         history_limit: 15,
         inbox_limit: 100,
@@ -128,14 +136,33 @@ defmodule VoelgoedAi.SupportDBCase do
         received_at: now
       })
 
-    %{event: event, fake: fake, admin: admin, operator: operator, binding_id: binding.id}
+    %{
+      event: event,
+      fake: fake,
+      admin: admin,
+      operator: operator,
+      binding_id: binding.id,
+      assistant: assistant,
+      revision: revision
+    }
   end
 
-  def signed_receipt(%{event: event, fake: fake}) do
+  def signed_receipt(%{event: event} = ctx) do
+    assert signed_request(ctx, & &1).status == 204
+
+    assert %{rows: [[id]]} =
+             SQL.query!(Repo, "SELECT id::text FROM inbound_events WHERE message_id = $1", [
+               event.message_id
+             ])
+
+    {:ok, %{id: id}}
+  end
+
+  def signed_request(%{event: event, fake: fake}, transform) do
     timestamp = Agent.get(fake, &Integer.to_string(DateTime.to_unix(&1.now)))
 
     bytes =
-      Jason.encode!(%{
+      %{
         "event" => "message_created",
         "id" => event.message_id,
         "account" => %{"id" => event.external_account_id},
@@ -151,34 +178,30 @@ defmodule VoelgoedAi.SupportDBCase do
         "message_type" => "incoming",
         "content_type" => "text",
         "content" => "Synthetic input"
-      })
+      }
+      |> transform.()
+      |> Jason.encode!()
 
     digest =
       :crypto.mac(:hmac, :sha256, @signing_key, [timestamp, ".", bytes])
       |> Base.encode16(case: :lower)
 
-    conn =
-      Plug.Test.conn(:post, "/webhooks/chatwoot/synthetic", bytes)
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("x-chatwoot-timestamp", timestamp)
-      |> put_req_header("x-chatwoot-signature", "sha256=" <> digest)
-      |> Endpoint.call(Endpoint.init([]))
-
-    assert conn.status == 204
-
-    assert %{rows: [[id]]} =
-             SQL.query!(Repo, "SELECT id::text FROM inbound_events WHERE message_id = $1", [
-               event.message_id
-             ])
-
-    {:ok, %{id: id}}
+    Plug.Test.conn(:post, "/webhooks/chatwoot/synthetic", bytes)
+    |> put_req_header("content-type", "application/json")
+    |> put_req_header("x-chatwoot-timestamp", timestamp)
+    |> put_req_header("x-chatwoot-signature", "sha256=" <> digest)
+    |> Endpoint.call(Endpoint.init([]))
   end
 
   def advance_clock(%{fake: fake}, seconds),
     do: Agent.update(fake, &%{&1 | now: DateTime.add(&1.now, seconds)})
 
   def append_public_input(%{fake: fake}, id),
-    do: Agent.update(fake, &%{&1 | history: &1.history ++ [%Message{id: id, sender: :contact}]})
+    do:
+      Agent.update(
+        fake,
+        &%{&1 | history: &1.history ++ [%Message{id: id, sender: :contact, visibility: :public}]}
+      )
 
   def write_mode(%{fake: fake}, mode), do: Agent.update(fake, &%{&1 | write_mode: mode})
 
@@ -186,23 +209,26 @@ defmodule VoelgoedAi.SupportDBCase do
     do: Agent.update(fake, &Map.put(&1, :write_barrier, pid))
 
   def block_next_conversation(%{fake: fake}, pid),
-    do: Agent.update(fake, &%{&1 | read_barrier: pid})
+    do: Agent.update(fake, &Map.put(&1, :read_barrier, pid))
 
   def writes(%{fake: fake}), do: Agent.get(fake, &Enum.reverse(&1.writes))
 
   def block_after_claim(%{fake: fake}, pid),
     do: Agent.update(fake, &Map.put(&1, :claim_barrier, pid))
 
-  defp pause_after_claim(fake) do
-    case Agent.get_and_update(fake, &Map.pop(&1, :claim_barrier)) do
+  defp pause_after_claim(fake),
+    do: pause_delivery(fake, :claim_barrier, :delivery_claimed, :resume_delivery_claim)
+
+  defp pause_delivery(fake, barrier, signal, reply) do
+    case Agent.get_and_update(fake, &Map.pop(&1, barrier)) do
       nil ->
         :ok
 
       pid ->
-        send(pid, {:delivery_claimed, self()})
+        send(pid, {signal, self()})
 
         receive do
-          :resume_delivery_claim -> :ok
+          ^reply -> :ok
         after
           1_000 -> {:error, :deadline}
         end

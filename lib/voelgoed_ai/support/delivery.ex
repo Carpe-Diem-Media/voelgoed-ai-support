@@ -5,7 +5,15 @@ defmodule VoelgoedAi.Support.Delivery do
   """
 
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, InboundEvent, OutboundDelivery}
+
+  alias VoelgoedAi.Support.{
+    BindingCircuit,
+    ChatwootAdapter,
+    Configuration,
+    InboundEvent,
+    OutboundDelivery
+  }
+
   alias VoelgoedAi.Support.{Ownership, Recovery, RunProcessing, SupportRun, WorkStore}
   alias VoelgoedAi.Support.Workers.{Reconcile, Sweep}
 
@@ -14,18 +22,25 @@ defmodule VoelgoedAi.Support.Delivery do
   @max_reads 3
 
   @doc "Process one durable intent. Duplicate jobs cannot issue another POST."
-  def deliver(id) do
-    with {:ok, {:read, reservation, session}} <- with_delivery(id, &preflight/4),
+  def deliver(id), do: VoelgoedAi.Support.JobAction.invoke(OutboundDelivery, :deliver_intent, id)
+
+  @doc false
+  def perform(id) do
+    with {:ok, {:read, reservation, session, generation}} <- with_delivery(id, &preflight/4),
          observation <- ChatwootAdapter.observe(session, reservation.deadline_at),
          history <- read_reply_history(session, reservation, observation),
          {:ok, {:claimed, claim}} <-
-           with_delivery(id, &claim(&1, &2, &3, &4, reservation, observation, history)),
-         :ok <- after_claim(),
+           with_delivery(
+             id,
+             &claim(&1, &2, &3, &4, reservation, observation, history, generation)
+           ),
+         :ok <- fixture_barrier(:after_claim),
          {:ok, {:authorized, authorized, text}} <-
-           with_delivery(id, &authorize(&1, &2, &3, &4, claim)) do
+           with_delivery(id, &authorize(&1, &2, &3, &4, claim, generation)),
+         :ok <- fixture_barrier(:after_authorization) do
       result = post(session, authorized, text)
 
-      case with_delivery(id, &settle(&1, &2, &3, &4, authorized, result)) do
+      case with_delivery(id, &settle(&1, &2, &3, &4, authorized, result, generation)) do
         {:ok, %{state: :unknown, purpose: :handoff_status}} when result == :ok ->
           Recovery.reconcile(id)
 
@@ -33,20 +48,30 @@ defmodule VoelgoedAi.Support.Delivery do
           RunProcessing.job_result(settled)
       end
     else
-      result -> RunProcessing.job_result(result)
+      {:ok, {:probe, session, deadline, generation}} ->
+        observation = ChatwootAdapter.observe(session, deadline)
+
+        with_delivery(id, fn config, _, _, now ->
+          :ok = BindingCircuit.finish_probe(config.binding, generation, now, observation)
+          {:ok, :probe_finished}
+        end)
+        |> RunProcessing.job_result()
+
+      result ->
+        RunProcessing.job_result(result)
     end
   end
 
   if Mix.env() == :test do
-    # Pause between the claim and dispatch transactions without holding either lock.
-    defp after_claim do
+    # Fault tests pause only after transactions have committed.
+    defp fixture_barrier(phase) do
       case ChatwootAdapter.fixture() do
-        %{after_claim: callback} -> callback.()
+        %{^phase => callback} -> callback.()
         _ -> :ok
       end
     end
   else
-    defp after_claim, do: :ok
+    defp fixture_barrier(_), do: :ok
   end
 
   @doc false
@@ -99,14 +124,32 @@ defmodule VoelgoedAi.Support.Delivery do
 
   defp preflight(config, session, %{state: :pending} = delivery, now) do
     cond do
+      DateTime.compare(now, delivery.deadline_at) != :lt ->
+        expire_pending(delivery, now)
+
       not valid?(config, session, delivery, now) ->
         fence(delivery, now, :stale_policy)
 
       delivery.attempt_count != 0 or delivery.read_count >= @max_reads ->
-        WorkStore.update(delivery, :fail, %{state: :failed, reason_code: :read_exhausted})
+        fail_pending(delivery, :read_exhausted)
+
+      delivery.purpose == :handoff_status and delivery.last_read_at != nil and
+          DateTime.before?(now, next_read_at(delivery)) ->
+        {:ok, :backoff}
 
       true ->
-        with {:ok, row} <- reserve_read(delivery, now), do: {:ok, {:read, row, session}}
+        case BindingCircuit.reserve(config.binding, now) do
+          {:closed, generation} ->
+            with {:ok, row} <- reserve_read(delivery, now),
+                 do: {:ok, {:read, row, session, generation}}
+
+          {:probe, generation} ->
+            with {:ok, _} <- fence(delivery, now, :unavailable),
+                 do: {:ok, {:probe, session, delivery.deadline_at, generation}}
+
+          :open ->
+            fence(delivery, now, :unavailable)
+        end
     end
   end
 
@@ -117,15 +160,20 @@ defmodule VoelgoedAi.Support.Delivery do
 
   defp read_reply_history(_, _, _), do: {:ok, []}
 
-  defp claim(config, session, delivery, now, reservation, observation, history) do
+  defp claim(config, session, delivery, now, reservation, observation, history, generation) do
     cond do
       delivery.state != :pending or delivery.read_sequence != reservation.read_sequence ->
         {:ok, :stale_claim}
 
-      not valid?(config, session, delivery, now) ->
+      not valid?(config, session, delivery, now) or
+          not BindingCircuit.closed?(config.binding, generation) ->
         fence(delivery, now, :stale_policy)
 
       true ->
+        if match?({:error, _}, observation) do
+          :ok = BindingCircuit.record(config.binding, generation, now, observation)
+        end
+
         qualify(config, session, delivery, now, observation, history)
     end
   end
@@ -196,7 +244,37 @@ defmodule VoelgoedAi.Support.Delivery do
     end
   end
 
+  defp qualify(_, _, %{purpose: :handoff_status} = delivery, now, {:error, reason}, _)
+       when reason in [:unavailable, :rate_limited, :timeout, :reset, :server_error] do
+    due = next_read_at(delivery)
+
+    cond do
+      delivery.read_count >= @max_reads ->
+        fail_pending(delivery, :read_exhausted)
+
+      not DateTime.before?(due, delivery.deadline_at) ->
+        expire_pending(delivery, now)
+
+      true ->
+        Ownership.enqueue(VoelgoedAi.Support.Workers.Deliver, %{"delivery_id" => delivery.id},
+          scheduled_at: due
+        )
+    end
+  end
+
   defp qualify(_, _, delivery, now, _, _), do: fence(delivery, now, :unavailable)
+
+  defp next_read_at(delivery),
+    do: DateTime.add(delivery.last_read_at, if(delivery.read_count == 1, do: 1, else: 3))
+
+  @doc false
+  def expire_pending(%{purpose: :handoff_status} = delivery, _now),
+    do: fail_pending(delivery, :deadline)
+
+  def expire_pending(delivery, now), do: fence(delivery, now, :deadline)
+
+  defp fail_pending(delivery, reason),
+    do: WorkStore.update(delivery, :fail, %{state: :failed, reason_code: reason})
 
   defp queued_input?(session) do
     where =
@@ -224,12 +302,13 @@ defmodule VoelgoedAi.Support.Delivery do
     end
   end
 
-  defp authorize(config, session, delivery, now, claim) do
+  defp authorize(config, session, delivery, now, claim, generation) do
     cond do
       not current_claim?(delivery, claim) or delivery.dispatch_authorized_at != nil ->
         {:ok, :stale_claim}
 
       not valid?(config, session, delivery, now) or
+        not BindingCircuit.closed?(config.binding, generation) or
         DateTime.diff(delivery.lease_expires_at, now, :millisecond) <= @request_margin_ms or
         DateTime.diff(delivery.deadline_at, now, :millisecond) <= @request_margin_ms or
           DateTime.diff(now, delivery.last_read_at, :millisecond) >= 2_000 ->
@@ -287,8 +366,9 @@ defmodule VoelgoedAi.Support.Delivery do
     end
   end
 
-  defp settle(_config, session, delivery, now, claim, result) do
+  defp settle(config, session, delivery, now, claim, result, generation) do
     if current_claim?(delivery, claim) and DateTime.compare(now, delivery.lease_expires_at) == :lt do
+      :ok = BindingCircuit.record(config.binding, generation, now, result)
       finish_post(session, delivery, now, result)
     else
       {:ok, :stale_claim}

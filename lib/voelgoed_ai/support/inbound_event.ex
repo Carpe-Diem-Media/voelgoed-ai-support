@@ -162,6 +162,11 @@ defmodule VoelgoedAi.Support.InboundEvent do
   end
 
   actions do
+    action :process_receipt, :atom do
+      argument(:id, :uuid, allow_nil?: false)
+      run(VoelgoedAi.Support.JobAction)
+    end
+
     read :by_identity do
     end
 
@@ -215,6 +220,10 @@ defmodule VoelgoedAi.Support.InboundEvent do
   end
 
   policies do
+    policy action([:process_receipt]) do
+      authorize_if(VoelgoedAi.Support.ActionScope)
+    end
+
     policy action([
              :by_identity,
              :by_id,

@@ -225,6 +225,21 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
   end
 
   actions do
+    action :deliver_intent, :atom do
+      argument(:id, :uuid, allow_nil?: false)
+      run(VoelgoedAi.Support.JobAction)
+    end
+
+    action :reconcile_intent, :atom do
+      argument(:id, :uuid, allow_nil?: false)
+      run(VoelgoedAi.Support.JobAction)
+    end
+
+    action :recover_intent, :atom do
+      argument(:id, :uuid, allow_nil?: false)
+      run(VoelgoedAi.Support.JobAction)
+    end
+
     read :by_id do
     end
 
@@ -466,6 +481,10 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
   end
 
   policies do
+    policy action([:deliver_intent, :reconcile_intent, :recover_intent]) do
+      authorize_if(VoelgoedAi.Support.ActionScope)
+    end
+
     policy action([
              :by_id,
              :for_session,

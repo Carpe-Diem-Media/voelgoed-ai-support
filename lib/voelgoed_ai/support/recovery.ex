@@ -12,7 +12,11 @@ defmodule VoelgoedAi.Support.Recovery do
   @batch_size 25
 
   @doc "Reconcile one UNKNOWN intent with qualified, bounded read-only evidence."
-  def reconcile(id) do
+  def reconcile(id),
+    do: VoelgoedAi.Support.JobAction.invoke(OutboundDelivery, :reconcile_intent, id)
+
+  @doc false
+  def perform_reconciliation(id) do
     with {:ok, {:read, delivery, session}} <- Delivery.with_delivery(id, &reserve/4) do
       observed = read_back(session, delivery)
 
@@ -113,7 +117,11 @@ defmodule VoelgoedAi.Support.Recovery do
   defp remaining?(row, now), do: DateTime.compare(now, row.recovery_deadline_at) == :lt
 
   @doc "Recover a delivery lease or expire an outstanding intent."
-  def delivery_deadline(id) do
+  def delivery_deadline(id),
+    do: VoelgoedAi.Support.JobAction.invoke(OutboundDelivery, :recover_intent, id)
+
+  @doc false
+  def perform_delivery_recovery(id) do
     Delivery.with_delivery(id, fn _, _, row, now ->
       case row do
         %{state: :sending, lease_expires_at: time} ->
@@ -121,7 +129,7 @@ defmodule VoelgoedAi.Support.Recovery do
 
         %{state: :pending, deadline_at: time} ->
           if DateTime.compare(now, time) != :lt,
-            do: Delivery.fence(row, now, :deadline),
+            do: Delivery.expire_pending(row, now),
             else: Ownership.enqueue(Deliver, %{"delivery_id" => row.id})
 
         %{state: :unknown} ->
@@ -155,7 +163,10 @@ defmodule VoelgoedAi.Support.Recovery do
   defp recover_send(row, now), do: Delivery.unknown(row, now, :ambiguous_write)
 
   @doc "Expire a run or recover a bounded local-only claim under a new token."
-  def run_deadline(id) do
+  def run_deadline(id), do: VoelgoedAi.Support.JobAction.invoke(SupportRun, :recover_run, id)
+
+  @doc false
+  def perform_run_recovery(id) do
     RunProcessing.with_run(id, fn _, _, run, now -> recover_run(run, now) end)
     |> RunProcessing.job_result()
   end

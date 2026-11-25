@@ -14,7 +14,11 @@ defmodule VoelgoedAi.Support.RunProcessing do
   @active [:queued, :running, :retry_wait]
 
   @doc "Process one internal receipt ID; completed receipts can be replayed safely."
-  def process_event(id) do
+  def process_event(id),
+    do: VoelgoedAi.Support.JobAction.invoke(InboundEvent, :process_receipt, id)
+
+  @doc false
+  def perform_event(id) do
     with {:ok, %InboundEvent{disposition: :pending, state: :dispatched} = event} <-
            Repo.transact(fn -> Ownership.get(InboundEvent, id) end) do
       verify_event(event)
@@ -295,7 +299,10 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   @doc "Claim the current batch and render or suppress its fixed response."
-  def process_run(id) do
+  def process_run(id), do: VoelgoedAi.Support.JobAction.invoke(SupportRun, :process_run, id)
+
+  @doc false
+  def perform_run(id) do
     with {:ok, {:claimed, run, session}} <- with_run(id, &claim/4) do
       observation = ChatwootAdapter.observe(session, run.deadline_at)
       history = ChatwootAdapter.history(session, run.deadline_at)

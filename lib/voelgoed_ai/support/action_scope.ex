@@ -1,6 +1,6 @@
 defmodule VoelgoedAi.Support.ActionScope do
   @moduledoc """
-  Exact application scopes for reading support configuration. Callers construct
+  Exact application scopes for support configuration and jobs. Callers construct
   these from qualified records and trusted job context, never request fields.
   """
 
@@ -8,7 +8,7 @@ defmodule VoelgoedAi.Support.ActionScope do
 
   alias VoelgoedAi.Governance.{AuditEvent, AutomationControl}
   alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
-  alias VoelgoedAi.Support.InboxBinding
+  alias VoelgoedAi.Support.{InboxBinding, JobAction}
 
   defmodule Ingress do
     @moduledoc "Scope for a trusted ingress operation."
@@ -61,7 +61,7 @@ defmodule VoelgoedAi.Support.ActionScope do
         kind in [Processing, Reconciliation] and target == {arguments.target_kind, arguments.id}
 
       _ ->
-        false
+        JobAction.kind(resource, action) == kind and target == arguments[:id]
     end
   end
 
