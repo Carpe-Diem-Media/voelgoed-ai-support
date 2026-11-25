@@ -1771,6 +1771,54 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert_fake_calls(ctx, [:get, :get, :reply])
   end
 
+  for {state, queue, script, expected, reason} <- [
+        {"pending", :f06_delivery, [{:get, @path, :kill}], "failed", "handoff_deadline_exceeded"},
+        {"sending", :f06_delivery,
+         [
+           {:get, @path, :bot},
+           {:handoff, @path <> "/toggle_status", :kill}
+         ], "unknown", "handoff_read_deadline_exceeded"},
+        {"unknown", :f06_reconcile,
+         [
+           {:get, @path, :bot},
+           {:handoff, @path <> "/toggle_status", :timeout},
+           {:get, @path, :kill}
+         ], "unknown", "handoff_read_deadline_exceeded"}
+      ] do
+    @tag :f06_followup
+    test "Cron closes a handoff in #{state} after the individual deadline job is lost", ctx do
+      state = unquote(state)
+      queue = unquote(queue)
+      expected = unquote(expected)
+      reason = unquote(reason)
+
+      script =
+        for {kind, path, action} <- unquote(Macro.escape(script)) do
+          case action do
+            :bot -> get(pending(), path)
+            :timeout -> {kind, path, write_result(:timeout)}
+            :kill -> {kind, path, &kill_worker/1}
+          end
+        end
+
+      ctx = fake(%{ctx | decision: "handoff"}, [get(pending()) | script])
+      id = prepare(ctx)
+      if state == "unknown", do: assert(drain(ctx, :f06_delivery).success == 1)
+      assert %{state: "available"} = kill_and_rescue(ctx, queue, with_scheduled: true)
+      assert %{state: ^state} = ChatwootStore.delivery(ctx.prefix, id)
+      if state == "sending", do: discard_checks(ctx, :f06_recovery)
+      discard_checks(ctx, :f06_deadline)
+
+      tick_deadline_cron(ctx)
+      assert drain(at(ctx, 300), :f06_deadline).success == 1
+      assert %{state: ^expected} = delivery = ChatwootStore.delivery(ctx.prefix, id)
+      assert reason in [delivery.reason, delivery.recovery_failure]
+      assert %{state: "handoff_pending"} = session(ctx)
+      assert drain(at(ctx, 300), queue, with_scheduled: true).success == 1
+      assert_fake_calls(ctx, [:get | Enum.map(script, &elem(&1, 0))])
+    end
+  end
+
   defp tick_deadline_cron(ctx) do
     cron_name = {ChatwootDeadlineJob, ctx.prefix}
 
