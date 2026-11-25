@@ -7,3 +7,5 @@ config :voelgoed_ai, VoelgoedAiWeb.Endpoint,
   render_errors: [formats: [json: VoelgoedAiWeb.ErrorJSON], layout: false]
 
 config :phoenix, :json_library, Jason
+
+config :req_llm, load_dotenv: false
