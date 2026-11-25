@@ -753,8 +753,8 @@ discovery metadata. The fixes and five regression tests are in
   PostgreSQL read returned the subject with its original space and tab.
   Signing in with the distinct unpadded subject returned 401, issued no
   session and left the row invited with only its provisioning audit event.
-  The exact padded subject activated successfully. The fixture treats
-  subject bytes as opaque and preserves padding.
+  The exact padded subject activated successfully on that candidate.
+  The current local subject format is documented below.
 - **Provider metadata.** The adapter validates all three endpoints as
   absolute HTTPS URLs with a host, a valid port and valid percent escapes.
   It rejects userinfo and fragments. An advertised authentication-method
@@ -811,3 +811,112 @@ must recheck authorisation for each protected event on an existing socket.
 VGAS-001 must reassess compatible patched stable AshAuthentication and
 adapter pins before staff UI work or live testing. The G036 RC exception
 is feasibility-only.
+
+### Malformed provider responses and subject format
+
+The follow-up addresses the two findings at
+`5a30e1540fe200c25559e4bae6ae63728c94018c` on
+`feat/vgas-6-f08-entra-authz`. The verified code is
+`1b03845d127b8a1cf41498d6f9185b1f50e96676`, after
+`4af4187dd1532ac6463d4865328362193ac47088` and
+`f71eb42ec02e53949d6d16f62b0e74787f2296bc`. The evidence commit changes
+only this section. The comparison base is `origin/main` at
+`a731a06a0d54d61438c6e709e5a3170e6b60b7ed`.
+
+The test-only HTTP adapter validates successful token and key-set
+responses before Assent 0.3.2 reads them. The fixture accepts compact
+RS256 JWS with a key ID and public RSA JWKs. It caps compact tokens at
+32,768 bytes and individual text fields at 4,096 bytes. Assent still
+checks signature, issuer, audience, expiry and nonce. Errors from
+Assent's callback or the JOSE payload parser return a fixed category
+and log only `entra_oidc_callback_exception`. The Ash policy and
+activation run outside the rescue. A deliberately raising Req adapter
+exercised the rescue at the endpoint. A separate test exercised the
+JOSE parse failure.
+
+The malformed-response matrix made 230 callback requests through
+private Req.Test stubs. Each case exercised the shape validator and
+returned 401 with `Sign-in denied`, no redirect, an empty session and
+zero persisted activations. The staff row stayed invited and its only
+audit event was provisioning.
+
+- 95 token and header cases covered the token object, `id_token`,
+  `access_token`, `token_type`, `refresh_token`, `expires_in`, `scope`,
+  the protected header object, `alg`, `kid`, `typ`, `cty`, `b64` and
+  `crit`. They also covered missing required members, extra or missing
+  segments, invalid or empty signature encoding, an oversized compact
+  JWS, an unsupported algorithm and an unencoded payload.
+- 71 signed-claim cases covered the payload object, `iss`, `sub`,
+  `aud`, `azp`, `exp`, `nbf`, `iat`, `nonce` and `tid`. They also
+  covered missing required claims and malformed audience arrays.
+- 64 key-set cases covered the JWKS object, `keys` and each key's
+  `kty`, `kid`, `use`, `alg`, `n`, `e` and private `d` member.
+  They also covered missing members, an empty set, invalid base64url,
+  EC keys and a malformed key after a valid matching key.
+
+The matrix applies null, a number, a list, an object, an empty string
+and a 4,097-byte string to each listed field. The suite also exercises
+valid optional values, `alg: none` denial, exact issuer and tenant,
+discovery and client-authentication methods, empty local role grants,
+audit rollback, activation concurrency and session renewal.
+
+Invites and signed callbacks require 1–255 ASCII bytes. The local rule
+also rejects ASCII controls and leading or trailing spaces. The nine
+negative subject cases include a padded tab, embedded NUL and DEL.
+Ash returned a subject validation error on invite, and the callback
+returned the same generic 401. A valid 255-byte subject round-tripped
+byte for byte and activated. Its lowercase variant did not match.
+Confirm the conservative format and local response bounds against the
+approved live registration in VGAS-9.
+[OIDC Core §2](https://openid.net/specs/openid-connect-core-1_0.html#IDToken).
+
+The first focused run against the old implementation, with the new
+endpoint regressions, exited 2. Each subsequent mutation removed one
+guard at a time. The command was
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs:<line> --seed 0`.
+All 53 runs at `f71eb42` exited 2 with one selected test failing and
+29 excluded.
+
+- Line 85 caught eight subject mutations covering the invite and
+  callback checks, nonempty and length checks, ASCII restrictions,
+  controls, boundary spaces and exact Ash casting.
+- Line 268 caught 21 token and header mutations covering adapter
+  enforcement, document and field shapes, compact JWS limits and
+  signature encoding, protected header members and shared text checks.
+- Line 293 caught 11 claim mutations covering the object, each
+  claim's shape and the audience list and member checks. Line 85
+  independently caught the subject predicate.
+- Line 310 caught 12 JWKS mutations covering adapter enforcement, set
+  shape, validation of every key, RSA key type, key members and exclusion
+  of private key data.
+- Line 365 caught removal of the callback rescue. After the rescue
+  was narrowed to the two parser calls in `1b03845`, removing it again
+  made both the raising adapter at line 366 and the JOSE test at
+  line 379 exit 2. Each run selected one test and excluded 30.
+
+All mutations were reverted before verification.
+
+- `devcore-project doctor` exited 1 with `.env.local` missing.
+  `devcore-project plan` and `devcore-project activate` exited 0.
+  The second `devcore-project doctor` exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix deps.unlock --check-unused` and
+  `mise exec -- mix format --check-formatted` exited 0.
+  `mise exec -- mix hex.audit` ran separately and exited 0 with no
+  retired packages or advisories.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+  exited 0 on seeds `0`, `17` and `2026`, with 31 passed and no skips
+  on each run.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 on seed `983803`, with 77 passed and five existing F04
+  disposable-target skips.
+- `python3 .github/scripts/plan_tests.py` exited 0 and routed F08 to
+  shard 4. `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0. Gitleaks reported no leaks.
+
+Local F08 passed using synthetic identities and DevCore TEST. Live
+Entra proof remains pending in VGAS-9, so F08 is still partial overall.
+Independent review and CI for the published candidate remain pending.
