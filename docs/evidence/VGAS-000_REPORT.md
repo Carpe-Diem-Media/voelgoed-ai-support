@@ -587,8 +587,9 @@ three failed; with it restored, the 21 focused tests pass.
 
 ## F06 | VGAS-5 signed Chatwoot ingress and fixed delivery
 
-Evidence from `feat/vgas-5-f06-chatwoot-ingress`, based on
-`324cb105d749de50b31f3ea007cabd931a915ff0`. The candidate head is the
+Evidence from `feat/vgas-5-f06-chatwoot-ingress`. The follow-up starts at
+`c8fd5868be45807e69fe54b386595375c579abe2`. The implementation commit is
+`34ff8988a391dde5a5c2c9cc8eef98e99ea8d3a9`. The candidate head is the
 commit containing this section. The tests use synthetic IDs and JSON, and
 generate signing keys and fake API tokens in ExUnit. The test-only Phoenix
 endpoint runs with `server: false`. The Req adapter has no network path.
@@ -633,8 +634,9 @@ endpoint runs with `server: false`. The Req adapter has no network path.
    each returned 500 with zero durable rows. A new signed attempt after
    the first rollback committed the pair.
 3. **PASS. Guarded fixed reply, explicit handoff and ambiguous writes
-   (T02, T04–T06).** Both queues used actual Oban inserts and manual drains.
-   A fresh GET qualified each write. A separate backend observed SENDING,
+   (T02, T04–T06).** Ingress, delivery and recovery used actual Oban
+   inserts and manual drains. A fresh GET qualified each write. A separate
+   backend observed SENDING,
    generation 1 and one attempt at the adapter boundary, with the expected
    ownership epoch and HANDOFF_PENDING for handoff. The adapter counted
    exactly one POST for each successful reply and handoff. The handoff
@@ -645,8 +647,9 @@ endpoint runs with `server: false`. The Req adapter has no network path.
    produced zero POSTs for those paths.
    A simulated remote commit followed by timeout, disconnect, 503,
    redirect, malformed acceptance or a failed read-back each left an
-   UNKNOWN intent after one POST. Claim expiry after simulated process
-   death, replay of both worker phases, a new event and read-only
+   UNKNOWN intent after one POST. After Oban discarded a lost delivery
+   job, the recovery job recorded UNKNOWN at claim expiry. Worker
+   replays, a new event and read-only
    reconciliation produced no additional POST for the unknown reply.
    A read-only reconciliation at 46 seconds confirmed that an unknown
    handoff had reached its goal. The adapter still recorded one status POST.
@@ -681,35 +684,78 @@ Both first-observation cases queued a reply intent (0/2, exit 2).
 The five handoff tests failed on cancellation or missing preflight
 retries (0/5, exit 2). All passed after restoration.
 
-The optional loopback Bandit request was omitted. The raw bytes reached
-the test endpoint through Phoenix.ConnTest. A signed human outbound event,
-a fresh GET before delivery and explicit reconciliation cover local
-ownership changes. Status and assignment event subscriptions and payloads
-remain F07 checks. The one-attempt claim test replays a persisted intent
-and exercises recovery after simulated process death.
+### Follow-up review corrections
+
+1. A qualified signed public human reply commits HUMAN_ACTIVE and fences
+   pending work in the receipt and enqueue transaction. A rollback undoes
+   the inhibit along with the receipt and job. Later bot-assigned pending
+   GETs leave the inhibit in place. Private notes and AgentBot messages
+   are ignored. The pinned CE callback for opening a pending conversation
+   on a human reply requires Captain. The test leaves the conversation
+   pending throughout. [Chatwoot message model](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/app/models/message.rb#L380-L390)
+2. A public reply requires `can_reply: true`. An explicit handoff can
+   open a qualified pending conversation assigned to the configured bot
+   when the reply window is closed. The test records one status POST
+   followed by a confirming GET. [Chatwoot status controller](https://github.com/chatwoot/chatwoot/blob/9f920b549c14491a4e587687a3eed5d21c6ccc7d/app/controllers/api/v1/accounts/conversations_controller.rb#L74-L90)
+3. HTTP 429 and 5xx join transport errors and timeouts in the safe
+   pre-write retry path. Handoff allows at most three preflight attempts
+   over five minutes. The tests retry 429 and 503 after 46 seconds, verify
+   the existing exhaustion reason, and show that a queued retry at the
+   five-minute boundary makes no additional preflight request. The
+   session stays inhibited after definitive failure. An ambiguous POST
+   still results in UNKNOWN after one write.
+4. The claim transaction schedules a separate Oban job for the five-second
+   lease expiry. Recovery locks the same session and delivery rows as
+   settlement and requires the matching generation in SENDING. It records
+   UNKNOWN without HTTP. The test kills the actual Oban drain at the fake
+   POST, observes the attempt-one job in `executing`, and runs Oban 2.24.2's
+   rescue engine. It observes the exhausted job in `discarded`. The
+   claim stays SENDING at four seconds, and the recovery job marks it
+   UNKNOWN at five seconds. Recovery of an already settled reply is a no-op.
+
+All five selected regressions failed against the original implementation
+at `c8fd586`, then passed with the fixes restored. The selection command
+was `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs:453:594:613:746 --seed 0`.
+It exited 2 on the original implementation, with five failures and 47
+excluded. With the other fixes in place, removing each fix in isolation
+also failed on the intended assertion. Each mutation used the same test
+command with a single line selector.
+
+- `:453`, receipt inhibit removed. The adapter recorded a reply POST.
+  Exit 2, one failure and 51 excluded.
+- `:594`, `can_reply` reapplied to handoff. The status intent failed
+  before its POST. Exit 2, one failure and 51 excluded.
+- `:613`, transient HTTP classification removed. The 429 and 503 tests
+  observed no retry. Exit 2, two failures and 50 excluded.
+- `:746`, recovery enqueue removed. The intent stayed SENDING after Oban
+  discarded the delivery job. Exit 2, one failure and 51 excluded.
 
 ### Verification
 
-The three focused runs used
-`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs`
-with `--seed 0`, `--seed 21427`, and `--seed 793636`.
-Each exited 0 with 48 passed, zero failures and zero skips.
+- `devcore-project doctor` exited 0 after `devcore-project plan` and
+  `devcore-project activate` created the missing local environment.
+  Both bootstrap commands exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix format --check-formatted`, and
+  `mise exec -- mix hex.audit` each exited 0 in separate invocations.
+  Hex reported no retired or advisory packages.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs --seed 0`
+  and the same command with `--seed 371486` each exited 0, with 52 passed
+  and zero skips. Both include the earlier assignee, human observation
+  and handoff deadline regressions.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 at seed 175627, with 98 passed and five pre-existing F04 skips.
+  The existing generated replay tests emitted compiler warnings about
+  constant branches.
+- `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0. Gitleaks reported no leaks.
 
-- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --seed 884620`
-  exited 0. Of 97 tests, 92 passed and the five pre-existing
-  F04 disposable tests skipped.
-- `devcore-project doctor`, `mise exec -- mix format --check-formatted`,
-  `MIX_ENV=test mise exec -- mix compile --warnings-as-errors`,
-  `mise exec -- mix deps.get --check-locked`, `mise exec -- mix hex.audit`,
-  and `git diff --check` exited 0. Hex found no security advisories or
-  retired packages. `mise exec gitleaks@8.30.1 -- gitleaks git --staged --redact`
-  exited 0 with no leaks. The fixtures use synthetic IDs and data.
-- `python3 .github/scripts/plan_tests.py` exited 0 and assigned
-  `test/voelgoed_ai/chatwoot_feasibility_test.exs` to shard 2.
-- `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix run -e ...`
-  used the Repo to check the TEST role and database, then counted schemas
-  with `left(nspname, 9) = 'vgas_f06_'`. The count and exit status were both
-  0. No Phoenix HTTP listener was started.
+The Phoenix.ConnTest fixture exercised raw request bytes with the
+endpoint disabled as a server. F07 still owns live status and assignment
+subscriptions, response payload and channel checks.
 
 ### F07 live gaps
 
