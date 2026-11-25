@@ -219,3 +219,47 @@ Entra. This exception grants no production authority.
   empty volume. Cleanup waited for Docker's auto-removal to finish before
   removing the volume. The run-owned container, volume, credential files
   and loopback listener were absent at exit. Shared DevCore was unchanged.
+
+## F02–F03 deterministic feasibility
+
+Plane VGAS-2 is Done for the local F01 checks under the documented
+exception. VGAS-3 is In Progress. The tests run without OpenAI credentials.
+Their request bodies, provider responses, usage and prices are synthetic.
+
+- **F02 PARTIAL.** Pinned Ash AI accepts the typed handoff decision and
+  rejects an unknown field or invalid decision. The Req HTTP plug observed
+  the Luna Responses request with a 500-token output limit, reasoning
+  effort none, strict JSON schema, `store: false`, no tools and no previous
+  response ID. The default structured-output mode sends a function tool
+  even with Ash tools disabled. With this pin, the explicit
+  `openai_structured_output_mode: :json_schema` option must be top-level.
+  A synthetic HTTP 503 reached the fake exactly once with retries disabled.
+  The spike configures a five-second request deadline. Actual provider
+  latency, token enforcement and behavior remain unverified.
+- Ash AI exposes normalized usage for valid output, but it returns an
+  action error when decoding/casting fails. A direct ReqLLM fixture
+  retained the provider response ID and usage. Its public response
+  metadata did not retain the synthetic `x-request-id` header. ReqLLM's
+  embedding API verified the model, 1536 dimensions and returned usage
+  with `return_usage: true`. That result does not include a provider
+  request ID. Embedding options use Req's retry flag because the pinned
+  embedding API rejects `max_retries`.
+- **F03 PARTIAL.** The test-only reservation ledger serializes admission
+  per test process, calculates synthetic integer nano-USD ceilings, and
+  reserves before invoking either operation. Tests cover daily/monthly
+  and concurrency denial, zero allowance, concurrent overspend, no
+  transport on denial, duplicate attempts, trusted settlement even for
+  invalid output, release on proven no-send, ambiguous timeout or
+  missing usage, and unresolved rollover. The test process does not
+  provide PostgreSQL durability or multi-node locking. Before live
+  testing, verify a PostgreSQL-backed reservation and settlement path,
+  capture trusted request-level usage and correlation even on rejected
+  outputs, and prove the full provider request cost bound. No live
+  generation or embedding occurred.
+- `mise exec -- mix format --check-formatted` and
+  `devcore-project run dev -- mise exec -- mix compile --warnings-as-errors`
+  exited 0. `env -u OPENAI_API_KEY devcore-project run test -- mise exec --
+  mix test` passed all 30 tests on the standard TEST allocation after
+  disposable F01 cleanup. The new inference tests use no live transport.
+- The read-only model-list check still awaits confirmation of the
+  permission change. Credential configuration remains PARTIALLY_VERIFIED.
