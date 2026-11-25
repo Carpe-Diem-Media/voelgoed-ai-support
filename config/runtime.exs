@@ -28,22 +28,5 @@ else
 end
 
 if config_env() == :dev do
-  usd_to_nano = fn value ->
-    value
-    |> Decimal.new()
-    |> Decimal.mult(1_000_000_000)
-    |> Decimal.to_integer()
-  end
-
-  config :voelgoed_ai, :development_ai,
-    model: System.get_env("VGAS_AI_MODEL", "openai:gpt-6-luna"),
-    reasoning_effort: System.get_env("VGAS_AI_REASONING_EFFORT", "none"),
-    max_output_tokens: String.to_integer(System.get_env("VGAS_AI_MAX_OUTPUT_TOKENS", "500")),
-    embedding_model: System.get_env("VGAS_EMBEDDING_MODEL", "openai:text-embedding-3-small"),
-    embedding_dimensions: String.to_integer(System.get_env("VGAS_EMBEDDING_DIMENSIONS", "1536")),
-    live_calls_enabled: System.get_env("VGAS_AI_LIVE_CALLS_ENABLED") == "true",
-    daily_budget_nano_usd: usd_to_nano.(System.get_env("VGAS_AI_DAILY_BUDGET_USD", "0.25")),
-    monthly_budget_nano_usd: usd_to_nano.(System.get_env("VGAS_AI_MONTHLY_BUDGET_USD", "2.00")),
-    max_concurrent_requests:
-      String.to_integer(System.get_env("VGAS_AI_MAX_CONCURRENT_REQUESTS", "2"))
+  config :voelgoed_ai, :development_ai, VoelgoedAi.DevelopmentAiConfig.load(System.get_env())
 end

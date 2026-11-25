@@ -63,3 +63,81 @@ next in sequence and uses deterministic transport fakes to prove typed
 inference and G027 reservations. F04–F06 remain pending in the approved
 sequence. F07–F09 have no new external evidence in this run. Core go/no-go
 remains open. No deployment or merge occurred.
+
+## Independent assessment follow-up
+
+The credential configuration remains `PARTIALLY_VERIFIED`. The previous
+HTTP 403 remains the latest provider result. Repeat the read-only check
+after the owner confirms that List models has Read permission.
+
+### VGAS-2 database provisioning
+
+DevCore v1.2.1's installed help documents that `activate` provisions roles,
+databases and environment files on existing servers. It never recreates
+the services. Compose labels for both assigned services identify
+`/opt/stacks/dev-core/compose.yaml`. Both services run
+`postgres:18.6-alpine` with persistent volumes. There is no project-level
+image selection or extension provisioning command in the installed CLI.
+
+To provide pgvector in shared DEV and TEST, the DevCore owner would need
+to approve a replacement image for both PostgreSQL services, verify
+image and volume compatibility and backups, and schedule recreation.
+For F01, approve the following one-shot container instead. It matches the
+CI pin, binds loopback only, and keeps its database in temporary memory.
+The environment file would contain an independently generated disposable
+administrator password and have mode 0600.
+
+```sh
+docker run --rm -d --name vgas-f01-pgvector \
+  -p 127.0.0.1:55434:5432 \
+  --tmpfs /var/lib/postgresql:rw \
+  --env-file "$VGAS_F01_CONTAINER_ENV" \
+  pgvector/pgvector:0.8.4-pg18@sha256:212765b63c1462883de295c4c415edcd22191b8d8d46853e86ad05d4b577a4cb
+```
+
+`docker buildx imagetools inspect pgvector/pgvector:0.8.4-pg18` resolved the
+digest above. After approval, mirror CI's restricted `vgas_test` role
+and empty database inside the container, enable vector as the disposable
+administrator, verify availability and the installed version, then run
+the repository migration and integration tests against this target.
+Stop the container and remove the temporary credential file afterward.
+The command has not run and shared services were not changed.
+
+### VGAS-2 stable authentication trial
+
+Hex release metadata confirms that AshAuthenticationPhoenix 2.17.4
+accepts AshAuthentication `~> 4.15`. AshAuthentication 4.15.1 requires
+Assent `> 0.2.0 and < 0.3.0`. The local
+`mise exec -- mix deps.update ash_authentication ash_authentication_phoenix`
+trial resolved those exact stable versions with Assent 0.2.13.
+`mise exec -- mix hex.audit` reported critical EEF-CVE-2026-117656 for
+that transitive release. Restored the prior manifest and lock. The
+original lock resolves Assent 0.3.2 and its audit was clean. No override
+was applied. The G036 stable dependency gate needs a patched stable
+dependency chain or an explicit, narrow exception for the existing
+release-candidate pair.
+
+- [AshAuthentication 4.15.1 requirements](https://hex.pm/api/packages/ash_authentication/releases/4.15.1)
+- [AshAuthenticationPhoenix 2.17.4 requirements](https://hex.pm/api/packages/ash_authentication_phoenix/releases/2.17.4)
+- [Assent advisory](https://osv.dev/vulnerability/EEF-CVE-2026-117656)
+
+### VGAS-3 runtime validation
+
+The independent runtime correction is staged locally ahead of inference
+work. Only the approved Luna and embedding profiles, 1536 dimensions and
+reasoning effort `none` are accepted. Token and concurrency limits must
+be positive. Budget values are exact nonnegative nano-USD, including
+zero. Live opt-in accepts only `true` or `false`. Errors name the
+variable and omit its value. Native credential lookup is unchanged.
+
+The focused tests initially failed without the validator. The final
+credential-free `devcore-project run test -- mise exec -- mix test`
+passed 17 tests. DEV runtime probes rejected a negative budget and
+`TRUE` (exit 1) and accepted a zero budget (exit 0). Formatting and
+warnings-as-errors application compilation exited 0. Dependency
+recompilation emitted an upstream deprecated `xref` configuration
+warning.
+
+F01 remains blocked. VGAS-3 typed inference and G027 reservation work
+await the F01 baseline. No paid provider calls, public push, merge or
+deployment occurred.
