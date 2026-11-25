@@ -129,6 +129,39 @@ defmodule VoelgoedAi.Support.WorkflowTest do
     assert [] = SupportDBCase.writes(ctx)
   end
 
+  test "a signed replay after admission leaves its run deadline and charges unchanged", ctx do
+    assert {:ok, %{id: id}} = SupportDBCase.signed_receipt(ctx)
+    assert :ok = RunProcessing.process_event(id)
+    session = Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+    account = "synthetic:#{ctx.event.external_account_id}:%"
+
+    assert %{rows: [[deadline, 6]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT deadline_at, (SELECT sum(count)::bigint FROM support_admission_windows WHERE scope LIKE $2)
+               FROM support_runs WHERE session_id = $1
+               """,
+               [session, account]
+             )
+
+    SupportDBCase.advance_clock(ctx, 44)
+    assert {:ok, %{id: ^id}} = SupportDBCase.signed_receipt(ctx)
+    assert :ok = RunProcessing.process_event(id)
+
+    assert %{rows: [[^deadline, 6]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT deadline_at, (SELECT sum(count)::bigint FROM support_admission_windows WHERE scope LIKE $2)
+               FROM support_runs WHERE session_id = $1
+               """,
+               [session, account]
+             )
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   test "restoring global control cannot replay a pending public reply", ctx do
     id = SupportDBCase.prepare_reply(ctx)
     SupportDBCase.disable_automation(ctx)

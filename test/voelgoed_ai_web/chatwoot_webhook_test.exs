@@ -60,6 +60,25 @@ defmodule VoelgoedAiWeb.ChatwootWebhookTest do
     assert {:reject, 401} = authenticate(signed(body <> "\n", 0, body))
   end
 
+  test "a body read timeout rejects before any receipt can be decoded" do
+    conn = signed(Jason.encode!(payload()))
+    conn = %{conn | adapter: {__MODULE__.TimedOutBody, self()}}
+
+    assert {:reject, 400} = authenticate(conn)
+    assert_receive {:body_read, options}
+    assert options[:length] <= 8192
+    assert options[:read_timeout] in 1..500
+  end
+
+  defmodule TimedOutBody do
+    @moduledoc false
+
+    def read_req_body(parent, options) do
+      send(parent, {:body_read, options})
+      {:error, :timeout}
+    end
+  end
+
   test "qualifies identity and keeps private, unsupported, and invalid senders out of reply work" do
     for other <- [
           put_in(payload()["account"]["id"], 99),
