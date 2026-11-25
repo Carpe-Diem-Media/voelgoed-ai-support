@@ -13,18 +13,24 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
   alias VoelgoedAi.Feasibility.ChatwootStore, as: Store
 
   @reply "This is the fixed F06 reply."
+  @receive_timeout 500
 
   def decide(ctx, event_id) do
-    event = Store.event(ctx.prefix, event_id)
+    case Store.event(ctx.prefix, event_id) do
+      %{outcome: "dispatched", processed: false} = event ->
+        operation =
+          case {event.purpose, ctx.decision} do
+            {"input", "reply"} -> :reply
+            {"input", "handoff"} -> :handoff_input
+            _ -> :observe
+          end
 
-    operation =
-      case {event.purpose, ctx.decision} do
-        {"input", "reply"} -> :reply
-        {"input", "handoff"} -> :handoff_input
-        _ -> :observe
-      end
+        scope = Map.put(event, :deadline, Store.ingress_deadline(event))
+        Store.decide(ctx, event_id, event, ownership(ctx, scope, operation))
 
-    Store.decide(ctx, event_id, event, ownership(ctx, event, operation))
+      _ ->
+        {:ok, :ok}
+    end
   end
 
   def deliver(ctx, delivery_id) do
@@ -47,8 +53,14 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
 
     case result do
       {:ok, {:send, generation}} ->
-        result = write(ctx, delivery)
-        Store.settle(ctx, delivery, generation, result) |> job_result()
+        case Store.authorize_dispatch(ctx, delivery, generation, @receive_timeout) do
+          {:ok, {:allowed, expires_at}} ->
+            result = write(ctx, delivery, expires_at)
+            Store.settle(ctx, delivery, generation, result) |> job_result()
+
+          result ->
+            job_result(result)
+        end
 
       {:ok, :retry_preflight} ->
         {:error, :handoff_preflight_unavailable}
@@ -133,9 +145,9 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
 
   defp classify(_ctx, _scope, _body, _operation), do: :unknown
 
-  defp write(ctx, %{kind: "reply"} = delivery) do
+  defp write(ctx, %{kind: "reply"} = delivery, expires_at) do
     result =
-      request(ctx, delivery, :post, "/messages",
+      request(ctx, within_lease(delivery, expires_at), :post, "/messages",
         json: %{content: @reply, message_type: "outgoing", private: false}
       )
 
@@ -162,22 +174,25 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     end
   end
 
-  defp write(ctx, %{kind: "handoff"} = delivery) do
-    result = request(ctx, delivery, :post, "/toggle_status", json: %{status: "open"})
+  defp write(ctx, %{kind: "handoff"} = delivery, expires_at) do
+    scope = within_lease(delivery, expires_at)
+    result = request(ctx, scope, :post, "/toggle_status", json: %{status: "open"})
 
     case result do
       {:ok, %{status: status, body: %{"payload" => %{"current_status" => "open"}}}}
       when status in 200..299 ->
-        with {:ok, _attempt} <- Store.reserve_read(ctx, delivery, "sending"),
-             :human <- ownership(ctx, delivery, :observe) do
-          {"sent", "handoff_confirmed", nil}
-        else
-          _ -> {"unknown", "handoff_unconfirmed", nil}
+        case Store.reserve_read(ctx, scope, "sending") do
+          {:ok, attempt} -> {:handoff_read, attempt, ownership(ctx, scope, :observe)}
+          :unavailable -> {"unknown", "handoff_unconfirmed", nil}
         end
 
       _ ->
         unresolved(result)
     end
+  end
+
+  defp within_lease(delivery, expires_at) do
+    %{delivery | deadline: Enum.min([delivery.deadline, expires_at], DateTime)}
   end
 
   defp unresolved({:ok, %{status: 403}}), do: {"failed", "permission_rejected", nil}
@@ -189,20 +204,27 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
       scope.installation == ctx.installation and scope.account_id == ctx.account_id and
         scope.inbox_id == ctx.inbox_id
 
-    Req.new(
-      [
-        url:
-          "https://chatwoot.invalid/api/v1/accounts/#{scope.account_id}/conversations/#{scope.conversation_id}#{suffix}",
-        method: method,
-        headers: [{"api_access_token", ctx.api_token}],
-        adapter: ChatwootFakeAdapter,
-        receive_timeout: 500,
-        retry: false,
-        redirect: false
-      ] ++ options
-    )
-    |> Req.Request.put_private(:f06_adapter, adapter)
-    |> Req.request()
+    timeout = min(@receive_timeout, DateTime.diff(scope.deadline, ctx.now.(), :millisecond))
+
+    if timeout > 0 do
+      Req.new(
+        [
+          url:
+            "https://chatwoot.invalid/api/v1/accounts/#{scope.account_id}/conversations/#{scope.conversation_id}#{suffix}",
+          method: method,
+          headers: [{"api_access_token", ctx.api_token}],
+          adapter: ChatwootFakeAdapter,
+          receive_timeout: timeout,
+          request_timeout: timeout,
+          retry: false,
+          redirect: false
+        ] ++ options
+      )
+      |> Req.Request.put_private(:f06_adapter, adapter)
+      |> Req.request()
+    else
+      {:error, :request_deadline_exceeded}
+    end
   end
 end
 

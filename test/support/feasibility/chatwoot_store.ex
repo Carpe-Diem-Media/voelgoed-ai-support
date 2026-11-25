@@ -195,90 +195,122 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
     )
   end
 
-  def decide(%{prefix: p, oban: oban} = ctx, id, event, ownership) do
+  def decide(%{prefix: p} = ctx, id, event, ownership) do
     Repo.transaction(fn ->
-      session = session_for(p, event, ownership)
-      session = observe(ctx, session, ownership)
-
       current =
-        one!("SELECT processed FROM #{p}.inbound_events WHERE id = $1::text::uuid FOR UPDATE", [
+        one!(
+          "SELECT outcome, processed, received_at FROM #{p}.inbound_events WHERE id = $1::text::uuid FOR UPDATE",
+          [id]
+        )
+
+      cond do
+        current.outcome != "dispatched" or current.processed ->
+          :ok
+
+        not DateTime.before?(ctx.now.(), ingress_deadline(current)) ->
+          finish_event(p, id, "ingress_deadline_exceeded")
+
+        true ->
+          decide_current(ctx, id, event, ownership)
+      end
+    end)
+  end
+
+  defp decide_current(%{prefix: p} = ctx, id, event, ownership) do
+    session = session_for(p, event, ownership)
+
+    if DateTime.before?(ctx.now.(), ingress_deadline(event)) do
+      finish_event(p, id, admit(ctx, session, id, event, ownership))
+    else
+      finish_event(p, id, "ingress_deadline_exceeded")
+    end
+  end
+
+  defp admit(%{prefix: p, oban: oban} = ctx, session, id, event, ownership) do
+    session = observe(ctx, session, ownership)
+
+    case {event.purpose, session, ownership} do
+      {"input", %{state: "bot_active", active_event: active_event} = session, :bot}
+      when is_nil(active_event) or ctx.decision == "handoff" ->
+        kind = ctx.decision
+
+        epoch =
+          if kind == "handoff",
+            do: fence(ctx, session, "handoff_pending"),
+            else: session.epoch
+
+        delivery_id = Ash.UUIDv7.generate()
+        deadline = deadline(ctx, event, kind)
+
+        query!(
+          """
+          INSERT INTO #{p}.deliveries (id, session_id, event_id, kind, state, epoch, deadline)
+          VALUES ($1::text::uuid,$2,$3::text::uuid,$4,'pending',$5,$6)
+          """,
+          [delivery_id, session.id, id, kind, epoch, deadline]
+        )
+
+        query!("UPDATE #{p}.sessions SET active_event = $2::text::uuid WHERE id = $1", [
+          session.id,
           id
         ])
 
-      unless current.processed do
-        admission =
-          case {event.purpose, session, ownership} do
-            {"input", %{state: "bot_active", active_event: active_event} = session, :bot}
-            when is_nil(active_event) or ctx.decision == "handoff" ->
-              kind = ctx.decision
+        max_attempts = if kind == "handoff", do: @handoff_max_attempts, else: 1
 
-              epoch =
-                if kind == "handoff",
-                  do: fence(ctx, session, "handoff_pending"),
-                  else: session.epoch
-
-              delivery_id = Ash.UUIDv7.generate()
-              deadline = deadline(ctx, event, kind)
-
-              query!(
-                """
-                INSERT INTO #{p}.deliveries (id, session_id, event_id, kind, state, epoch, deadline)
-                VALUES ($1::text::uuid,$2,$3::text::uuid,$4,'pending',$5,$6)
-                """,
-                [delivery_id, session.id, id, kind, epoch, deadline]
-              )
-
-              query!("UPDATE #{p}.sessions SET active_event = $2::text::uuid WHERE id = $1", [
-                session.id,
-                id
-              ])
-
-              max_attempts = if kind == "handoff", do: @handoff_max_attempts, else: 1
-
-              enqueue!(
-                oban,
-                ChatwootDeliveryJob.new(%{"delivery_id" => delivery_id},
-                  max_attempts: max_attempts
-                )
-              )
-
-              enqueue!(
-                oban,
-                ChatwootDeadlineJob.new(%{"delivery_id" => delivery_id}, scheduled_at: deadline)
-              )
-
-              checkpoint(ctx, :after_decision_enqueue)
-              kind
-
-            _ ->
-              "no_write"
-          end
-
-        query!(
-          "UPDATE #{p}.inbound_events SET processed = true, decision = $2 WHERE id = $1::text::uuid",
-          [id, admission]
+        enqueue!(
+          oban,
+          ChatwootDeliveryJob.new(%{"delivery_id" => delivery_id},
+            max_attempts: max_attempts
+          )
         )
-      end
 
-      :ok
-    end)
+        enqueue!(
+          oban,
+          ChatwootDeadlineJob.new(%{"delivery_id" => delivery_id}, scheduled_at: deadline)
+        )
+
+        checkpoint(ctx, :after_decision_enqueue)
+        kind
+
+      _ ->
+        "no_write"
+    end
   end
+
+  defp finish_event(p, id, decision) do
+    query!(
+      "UPDATE #{p}.inbound_events SET processed = true, decision = $2 WHERE id = $1::text::uuid",
+      [id, decision]
+    )
+
+    :ok
+  end
+
+  def ingress_deadline(event), do: DateTime.add(event.received_at, @reply_deadline_seconds)
 
   @doc "Spend one delivery read attempt before entering the HTTP adapter."
   def reserve_read(%{prefix: p} = ctx, delivery, state) do
     limit = if delivery.kind == "reply", do: @reply_max_reads, else: @handoff_max_attempts
 
-    case query!(
-           """
-           UPDATE #{p}.deliveries SET read_attempts = read_attempts + 1
-           WHERE id = $1 AND state = $2
-             AND deadline > $3 AND read_attempts < $4 AND recovery_failure IS NULL
-           RETURNING read_attempts
-           """,
-           [delivery.id, state, ctx.now.(), limit]
-         ) do
-      %{rows: [[attempt]]} -> {:ok, attempt}
-      %{rows: []} -> :unavailable
+    Repo.transaction(fn ->
+      current = lock_delivery(p, delivery.id)
+      # Sample the injected clock after any wait on the reservation row.
+      now = ctx.now.()
+
+      if current.state == state and is_nil(current.recovery_failure) and
+           current.read_attempts < limit and DateTime.before?(now, delivery.deadline) do
+        %{rows: [[attempt]]} =
+          query!(
+            "UPDATE #{p}.deliveries SET read_attempts = read_attempts + 1 WHERE id = $1 RETURNING read_attempts",
+            [current.id]
+          )
+
+        {:reserved, attempt}
+      end
+    end)
+    |> case do
+      {:ok, {:reserved, attempt}} -> {:ok, attempt}
+      {:ok, nil} -> :unavailable
     end
   end
 
@@ -287,7 +319,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
       session = lock_session(p, delivery.session_id)
       current = lock_delivery(p, delivery.id)
 
-      if current.state == "pending" do
+      if current.state == "pending" and current.read_attempts == read_attempt do
         cond do
           not DateTime.before?(ctx.now.(), current.deadline) ->
             expire_current(ctx, current)
@@ -350,7 +382,25 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
     end)
   end
 
-  def settle(%{prefix: p} = ctx, delivery, generation, {state, reason, external_id}) do
+  @doc "Recheck the committed write claim immediately before dispatch."
+  def authorize_dispatch(%{prefix: p} = ctx, delivery, generation, timeout_ms) do
+    Repo.transaction(fn ->
+      session = lock_session(p, delivery.session_id)
+      current = lock_delivery(p, delivery.id)
+      now = ctx.now.()
+
+      if current.state == "sending" and current.generation == generation and
+           session.epoch == current.epoch and session.active_event == current.event_id and
+           allowed?(session.state, current.kind) and DateTime.before?(now, current.deadline) do
+        expires_at = claim_expires_at(current.claimed_at)
+
+        if DateTime.diff(expires_at, now, :microsecond) > timeout_ms * 1000,
+          do: {:allowed, expires_at}
+      end
+    end)
+  end
+
+  def settle(%{prefix: p} = ctx, delivery, generation, result) do
     Repo.transaction(fn ->
       session = lock_session(p, delivery.session_id)
       current = lock_delivery(p, delivery.id)
@@ -360,23 +410,30 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
           session.epoch != current.epoch ->
             mark_unknown(ctx, current, "ownership_changed_during_send")
 
-          state == "unknown" ->
-            mark_unknown(ctx, current, reason)
-
-          state == "sent" and current.kind == "handoff" and
-              not DateTime.before?(ctx.now.(), current.deadline) ->
-            mark_unknown(ctx, current, "handoff_unconfirmed")
-
-          state == "sent" and current.kind == "handoff" ->
-            finish(ctx, current, state, reason, external_id)
-            observe(ctx, session, :human)
+          not DateTime.before?(ctx.now.(), claim_expires_at(current.claimed_at)) ->
+            mark_unknown(ctx, current, "claim_expired")
 
           true ->
-            finish(ctx, current, state, reason, external_id)
+            settle_current(ctx, session, current, result)
         end
       end
     end)
   end
+
+  defp settle_current(ctx, session, current, {:handoff_read, attempt, ownership}) do
+    if current.read_attempts == attempt and is_nil(current.recovery_failure) do
+      case handoff_observation(ctx, session, current, ownership, "handoff_confirmed") do
+        :unconfirmed -> mark_unknown(ctx, current, "handoff_unconfirmed")
+        :recorded -> :ok
+      end
+    end
+  end
+
+  defp settle_current(ctx, _session, current, {"unknown", reason, nil}),
+    do: mark_unknown(ctx, current, reason)
+
+  defp settle_current(ctx, _session, current, {state, reason, external_id}),
+    do: finish(ctx, current, state, reason, external_id)
 
   def recover(%{prefix: p} = ctx, delivery) do
     Repo.transaction(fn ->
@@ -404,30 +461,44 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
       session = lock_session(p, delivery.session_id)
       current = lock_delivery(p, delivery.id)
 
-      if current.state == "unknown" and current.kind == "handoff" do
-        cond do
-          not DateTime.before?(ctx.now.(), current.deadline) ->
-            expire_current(ctx, current)
+      if current.state == "unknown" and current.kind == "handoff" and
+           current.read_attempts == attempt and is_nil(current.recovery_failure) do
+        case handoff_observation(ctx, session, current, ownership, "goal_observed") do
+          :recorded ->
+            :ok
 
-          ownership == :human and session.state in ["handoff_pending", "human_active"] ->
-            finish(ctx, current, "sent", "goal_observed", nil)
-            observe(ctx, session, :human)
-
-          ownership == :closed or session.state == "closed" ->
-            observe(ctx, session, :closed)
-            recovery_failed(ctx, current, "handoff_conversation_closed")
-
-          attempt == @handoff_max_attempts ->
+          :unconfirmed when attempt == @handoff_max_attempts ->
             recovery_failed(ctx, current, "handoff_read_budget_exhausted")
 
-          is_nil(current.recovery_failure) ->
+          :unconfirmed ->
             :retry_read
-
-          true ->
-            :ok
         end
       end
     end)
+  end
+
+  defp handoff_observation(ctx, session, current, ownership, confirmed_reason) do
+    cond do
+      not DateTime.before?(ctx.now.(), current.deadline) ->
+        expire_current(ctx, current)
+        :recorded
+
+      ownership == :closed or session.state == "closed" ->
+        if current.state == "sending",
+          do: finish(ctx, current, "unknown", "handoff_unconfirmed", nil)
+
+        observe(ctx, session, :closed)
+        recovery_failed(ctx, current, "handoff_conversation_closed")
+        :recorded
+
+      ownership == :human and session.state in ["handoff_pending", "human_active"] ->
+        finish(ctx, current, "sent", confirmed_reason, nil)
+        observe(ctx, session, :human)
+        :recorded
+
+      true ->
+        :unconfirmed
+    end
   end
 
   @doc "Close overdue automation work without making a remote request."
@@ -440,8 +511,24 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
     end)
   end
 
-  @doc "Find overdue intents even if Oban discarded an individual deadline job."
+  @doc "Find overdue receipts and intents even when their Oban jobs were discarded."
   def sweep_deadlines(%{prefix: p} = ctx) do
+    query!(
+      """
+      WITH expired AS (
+        SELECT id FROM #{p}.inbound_events
+        WHERE outcome = 'dispatched' AND NOT processed AND received_at <= $1
+        ORDER BY received_at, id
+        LIMIT 100
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE #{p}.inbound_events AS e
+      SET processed = true, decision = 'ingress_deadline_exceeded'
+      FROM expired WHERE e.id = expired.id
+      """,
+      [DateTime.add(ctx.now.(), -@reply_deadline_seconds)]
+    )
+
     %{rows: rows} =
       query!(
         """
@@ -507,7 +594,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
   defp deadline(ctx, _event, "handoff"), do: DateTime.add(ctx.now.(), @handoff_recovery_seconds)
 
   defp deadline(_ctx, event, "reply"),
-    do: DateTime.add(event.received_at, @reply_deadline_seconds)
+    do: ingress_deadline(event)
 
   defp session_for(p, event, ownership) do
     key = [event.installation, event.account_id, event.conversation_id]
