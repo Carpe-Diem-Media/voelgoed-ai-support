@@ -1,10 +1,13 @@
 defmodule VoelgoedAi.ChatwootFeasibilityTest do
   use ExUnit.Case, async: false
+  import Ecto.Query, only: [where: 3]
   import Phoenix.ConnTest, only: [build_conn: 0, dispatch: 5]
   import Plug.Conn
 
   alias VoelgoedAi.Feasibility.{
+    ChatwootDeadlineJob,
     ChatwootDelivery,
+    ChatwootDeliveryJob,
     ChatwootEndpoint,
     ChatwootStore
   }
@@ -241,7 +244,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
 
     assert submit(ctx).status == 204
     assert drain(ctx, :f06_ingress).success == 1
-    assert counts(ctx) == [1, 2, 1, 1]
+    assert counts(ctx) == [1, 3, 1, 1]
     id = intent_id(ctx)
     assert %{state: "pending", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
     assert drain(ctx, :f06_delivery).success == 1
@@ -274,7 +277,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
 
     assert submit(ctx, body: payload(%{"id" => 102})).status == 204
     assert drain(ctx, :f06_ingress).success == 1
-    assert counts(ctx) == [2, 4, 1, 1]
+    assert counts(ctx) == [2, 5, 1, 1]
     assert %{state: "human_active", epoch: 3} = session(ctx)
     assert_fake_calls(ctx, [:get, :get, :handoff, :get, :get])
   end
@@ -293,7 +296,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert drain(ctx, :f06_ingress).discard == 1
     assert %{state: "bot_active", epoch: 1, active_event: ^active} = session(ctx)
     assert %{state: "pending"} = ChatwootStore.delivery(ctx.prefix, id)
-    assert counts(ctx) == [2, 3, 1, 1]
+    assert counts(ctx) == [2, 4, 1, 1]
 
     assert %{rows: [[false, nil]]} =
              sql!(
@@ -310,7 +313,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert %{state: "pending", kind: "handoff"} =
              ChatwootStore.delivery(ctx.prefix, intent_id(ctx, 102))
 
-    assert counts(ctx) == [2, 4, 1, 2]
+    assert counts(ctx) == [2, 6, 1, 2]
     assert_fake_calls(ctx, [:get, :get, :get])
   end
 
@@ -409,7 +412,6 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
       fake(ctx, [
         get(pending()),
         get(pending()),
-        get(pending(%{"last_non_activity_message" => %{"id" => 102}})),
         get(pending(%{"last_non_activity_message" => %{"id" => 102}}))
       ])
 
@@ -422,8 +424,11 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert drain(ctx, :f06_ingress).success == 1
     id = intent_id(ctx, 102)
     assert drain(%{ctx | now: fn -> DateTime.add(@now, 45) end}, :f06_delivery).success == 1
-    assert %{state: "cancelled", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
-    assert_fake_calls(ctx, [:get, :get, :get, :get])
+
+    assert %{state: "cancelled", attempts: 0, reason: "reply_deadline_exceeded"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert_fake_calls(ctx, [:get, :get, :get])
   end
 
   test "a public human reply fences pending work and reconciles current ownership", ctx do
@@ -551,7 +556,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert :ok = ChatwootDelivery.deliver(expired, id)
     assert submit(expired, body: payload(%{"id" => 102})).status == 204
     assert drain(%{expired | decision: "reply"}, :f06_ingress).success == 1
-    assert counts(ctx) == [2, 3, 1, 1]
+    assert counts(ctx) == [2, 4, 1, 1]
     assert_fake_calls(ctx, [:get, :get, :get])
   end
 
@@ -757,14 +762,6 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
         get(pending()),
         get(pending()),
         reply(crashed),
-        get(
-          pending(%{
-            "last_non_activity_message" => %{
-              "id" => 700,
-              "content" => "This is the fixed F06 reply."
-            }
-          })
-        ),
         get(pending()),
         get(pending(%{"last_non_activity_message" => %{"id" => 102}}))
       ])
@@ -794,14 +791,15 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert %{state: "unknown", attempts: 1, reason: "claim_expired"} =
              ChatwootStore.delivery(ctx.prefix, id)
 
-    assert {:ok, _} = ChatwootDelivery.reconcile(advanced, id)
+    insert_reconciliation(ctx, id)
+    assert drain(advanced, :f06_reconcile).success == 1
     assert :ok == ChatwootDelivery.deliver(advanced, id)
     assert {:ok, :ok} = ChatwootDelivery.decide(advanced, event_id(ctx, 101))
     assert submit(ctx, body: payload(%{"id" => 102})).status == 204
     assert drain(advanced, :f06_ingress).success == 1
     assert %{state: "unknown", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
-    assert counts(ctx) == [2, 4, 1, 1]
-    assert_fake_calls(ctx, [:get, :get, :reply, :get, :get, :get])
+    assert counts(ctx) == [2, 6, 1, 1]
+    assert_fake_calls(ctx, [:get, :get, :reply, :get, :get])
   end
 
   test "handoff timeout stays inhibited until a read confirms the goal after the reply deadline",
@@ -820,13 +818,493 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert %{state: "handoff_pending"} = session(ctx)
     assert :ok == ChatwootDelivery.deliver(ctx, id)
     advanced = %{ctx | now: fn -> DateTime.add(@now, 46) end}
-    assert {:ok, _} = ChatwootDelivery.reconcile(advanced, id)
+    assert drain(advanced, :f06_reconcile, with_scheduled: true).success == 1
 
     assert %{state: "sent", attempts: 1, reason: "goal_observed"} =
              ChatwootStore.delivery(ctx.prefix, id)
 
     assert %{state: "human_active"} = session(ctx)
     assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  @tag :f06_review
+  test "a discarded reply preflight releases the active slot at the deadline", ctx do
+    ctx = fake(ctx, [get(pending()), {:get, @path, &kill_worker/1}])
+    id = prepare(ctx)
+    assert %{state: "discarded", attempt: 1} = kill_and_rescue(ctx, :f06_delivery)
+
+    insert_delivery(ctx, id)
+    assert drain(at(ctx, 1), :f06_delivery).success == 1
+    assert %{state: "pending", read_attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+
+    assert drain(at(ctx, 44), :f06_deadline, with_scheduled: at(ctx, 44).now.()).success == 0
+    assert %{state: "pending"} = ChatwootStore.delivery(ctx.prefix, id)
+    assert drain(at(ctx, 45), :f06_deadline, with_scheduled: true).success == 1
+
+    assert %{state: "cancelled", reason: "reply_deadline_exceeded", attempts: 0} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "bot_active", active_event: nil} = session(ctx)
+    insert_delivery(ctx, id)
+    assert drain(at(ctx, 46), :f06_delivery).success == 1
+    assert_fake_calls(ctx, [:get, :get])
+  end
+
+  @tag :f06_review
+  test "Oban discards the third lost handoff preflight and the deadline records failure", ctx do
+    timeout = {:get, @path, write_result(:timeout)}
+
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        timeout,
+        timeout,
+        {:get, @path, &kill_worker/1}
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).failure == 1
+    assert drain(ctx, :f06_delivery, with_scheduled: true).failure == 1
+
+    assert %{state: "discarded", attempt: 3} =
+             kill_and_rescue(ctx, :f06_delivery, with_scheduled: true)
+
+    assert %{state: "pending", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+    assert drain(at(ctx, 301), :f06_delivery, with_scheduled: true).success == 0
+    assert drain(at(ctx, 301), :f06_deadline, with_scheduled: true).success == 1
+
+    assert %{state: "failed", reason: "handoff_deadline_exceeded", attempts: 0} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending", active_event: nil} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :get, :get])
+  end
+
+  @tag :f06_review
+  test "a replacement delivery shares all three handoff preflight reservations", ctx do
+    timeout = {:get, @path, write_result(:timeout)}
+    ctx = fake(%{ctx | decision: "handoff"}, [get(pending()), timeout, timeout, timeout])
+    id = prepare(ctx)
+
+    assert drain(ctx, :f06_delivery).failure == 1
+    assert drain(ctx, :f06_delivery, with_scheduled: true).failure == 1
+    insert_delivery(ctx, id)
+    assert drain(ctx, :f06_delivery).success == 1
+
+    assert %{state: "failed", read_attempts: 3, reason: "handoff_preflight_exhausted"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert drain(ctx, :f06_delivery, with_scheduled: true).success == 1
+    assert_fake_calls(ctx, [:get, :get, :get, :get])
+  end
+
+  @tag :f06_review
+  test "a concurrent duplicate cannot enter GET while the last preflight is in flight", ctx do
+    parent = self()
+    timeout = {:get, @path, write_result(:timeout)}
+
+    third = fn request ->
+      barrier(parent, :last_preflight)
+      write_result(:timeout).(request)
+    end
+
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        timeout,
+        timeout,
+        {:get, @path, third}
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).failure == 1
+    assert drain(ctx, :f06_delivery, with_scheduled: true).failure == 1
+    job = Task.async(fn -> drain(ctx, :f06_delivery, with_scheduled: true) end)
+    assert_receive {:last_preflight, worker, _backend}, 5_000
+    assert %{state: "pending", read_attempts: 3} = ChatwootStore.delivery(ctx.prefix, id)
+    insert_delivery(ctx, id)
+    assert drain(ctx, :f06_delivery).success == 1
+    send(worker, {:release, :last_preflight, :ok})
+    assert Task.await(job).success == 1
+
+    assert %{state: "failed", reason: "handoff_preflight_exhausted"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert_fake_calls(ctx, [:get, :get, :get, :get])
+  end
+
+  @tag :f06_review
+  test "a replacement read-back shares the preflight budget and cannot confirm a wrong scope",
+       ctx do
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(pending()),
+        handoff(write_result(:timeout)),
+        get(pending(%{"status" => "open", "account_id" => 2})),
+        get(pending())
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).success == 1
+    assert drain(ctx, :f06_reconcile, with_scheduled: true).failure == 1
+    assert %{state: "unknown", read_attempts: 2} = ChatwootStore.delivery(ctx.prefix, id)
+
+    insert_reconciliation(ctx, id)
+    assert drain(ctx, :f06_reconcile).success == 1
+
+    assert %{
+             state: "unknown",
+             read_attempts: 3,
+             recovery_failure: "handoff_read_budget_exhausted"
+           } =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert drain(ctx, :f06_reconcile, with_scheduled: true).success == 1
+    assert %{state: "handoff_pending"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get, :get])
+  end
+
+  @tag :f06_review
+  test "a lost reconciliation GET cannot be retried outside the original handoff window", ctx do
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(pending()),
+        handoff(write_result(:timeout)),
+        {:get, @path, &kill_worker/1}
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).success == 1
+    assert %{attempt: 1} = kill_and_rescue(ctx, :f06_reconcile, with_scheduled: true)
+    assert drain(at(ctx, 300), :f06_reconcile, with_scheduled: true).success == 1
+    assert drain(at(ctx, 300), :f06_deadline, with_scheduled: true).success == 1
+
+    assert %{
+             state: "unknown",
+             read_attempts: 2,
+             recovery_failure: "handoff_read_deadline_exceeded"
+           } =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  @tag :f06_review
+  test "lease recovery reads back a lost handoff POST and fences a duplicate write", ctx do
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(pending()),
+        handoff(&kill_worker/1),
+        get(pending() |> put_in(["meta", "assignee_type"], "User"))
+      ])
+
+    id = prepare(ctx)
+    assert %{attempt: 1} = kill_and_rescue(ctx, :f06_delivery)
+    insert_delivery(ctx, id)
+    assert drain(ctx, :f06_delivery).success >= 1
+    assert drain(at(ctx, 5), :f06_recovery, with_scheduled: true).success == 1
+    assert %{state: "unknown", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+    assert drain(at(ctx, 5), :f06_reconcile, with_scheduled: true).success == 1
+
+    assert %{state: "sent", reason: "goal_observed", attempts: 1} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "human_active"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  @tag :f06_review
+  test "Oban Cron sweeps a reply after Oban discards its delivery and deadline jobs", ctx do
+    ctx = fake(ctx, [get(pending()), {:get, @path, &kill_worker/1}])
+    id = prepare(ctx)
+    assert %{state: "discarded"} = kill_and_rescue(ctx, :f06_delivery)
+    discard_checks(ctx, :f06_deadline)
+    assert %{state: "pending"} = ChatwootStore.delivery(ctx.prefix, id)
+
+    cron_name = {ChatwootDeadlineJob, ctx.prefix}
+
+    start_supervised!(
+      {Oban,
+       name: cron_name,
+       repo: Repo,
+       prefix: ctx.prefix,
+       queues: false,
+       peer: Oban.Peers.Isolated,
+       cron: [crontab: ChatwootDeadlineJob.crontab()],
+       log: false}
+      |> Supervisor.child_spec(id: cron_name)
+    )
+
+    cron = Oban.Registry.whereis(cron_name, {:plugin, Oban.Cron})
+    send(cron, :evaluate)
+    :sys.get_state(cron)
+
+    assert %{rows: [[true]]} =
+             sql!(ctx, "SELECT meta->'cron' FROM @schema.oban_jobs WHERE state = 'available'")
+
+    assert drain(at(ctx, 60), :f06_deadline).success == 1
+
+    assert %{state: "cancelled", reason: "reply_deadline_exceeded"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert_fake_calls(ctx, [:get, :get])
+  end
+
+  for {label, queue, seconds} <- [{"lease", :f06_recovery, 5}, {"deadline", :f06_deadline, 45}] do
+    @tag :f06_review
+    test "#{label} recovery wins against a late reply POST response", ctx do
+      parent = self()
+
+      wait_for_recovery = fn request ->
+        barrier(parent, :reply_post)
+        response(200, reply_body()).(request)
+      end
+
+      ctx = fake(ctx, [get(pending()), get(pending()), reply(wait_for_recovery)])
+      id = prepare(ctx)
+      write = Task.async(fn -> drain(ctx, :f06_delivery) end)
+      assert_receive {:reply_post, worker, _backend}, 5_000
+      assert worker == write.pid
+      insert_delivery(ctx, id)
+      assert drain(ctx, :f06_delivery).success == 1
+
+      if unquote(queue) == :f06_deadline, do: discard_checks(ctx, :f06_recovery)
+
+      assert drain(at(ctx, unquote(seconds)), unquote(queue), with_scheduled: true).success == 1
+      assert %{state: "unknown", reason: "claim_expired"} = ChatwootStore.delivery(ctx.prefix, id)
+      send(worker, {:release, :reply_post, :ok})
+      assert Task.await(write).success == 1
+
+      assert %{state: "unknown", attempts: 1, external_message_id: nil} =
+               ChatwootStore.delivery(ctx.prefix, id)
+
+      assert_fake_calls(ctx, [:get, :get, :reply])
+    end
+  end
+
+  @tag :f06_review
+  test "a qualified read-back that returns at the deadline cannot confirm the handoff", ctx do
+    clock = :atomics.new(1, [])
+
+    late_open = fn request ->
+      :atomics.put(clock, 1, 300)
+      response(200, unassigned("open")).(request)
+    end
+
+    ctx =
+      fake(
+        %{ctx | decision: "handoff", now: fn -> DateTime.add(@now, :atomics.get(clock, 1)) end},
+        [
+          get(pending()),
+          get(pending()),
+          handoff(write_result(:timeout)),
+          {:get, @path, late_open}
+        ]
+      )
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).success == 1
+    :atomics.put(clock, 1, 299)
+    assert drain(ctx, :f06_reconcile, with_scheduled: true).success == 1
+
+    assert %{state: "unknown", recovery_failure: "handoff_read_deadline_exceeded"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  @tag :f06_review
+  test "a handoff POST acceptance cannot spend a fourth read on immediate confirmation", ctx do
+    timeout = {:get, @path, write_result(:timeout)}
+
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        timeout,
+        timeout,
+        get(pending()),
+        handoff(response(200, %{"payload" => %{"current_status" => "open"}}))
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).failure == 1
+    assert drain(ctx, :f06_delivery, with_scheduled: true).failure == 1
+    assert drain(ctx, :f06_delivery, with_scheduled: true).success == 1
+    assert drain(ctx, :f06_reconcile, with_scheduled: true).success == 0
+
+    assert %{state: "unknown", attempts: 1, recovery_failure: "handoff_read_budget_exhausted"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :get, :get, :handoff])
+  end
+
+  @tag :f06_review
+  test "a qualified handoff preflight that returns at the deadline cannot claim a POST", ctx do
+    clock = :atomics.new(1, [])
+
+    late_bot = fn request ->
+      :atomics.put(clock, 1, 300)
+      response(200, pending()).(request)
+    end
+
+    ctx =
+      fake(
+        %{ctx | decision: "handoff", now: fn -> DateTime.add(@now, :atomics.get(clock, 1)) end},
+        [
+          get(pending()),
+          {:get, @path, late_bot}
+        ]
+      )
+
+    id = prepare(ctx)
+    :atomics.put(clock, 1, 299)
+    assert drain(ctx, :f06_delivery).success == 1
+
+    assert %{state: "failed", attempts: 0, reason: "handoff_deadline_exceeded"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get])
+  end
+
+  @tag :f06_review
+  test "read-back stops when the qualified conversation is resolved and preserves UNKNOWN", ctx do
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(pending()),
+        handoff(write_result(:timeout)),
+        get(unassigned("resolved"))
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).success == 1
+    assert drain(ctx, :f06_reconcile, with_scheduled: true).success == 1
+
+    assert %{state: "unknown", recovery_failure: "handoff_conversation_closed"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    insert_reconciliation(ctx, id)
+    assert drain(ctx, :f06_reconcile).success == 1
+    assert %{state: "closed"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  @tag :f06_review
+  test "a stale handoff write job leaves the remaining read to the recovery queue", ctx do
+    parent = self()
+
+    blocked_post = fn request ->
+      barrier(parent, :handoff_post)
+      response(200, %{"payload" => %{"current_status" => "open"}}).(request)
+    end
+
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(pending()),
+        handoff(blocked_post),
+        get(unassigned("open"))
+      ])
+
+    id = prepare(ctx)
+    write = Task.async(fn -> drain(ctx, :f06_delivery) end)
+    assert_receive {:handoff_post, worker, _backend}, 5_000
+    assert drain(at(ctx, 5), :f06_recovery, with_scheduled: true).success == 1
+    send(worker, {:release, :handoff_post, :ok})
+    assert Task.await(write).success == 1
+    assert %{state: "unknown", read_attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+
+    assert drain(at(ctx, 5), :f06_reconcile, with_scheduled: true).success == 1
+    assert %{state: "sent", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  @tag :f06_review
+  test "immediate handoff confirmation cannot settle after the deadline", ctx do
+    clock = :atomics.new(1, [])
+
+    late_open = fn request ->
+      :atomics.put(clock, 1, 300)
+      response(200, unassigned("open")).(request)
+    end
+
+    ctx =
+      fake(
+        %{ctx | decision: "handoff", now: fn -> DateTime.add(@now, :atomics.get(clock, 1)) end},
+        [
+          get(pending()),
+          get(pending()),
+          handoff(response(200, %{"payload" => %{"current_status" => "open"}})),
+          {:get, @path, late_open}
+        ]
+      )
+
+    id = prepare(ctx)
+    :atomics.put(clock, 1, 299)
+    assert drain(ctx, :f06_delivery).success == 1
+
+    assert %{state: "unknown", recovery_failure: "handoff_read_deadline_exceeded"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "handoff_pending"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  defp at(ctx, seconds), do: %{ctx | now: fn -> DateTime.add(@now, seconds) end}
+
+  defp kill_worker(_request), do: Process.exit(self(), :kill)
+
+  defp kill_and_rescue(ctx, queue, opts \\ []) do
+    {pid, ref} = spawn_monitor(fn -> drain(ctx, queue, opts) end)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 5_000
+
+    assert %{rows: [[id, attempt]]} =
+             sql!(
+               ctx,
+               "SELECT id, attempt FROM @schema.oban_jobs WHERE queue = $1 AND state = 'executing'",
+               [Atom.to_string(queue)]
+             )
+
+    lost = where(Oban.Job, [job], job.id == ^id)
+
+    assert {:ok, [%{id: ^id} = job]} =
+             Oban.Engine.rescue_jobs(Oban.config(ctx.oban), lost, rescue_after: 0)
+
+    Map.put(job, :attempt, attempt)
+  end
+
+  defp discard_checks(ctx, queue) do
+    crash = %{ctx | now: fn -> kill_worker(nil) end}
+
+    assert %{state: "available"} = kill_and_rescue(crash, queue, with_scheduled: true)
+    assert %{state: "available"} = kill_and_rescue(crash, queue)
+    assert %{state: "discarded"} = kill_and_rescue(crash, queue)
+  end
+
+  defp insert_delivery(ctx, id) do
+    assert {:ok, _} =
+             Oban.insert(
+               ctx.oban,
+               ChatwootDeliveryJob.new(%{"delivery_id" => id}, max_attempts: 3)
+             )
+  end
+
+  defp insert_reconciliation(ctx, id) do
+    job =
+      Oban.Job.new(%{"delivery_id" => id},
+        worker: "VoelgoedAi.Feasibility.ChatwootReconcileJob",
+        queue: :f06_reconcile,
+        max_attempts: 3
+      )
+
+    assert {:ok, _} = Oban.insert(ctx.oban, job)
   end
 
   defp submit(ctx, opts \\ []) do

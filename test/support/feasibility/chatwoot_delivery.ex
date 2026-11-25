@@ -27,29 +27,14 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     Store.decide(ctx, event_id, event, ownership(ctx, event, operation))
   end
 
-  def deliver(ctx, delivery_id, retry_preflight? \\ false) do
+  def deliver(ctx, delivery_id) do
     case Store.delivery(ctx.prefix, delivery_id) do
       %{state: "pending"} = delivery ->
         operation = if delivery.kind == "reply", do: :reply, else: :handoff
 
-        ownership =
-          if operation == :handoff and not DateTime.before?(ctx.now.(), delivery.deadline) do
-            :unknown
-          else
-            ownership(ctx, delivery, operation)
-          end
-
-        case Store.claim(ctx, delivery, ownership, retry_preflight?) do
-          {:ok, {:send, generation}} ->
-            result = write(ctx, delivery)
-            Store.settle(ctx, delivery, generation, result)
-            :ok
-
-          {:ok, :retry_preflight} ->
-            {:error, :handoff_preflight_unavailable}
-
-          {:ok, _no_write} ->
-            :ok
+        case Store.reserve_read(ctx, delivery, "pending") do
+          {:ok, attempt} -> claim_and_write(ctx, delivery, operation, attempt)
+          :unavailable -> Store.expire(ctx, delivery) |> job_result()
         end
 
       _ ->
@@ -57,10 +42,37 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     end
   end
 
-  def reconcile(ctx, delivery_id) do
-    delivery = Store.delivery(ctx.prefix, delivery_id)
-    Store.reconcile(ctx, delivery, ownership(ctx, delivery, :observe))
+  defp claim_and_write(ctx, delivery, operation, read_attempt) do
+    result = Store.claim(ctx, delivery, ownership(ctx, delivery, operation), read_attempt)
+
+    case result do
+      {:ok, {:send, generation}} ->
+        result = write(ctx, delivery)
+        Store.settle(ctx, delivery, generation, result) |> job_result()
+
+      {:ok, :retry_preflight} ->
+        {:error, :handoff_preflight_unavailable}
+
+      result ->
+        job_result(result)
+    end
   end
+
+  @doc "Recheck an ambiguous handoff through a bounded GET, with no write claim."
+  def reconcile(ctx, delivery_id) do
+    with %{kind: "handoff", state: "unknown"} = delivery <-
+           Store.delivery(ctx.prefix, delivery_id),
+         {:ok, attempt} <- Store.reserve_read(ctx, delivery, "unknown") do
+      Store.record_handoff_read(ctx, delivery, attempt, ownership(ctx, delivery, :observe))
+      |> job_result()
+    else
+      _ -> :ok
+    end
+  end
+
+  defp job_result({:ok, :retry_read}), do: {:error, :handoff_goal_unconfirmed}
+  defp job_result({:ok, _}), do: :ok
+  defp job_result({:error, _}), do: {:error, :delivery_rolled_back}
 
   defp ownership(ctx, scope, operation) do
     case request(ctx, scope, :get, "", []) do
@@ -156,10 +168,11 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     case result do
       {:ok, %{status: status, body: %{"payload" => %{"current_status" => "open"}}}}
       when status in 200..299 ->
-        if ownership(ctx, delivery, :observe) == :human do
+        with {:ok, _attempt} <- Store.reserve_read(ctx, delivery, "sending"),
+             :human <- ownership(ctx, delivery, :observe) do
           {"sent", "handoff_confirmed", nil}
         else
-          {"unknown", "handoff_unconfirmed", nil}
+          _ -> {"unknown", "handoff_unconfirmed", nil}
         end
 
       _ ->
@@ -190,6 +203,50 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     )
     |> Req.Request.put_private(:f06_adapter, adapter)
     |> Req.request()
+  end
+end
+
+defmodule VoelgoedAi.Feasibility.ChatwootDeadlineJob do
+  @moduledoc false
+  use Oban.Worker, queue: :f06_deadline, max_attempts: 3
+  alias VoelgoedAi.Feasibility.ChatwootDelivery
+  alias VoelgoedAi.Feasibility.ChatwootStore, as: Store
+
+  def crontab, do: [{"* * * * *", __MODULE__}]
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{args: %{"delivery_id" => id}, conf: conf}) do
+    ctx = Process.get({ChatwootDelivery, conf.prefix})
+    delivery = Store.delivery(ctx.prefix, id)
+    now = ctx.now.()
+
+    if DateTime.before?(now, delivery.deadline) do
+      {:snooze, DateTime.diff(delivery.deadline, now) + 1}
+    else
+      case Store.expire(ctx, delivery) do
+        {:ok, _} -> :ok
+        {:error, _} -> {:error, :deadline_rolled_back}
+      end
+    end
+  end
+
+  def perform(%Oban.Job{args: args, conf: conf}) when map_size(args) == 0 do
+    Store.sweep_deadlines(Process.get({ChatwootDelivery, conf.prefix}))
+    :ok
+  end
+end
+
+defmodule VoelgoedAi.Feasibility.ChatwootReconcileJob do
+  @moduledoc false
+  use Oban.Worker, queue: :f06_reconcile, max_attempts: 3
+  alias VoelgoedAi.Feasibility.ChatwootDelivery
+
+  @impl Oban.Worker
+  def backoff(%Oban.Job{attempt: attempt}), do: 2 * attempt - 1
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{args: %{"delivery_id" => id}, conf: conf}) do
+    ChatwootDelivery.reconcile(Process.get({ChatwootDelivery, conf.prefix}), id)
   end
 end
 
@@ -237,8 +294,8 @@ defmodule VoelgoedAi.Feasibility.ChatwootDeliveryJob do
   def backoff(%Oban.Job{attempt: attempt}), do: 2 * attempt - 1
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"delivery_id" => id}, conf: conf} = job) do
+  def perform(%Oban.Job{args: %{"delivery_id" => id}, conf: conf}) do
     ctx = Process.get({ChatwootDelivery, conf.prefix})
-    ChatwootDelivery.deliver(ctx, id, job.attempt < job.max_attempts)
+    ChatwootDelivery.deliver(ctx, id)
   end
 end

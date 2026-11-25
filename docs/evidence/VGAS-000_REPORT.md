@@ -587,10 +587,10 @@ three failed; with it restored, the 21 focused tests pass.
 
 ## F06 | VGAS-5 signed Chatwoot ingress and fixed delivery
 
-Evidence from `feat/vgas-5-f06-chatwoot-ingress`. The follow-up starts at
+Evidence from `feat/vgas-5-f06-chatwoot-ingress`. The first follow-up started at
 `c8fd5868be45807e69fe54b386595375c579abe2`. The implementation commit is
-`34ff8988a391dde5a5c2c9cc8eef98e99ea8d3a9`. The candidate head is the
-commit containing this section. The tests use synthetic IDs and JSON, and
+`34ff8988a391dde5a5c2c9cc8eef98e99ea8d3a9`. The next review fixes start at
+`c092c05e58887a6f2243d958f767b7fa19bdcf96`. The tests use synthetic IDs and JSON, and
 generate signing keys and fake API tokens in ExUnit. The test-only Phoenix
 endpoint runs with `server: false`. The Req adapter has no network path.
 
@@ -649,10 +649,10 @@ endpoint runs with `server: false`. The Req adapter has no network path.
    redirect, malformed acceptance or a failed read-back each left an
    UNKNOWN intent after one POST. After Oban discarded a lost delivery
    job, the recovery job recorded UNKNOWN at claim expiry. Worker
-   replays, a new event and read-only
-   reconciliation produced no additional POST for the unknown reply.
-   A read-only reconciliation at 46 seconds confirmed that an unknown
-   handoff had reached its goal. The adapter still recorded one status POST.
+   replays, a new event and a duplicate reconciliation job produced no
+   additional POST for the unknown reply. The scheduled read-only job
+   confirmed an unknown handoff at 46 seconds. The adapter recorded one
+   status POST.
 
 ### Review corrections
 
@@ -668,8 +668,8 @@ endpoint runs with `server: false`. The Req adapter has no network path.
    leaves that session human-owned with zero POSTs. The duplicate webhook
    and ingress job replay exercise the same sequence.
 3. **Handoff recovery.** A reply expires 45 seconds after receipt. G013's
-   five-minute handoff window starts when the intent is created. Oban
-   allows up to three pre-write reads on transport failures. The worker
+   five-minute handoff window starts when the intent is created. The
+   first review used Oban attempts to cap pre-write reads. The worker
    can send at 46 seconds. At the handoff deadline or after the third
    failed read, it records a terminal FAILED intent with a reason code and
    keeps the session in HANDOFF_PENDING for operator inspection. The spike
@@ -729,6 +729,27 @@ command with a single line selector.
   observed no retry. Exit 2, two failures and 50 excluded.
 - `:746`, recovery enqueue removed. The intent stayed SENDING after Oban
   discarded the delivery job. Exit 2, one failure and 51 excluded.
+
+### Delivery intent lifecycle
+
+Both intents use an atomic claim with one POST per intent. HTTP runs
+outside transactions. An insert in the decision transaction schedules
+the delivery and its independent deadline check. A recurring Oban
+deadline sweep also finds overdue intents if their individual check is
+discarded. Both deadline paths use PostgreSQL only. ExUnit drives Oban
+queues manually and exercises the recurring fallback with a real Cron
+tick against the same disposable schema.
+
+| Intent and transition | Guard and effect | Durable next step and job loss |
+|---|---|---|
+| Reply, create PENDING | A qualified bot owns the active input. The deadline is 45 seconds after receipt. The intent allows one reserved ownership read. | The decision transaction inserts the delivery and deadline jobs. A replacement delivery job cannot restore a spent read or extend the deadline. |
+| Reply, PENDING to SENDING | A fresh qualified GET passes eligibility. The session epoch and active event match before the deadline. | The claim transaction increments the generation, records the single POST attempt and schedules lease recovery at five seconds. |
+| Reply, PENDING to CANCELLED | A fence, ineligible GET or stale input prevents sending. The deadline check cancels an overdue, unclaimed reply and releases its active slot. | Cancellation is terminal. A lost deadline job is covered by the sweep. |
+| Reply, SENDING to SENT, FAILED or UNKNOWN | Settlement checks the generation and epoch. A verified message ID yields SENT. A definitive rejection yields FAILED. An uncertain result, changed epoch or expired claim yields UNKNOWN. | SENT and FAILED are terminal. If the delivery is lost, lease recovery records UNKNOWN. The deadline and sweep cover a lost lease job. UNKNOWN blocks another reply and is terminal for automation in this spike. |
+| Handoff, create PENDING | A qualified bot can hand off. The decision transaction fences unsent work and commits HANDOFF_PENDING. The deadline is five minutes after intent creation. | The decision transaction inserts the delivery and deadline jobs. All jobs share the row's three-read budget, including confirmation after the POST. |
+| Handoff, PENDING to PENDING, SENDING, SENT, CANCELLED or FAILED | An atomic reservation spends one read before a GET. A transient read can retry within budget. Qualified bot ownership permits a claim. Qualified human ownership confirms the goal without a POST. Resolution or a fence cancels the intent. Unverifiable ownership, exhausted preflight or deadline expiry records FAILED when no write was claimed. | Oban retries transient reads. Job replacement cannot restore a spent read. The deadline path closes an unclaimed intent if its delivery job is lost. FAILED keeps the inhibit. |
+| Handoff, SENDING to SENT, FAILED or UNKNOWN | The same claim and lease as the reply apply. A qualified confirming GET yields SENT and human ownership. A definitive rejection yields FAILED. Ambiguity, loss of claim or changed epoch yields UNKNOWN and keeps automation inhibited. | Settlement or lease recovery schedules a read-only job in the transaction that records UNKNOWN, if a read remains before the deadline. The deadline path records UNKNOWN and a recovery failure if the lease job is lost. |
+| Handoff, UNKNOWN to SENT or bounded UNKNOWN | A reserved GET within the original budget and deadline can confirm open status or human ownership. Resolution closes the session without proving the write. Unconfirmed reads exhaust the budget or reach the deadline and record a recovery failure. | Oban retries within the same row budget. If the read-back job is lost or replaced, the deadline path still records the failure without another POST. SENT, FAILED and CANCELLED are terminal. Bounded UNKNOWN stays inhibited for operator review. |
 
 ### Verification
 
