@@ -58,7 +58,7 @@ defmodule VoelgoedAi.Feasibility.TransportEvidence do
     [
       receive_timeout: 5000,
       retry: false,
-      # ReqLLM's retry step replaces `retry: false` and reads only this limit.
+      # ReqLLM's retry step replaces `retry: false`; this sets its attempt limit.
       max_retries: 0,
       redirect: false,
       adapter: fn request ->

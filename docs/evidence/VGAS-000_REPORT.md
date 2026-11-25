@@ -538,18 +538,23 @@ the F02–F03 sections and preserves them as history.
 The earlier claim that Req's `retry: false` disables embedding retries
 was wrong. ReqLLM 1.31.0 attaches its own retry step after merging the
 Req options and replaces `retry` with its policy
-(`deps/req_llm/lib/req_llm/step/retry.ex`). The step reads only
-`max_retries`, which defaults to 3. An offline probe with a counting
-adapter and `retry: false` entered the adapter four times for both a
-synthetic 503 and a synthetic timeout. With `max_retries: 0` in
+(`deps/req_llm/lib/req_llm/step/retry.ex`). That policy decides
+whether a failure is retryable; `max_retries`, which defaults to 3,
+controls the attempt limit. An offline probe with a counting adapter,
+`retry: false` and a 20-second total timeout entered the adapter four
+times for both a synthetic 503 and a synthetic timeout. With `max_retries: 0` in
 `req_http_options` it entered once.
 
 The merged durable path was also exposed. `TransportEvidence` calls
 `Req.merge(plug: ...)`, which sets the returned request's adapter to
 `Req.Plug`, so each retry bypassed the wrapper and its durable claim
-and went straight to the provider. The independent review of PR #3
-observed one wrapper entry but four fake-provider calls for both a
-503 and a timeout under the uncorrected options. An earlier draft of
+and went straight to the provider. Under the uncorrected options the
+independent review of PR #3 observed one wrapper entry and up to four
+fake-provider calls. A synthetic timeout gave four calls with either a
+5-second or a 20-second total timeout. A plain 503 gave three calls
+within the 5-second deadline the regression test uses and four within
+20 seconds, because retry backoff consumes the deadline. Four is the
+maximum: the first attempt plus three retries. An earlier draft of
 this correction wrongly called the durable path incidentally safe.
 
 The correction adds `max_retries: 0` to both transport option sets.
