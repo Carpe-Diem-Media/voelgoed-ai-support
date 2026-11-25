@@ -169,6 +169,12 @@ defmodule VoelgoedAi.Support.InboxBinding do
       )
     end
 
+    read :enabled_for_assistant do
+      argument(:assistant_id, :uuid, allow_nil?: false)
+      filter(expr(assistant_id == ^arg(:assistant_id) and status == :enabled))
+      prepare(build(limit: 1))
+    end
+
     create :create_row do
       transaction?(false)
 
@@ -207,7 +213,13 @@ defmodule VoelgoedAi.Support.InboxBinding do
       authorize_if(ActionScope)
     end
 
-    policy action([:configuration_row, :update_row, :qualified_inbox, :create_row]) do
+    policy action([
+             :configuration_row,
+             :update_row,
+             :qualified_inbox,
+             :enabled_for_assistant,
+             :create_row
+           ]) do
       authorize_if(ActionScope.Storage)
     end
   end

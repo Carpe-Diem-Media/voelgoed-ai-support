@@ -2,6 +2,10 @@ defmodule VoelgoedAi.Support.Configuration do
   @moduledoc """
   Runs authorized configuration actions on the application Repo. Staff grants
   and rows are rechecked under locks. Audit and epoch changes commit together.
+
+  Every mutation locks rows in one order: staff row, global control,
+  assistants in id order, then the binding. Later support work follows the
+  same order before it locks sessions, so the two cannot deadlock.
   """
 
   use Ash.Resource.Actions.Implementation
@@ -93,7 +97,7 @@ defmodule VoelgoedAi.Support.Configuration do
     do: project(get(InboxBinding, id))
 
   defp execute(InboxBinding, action, %{id: id} = args, admin) do
-    with {:ok, binding} <- get(InboxBinding, id, :for_update),
+    with {:ok, binding} <- lock_binding(id, rebind_target(action, args)),
          {:ok, attrs} <- binding_transition(binding, action, args) do
       transition(binding, epoch(binding, attrs), action, admin)
     end
@@ -121,9 +125,16 @@ defmodule VoelgoedAi.Support.Configuration do
     do: {:ok, epoch(assistant, %{status: :disabled, disabled_at: DateTime.utc_now()})}
 
   # In this slice no work can be admitted. The disabled state and new epoch
-  # fence the assistant without deleting its pointer or history.
-  defp assistant_transition(%{status: :disabled} = assistant, :retire),
-    do: {:ok, epoch(assistant, %{status: :retired})}
+  # fence the assistant without deleting its pointer or history. Enabled
+  # bindings must be disabled first. The assistant lock held here blocks a
+  # concurrent enable or rebind, which locks the assistant before the binding.
+  defp assistant_transition(%{status: :disabled} = assistant, :retire) do
+    case read(InboxBinding, :enabled_for_assistant, %{assistant_id: assistant.id}) do
+      {:ok, nil} -> {:ok, epoch(assistant, %{status: :retired})}
+      {:ok, _binding} -> {:error, :enabled_binding}
+      error -> error
+    end
+  end
 
   defp assistant_transition(_, _), do: {:error, :invalid_transition}
 
@@ -218,7 +229,7 @@ defmodule VoelgoedAi.Support.Configuration do
 
   defp control_transition(%{status: :disabled}, :enable_automation, %{binding_id: id}) do
     with {:ok, %{status: :enabled, operating_mode: :automatic} = binding} <-
-           get(InboxBinding, id, :for_update),
+           lock_binding(id),
          :ok <- eligible_binding(binding) do
       {:ok, %{status: :enabled, mode: :fake}}
     else
@@ -228,6 +239,35 @@ defmodule VoelgoedAi.Support.Configuration do
   end
 
   defp control_transition(_, _, _), do: {:error, :invalid_transition}
+
+  # The binding's assistant is read unlocked first so that its lock is taken
+  # before the binding's. A rebind between the two reads is reported as a
+  # conflict instead of locking a different assistant out of order.
+  defp lock_binding(id, other_assistants \\ []) do
+    with {:ok, candidate} <- get(InboxBinding, id),
+         :ok <- lock_assistants([candidate.assistant_id | other_assistants]),
+         {:ok, binding} <- get(InboxBinding, id, :for_update) do
+      if binding.assistant_id == candidate.assistant_id,
+        do: {:ok, binding},
+        else: {:error, :concurrent_configuration_change}
+    end
+  end
+
+  # UUID strings share one fixed format, so string order matches PostgreSQL's.
+  defp lock_assistants(ids) do
+    ids
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.reduce_while(:ok, fn id, :ok ->
+      case get(Assistant, id, :for_update) do
+        {:ok, _} -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp rebind_target(:rebind, %{assistant_id: id}), do: [id]
+  defp rebind_target(_action, _args), do: []
 
   defp eligible_binding(binding) do
     with {:ok, fixture} <- binding_fixture(binding),
@@ -323,8 +363,11 @@ defmodule VoelgoedAi.Support.Configuration do
   defp scoped_configuration(Assistant, %{id: id}, %{assistant_id: id}),
     do: project(get(Assistant, id))
 
+  # Workers see only revisions that were published. Drafts and discarded
+  # revisions stay visible to admins only.
   defp scoped_configuration(AssistantRevision, %{id: id}, %{assistant_id: assistant_id}) do
-    with {:ok, %{assistant_id: ^assistant_id} = revision} <- get(AssistantRevision, id) do
+    with {:ok, %{assistant_id: ^assistant_id, status: status} = revision}
+         when status in [:published, :superseded] <- get(AssistantRevision, id) do
       {:ok, projection(revision)}
     else
       _ -> {:error, :denied}

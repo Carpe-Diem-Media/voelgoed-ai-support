@@ -236,6 +236,33 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
     assert {:error, _} =
              invoke(InboxBinding, :read_configuration, %{id: Ash.UUIDv7.generate()}, scope)
 
+    pending = draft(admin, assistant)
+
+    revision_scope = fn id ->
+      struct(ActionScope.Processing,
+        action: :read_configuration,
+        resource: AssistantRevision,
+        target: id,
+        inbox: scope.inbox
+      )
+    end
+
+    assert {:ok, %{status: :published}} =
+             invoke(
+               AssistantRevision,
+               :read_configuration,
+               %{id: revision.id},
+               revision_scope.(revision.id)
+             )
+
+    assert {:error, _} =
+             invoke(
+               AssistantRevision,
+               :read_configuration,
+               %{id: pending.id},
+               revision_scope.(pending.id)
+             )
+
     assert {:error, _} =
              invoke(InboxBinding, :rebind, Map.put(args, :assistant_id, assistant.id), admin)
 
@@ -277,6 +304,41 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
 
     assert {:error, _} =
              invoke(InboxBinding, :change_mode, Map.put(args, :operating_mode, :shadow), admin)
+  end
+
+  test "binding mutations lock the assistant first and retirement needs disabled bindings", ctx do
+    admin = bootstrap_admin(ctx.admin)
+    assistant = create(admin, ctx.slug)
+    fixture = allow_fixture(assistant)
+    assert {:ok, _} = publish(admin, draft(admin, assistant), nil)
+    assert {:ok, _} = invoke(Assistant, :activate, %{id: assistant.id}, admin)
+
+    attrs =
+      Map.take(fixture, [
+        :assistant_id,
+        :installation_ref,
+        :external_account_id,
+        :external_inbox_id
+      ])
+
+    assert {:ok, binding} = invoke(InboxBinding, :create_draft, attrs, admin)
+    args = %{id: binding.id}
+
+    # While the enable waits for the assistant it must not hold the binding.
+    assert {:ok, waiter} =
+             Repo.transact(fn ->
+               lock_row("assistants", assistant.id)
+               task = blocked_task(fn -> invoke(InboxBinding, :enable, args, admin) end)
+               lock_row("inbox_bindings", binding.id, "NOWAIT")
+               {:ok, task}
+             end)
+
+    assert {:ok, %{status: :enabled}} = Task.await(waiter, 5_000)
+    assert {:ok, _} = invoke(Assistant, :disable, %{id: assistant.id}, admin)
+    assert {:error, error} = invoke(Assistant, :retire, %{id: assistant.id}, admin)
+    assert Exception.message(error) =~ "enabled_binding"
+    assert {:ok, _} = invoke(InboxBinding, :disable, args, admin)
+    assert {:ok, %{status: :retired}} = invoke(Assistant, :retire, %{id: assistant.id}, admin)
   end
 
   test "global enable requires fresh fixture eligibility and disable increments the epoch", ctx do
@@ -394,6 +456,12 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
                action: :append_operational,
                actor: %Scope{action: :append, target: {admin.id, :create}}
              )
+  end
+
+  defp lock_row(table, id, mode \\ "") do
+    SQL.query!(Repo, "SELECT 1 FROM #{table} WHERE id = $1 FOR UPDATE #{mode}", [
+      Ecto.UUID.dump!(id)
+    ])
   end
 
   defp publish(admin, revision, expected) do
