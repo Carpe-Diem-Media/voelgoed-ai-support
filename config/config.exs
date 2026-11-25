@@ -11,6 +11,14 @@ config :voelgoed_ai,
 
 config :voelgoed_ai, VoelgoedAi.Repo, log: false
 
+# Install job storage now. A later slice must explicitly configure execution.
+config :voelgoed_ai, Oban,
+  repo: VoelgoedAi.Repo,
+  queues: false,
+  plugins: false,
+  peer: false,
+  stager: false
+
 config :voelgoed_ai, VoelgoedAiWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   render_errors: [formats: [json: VoelgoedAiWeb.ErrorJSON], layout: false]
@@ -22,6 +30,8 @@ config :req_llm, load_dotenv: false
 config :ash, default_string_length_count: :codepoints
 
 if config_env() == :test do
+  config :voelgoed_ai, Oban, testing: :manual
+
   config :voelgoed_ai, :entra_fixture_transport, {Req.Test, VoelgoedAi.StaffEntraFixture}
 
   config :ash_authentication,

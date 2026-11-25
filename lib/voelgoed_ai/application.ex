@@ -17,6 +17,7 @@ defmodule VoelgoedAi.Application do
 
     children = [
       VoelgoedAi.Repo,
+      {Oban, Application.fetch_env!(:voelgoed_ai, Oban)},
       VoelgoedAi.Accounts.EntraPendingStates,
       VoelgoedAiWeb.Endpoint
     ]

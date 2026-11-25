@@ -144,7 +144,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [fresh, upgrade]
+        lane: [fresh, upgrade, vgas001-upgrade]
     services:
       postgres:
         image: pgvector/pgvector:0.8.4-pg18
@@ -191,8 +191,26 @@ jobs:
           git show "aa93104fd476d208206288658e67bfe70e0780cd:priv/repo/migrations/$foundation" > "$base_migrations/$foundation"
           cmp "$base_migrations/$foundation" "priv/repo/migrations/$foundation"
           mix ecto.migrate --migrations-path "$base_migrations" --strict-version-order
+      - name: Install merged VGAS-001 and record synthetic staff history
+        if: matrix.lane == 'vgas001-upgrade'
+        shell: bash
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          base_migrations=$(mktemp -d)
+          trap 'rm -rf "$base_migrations"' EXIT
+          predecessor=92ef0e39a7808d4ffa692b37b48ba3ee27a05e30
+          for name in 20261125141215_foundation_extensions_1.exs 20261125205628_add_staff_authorization.exs; do
+            git show "$predecessor:priv/repo/migrations/$name" > "$base_migrations/$name"
+            cmp "$base_migrations/$name" "priv/repo/migrations/$name"
+          done
+          mix ecto.migrate --migrations-path "$base_migrations" --strict-version-order
+          docker exec -i "$POSTGRES_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U vgas_test -d vgas_test \
+            < .github/scripts/vgas001_upgrade_fixture.sql
       - name: Apply and verify candidate migrations
         shell: bash
+        env:
+          VGAS_VERIFY_VGAS001_UPGRADE: ${{ matrix.lane == 'vgas001-upgrade' }}
         run: |
           mix ecto.migrate --strict-version-order
           migrations=$(mix ecto.migrations)

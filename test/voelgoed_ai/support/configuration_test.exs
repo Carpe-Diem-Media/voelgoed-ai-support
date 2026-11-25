@@ -41,7 +41,10 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
                    display_name: "Forged",
                    audience: :public,
                    disabled_at: DateTime.utc_now()
-                 }, action: :create_row, actor: %Storage{ref: make_ref()})
+                 },
+                 action: :create_row,
+                 actor: %Storage{ref: make_ref()}
+               )
              end)
 
     assert {:ok, _} = Accounts.set_roles(admin, admin.id, [])
