@@ -83,6 +83,27 @@ defmodule VoelgoedAi.StaffFixtures do
     Process.delete({VoelgoedAi.Accounts.StaffLifecycle, :reject_audit})
   end
 
+  @doc "Fill the pending OIDC state store to its cap for the duration of `operation`."
+  def with_full_pending_states(operation) do
+    store = VoelgoedAi.Accounts.EntraPendingStates
+    original = :sys.get_state(store)
+
+    try do
+      :sys.replace_state(store, fn states ->
+        expiry = System.monotonic_time(:millisecond) + 600_000
+        missing = store.max_pending() - map_size(states)
+
+        Enum.reduce(1..missing//1, states, fn _, states ->
+          Map.put(states, :crypto.strong_rand_bytes(32), expiry)
+        end)
+      end)
+
+      operation.()
+    after
+      :sys.replace_state(store, fn _ -> original end)
+    end
+  end
+
   def resolve(id) do
     {:ok, row} =
       StaffUser

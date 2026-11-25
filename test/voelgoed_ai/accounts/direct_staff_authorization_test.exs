@@ -52,25 +52,41 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
             nil,
             session,
             Map.from_struct(session),
-            %Scope{action: wrong_action, target: context.target.id}
+            %Scope{action: wrong_action, target: context.target.id},
+            %Scope{action: action, target: Ash.UUIDv7.generate()}
           ] do
         assert {:ok, :denied} =
                  Repo.transact(fn ->
-                   assert {:error, %Ash.Error.Forbidden{errors: errors}} =
-                            direct_call(
-                              unquote(resource),
-                              unquote(type),
-                              action,
-                              args,
-                              actor,
-                              context.target
-                            )
+                   result =
+                     direct_call(
+                       unquote(resource),
+                       unquote(type),
+                       action,
+                       args,
+                       actor,
+                       context.target
+                     )
 
-                   assert Enum.any?(errors, &match?(%Ash.Error.Forbidden.Policy{}, &1))
+                   assert_denied(action, actor, result)
                    {:ok, :denied}
                  end)
       end
     end
+  end
+
+  # The Entra preparation rechecks the registration binding before the policy
+  # runs, so a wrong binding fails there as an invalid identity.
+  defp assert_denied(
+         :sign_in_with_entra,
+         %Scope{action: :sign_in_with_entra},
+         {:error, %Ash.Error.Invalid{errors: errors}}
+       ) do
+    assert [%Ash.Error.Query.InvalidArgument{field: :user_info}] = errors
+  end
+
+  defp assert_denied(_action, _actor, result) do
+    assert {:error, %Ash.Error.Forbidden{errors: errors}} = result
+    assert Enum.any?(errors, &match?(%Ash.Error.Forbidden.Policy{}, &1))
   end
 
   defp direct_call(resource, :create, action, args, actor, _),

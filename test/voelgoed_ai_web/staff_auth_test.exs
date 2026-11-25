@@ -185,6 +185,17 @@ defmodule VoelgoedAiWeb.StaffAuthTest do
     assert :atomics.get(flow.exchange_count, 1) == 1
   end
 
+  test "a full pending state store denies new sign-ins without a redirect", context do
+    assert {:ok, _} = Accounts.bootstrap(context.admin, [:admin])
+    StaffEntraFixture.stub_discovery(StaffEntraFixture.metadata())
+
+    denied = StaffFixtures.with_full_pending_states(fn -> request(:get, "/staff/entra") end)
+
+    assert_denied(denied)
+    assert get_resp_header(denied, "location") == []
+    assert StaffEntraFixture.sign_in(context, context.admin.subject).status == 204
+  end
+
   test "audit validation failure clears the pending cookie without activating staff", context do
     admin = StaffFixtures.bootstrap_admin(context.admin)
     assert {:ok, %{id: id}} = Accounts.provision(admin, context.invited, [:support_operator])

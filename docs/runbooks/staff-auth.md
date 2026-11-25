@@ -67,7 +67,12 @@ grants its own permission, including when someone holds ADMIN.
   bumps its generation by disabling the account or changing its roles.
 - A callback consumes its pending OIDC state before exchange. Pending sign-ins
   are local to the single application instance and expire after 600 seconds.
-  If that instance restarts, start sign-in again.
+  If that instance restarts, start sign-in again. The instance holds at most
+  10,000 pending sign-ins. At that cap new sign-ins get the generic denial until
+  callbacks or expiry free space. Route rate limiting is a VGAS-9 gate.
+- `Governance.staff_security_history/2` returns the first 100 events for one
+  staff ID, oldest first, without saying whether more exist. Use it for
+  recent-account review only, not as a complete audit export.
 - Staff management checks the administrator's current role, state, expiry,
   registration and generation under lock. A real role change, disable,
   reactivation or retirement increments the target's generation. Subsequent

@@ -4,12 +4,16 @@ defmodule VoelgoedAi.Accounts.EntraPendingStates do
 
   A restart discards pending sign-ins. The encrypted browser cookie still holds
   the nonce and PKCE verifier, and cannot restore a spent state.
+
+  Unauthenticated requests create entries, so the map is capped. At the cap a
+  new sign-in fails closed until consumption or the sweep frees space.
   """
 
   use GenServer
 
   @ttl_ms 600_000
   @sweep_ms 60_000
+  @max_pending 10_000
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
 
@@ -23,6 +27,10 @@ defmodule VoelgoedAi.Accounts.EntraPendingStates do
   end
 
   @impl true
+  def handle_call({:remember, _key}, _from, states) when map_size(states) >= @max_pending do
+    {:reply, {:error, :pending_limit}, states}
+  end
+
   def handle_call({:remember, key}, _from, states) do
     {:reply, :ok, Map.put_new(states, key, now() + @ttl_ms)}
   end
@@ -38,6 +46,9 @@ defmodule VoelgoedAi.Accounts.EntraPendingStates do
     schedule_sweep()
     {:noreply, Map.reject(states, fn {_key, expiry} -> expiry <= now end)}
   end
+
+  @doc false
+  def max_pending, do: @max_pending
 
   defp digest(state), do: :crypto.hash(:sha256, state)
   defp now, do: System.monotonic_time(:millisecond)

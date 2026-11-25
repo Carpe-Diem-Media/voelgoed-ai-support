@@ -32,10 +32,16 @@ defmodule VoelgoedAi.Accounts.EntraHTTPAdapterTest do
           conn = send_chunked(conn, 200)
           piece = String.duplicate(" ", 8_192)
 
-          Enum.reduce_while(List.duplicate(piece, 16) ++ [body], conn, fn data, conn ->
+          # 32 MiB exceeds loopback socket buffering, so a chunk write fails
+          # only if the client closes the stream early.
+          Enum.reduce_while(List.duplicate(piece, 4_096) ++ [body], conn, fn data, conn ->
             case chunk(conn, data) do
-              {:ok, conn} -> {:cont, conn}
-              {:error, _} -> {:halt, conn}
+              {:ok, conn} ->
+                {:cont, conn}
+
+              {:error, _} ->
+                send(owner, {:provider_stream, :closed_by_client})
+                {:halt, conn}
             end
           end)
 
@@ -83,6 +89,11 @@ defmodule VoelgoedAi.Accounts.EntraHTTPAdapterTest do
       assert_received {:provider_request, path} when path == context.path
       refute_received {:provider_request, _}
     end
+  end
+
+  test "real HTTP stops reading an oversized body at the cap", context do
+    assert fetch(context, :oversized) == {:error, :provider_response_denied}
+    assert_receive {:provider_stream, :closed_by_client}, 5_000
   end
 
   defp fetch(context, scenario) do
