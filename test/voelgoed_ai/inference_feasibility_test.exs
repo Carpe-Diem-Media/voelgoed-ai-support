@@ -46,13 +46,21 @@ defmodule VoelgoedAi.InferenceFeasibilityTest do
   test "embedding timeout holds the reservation and the same attempt cannot send again", %{
     budget: budget
   } do
+    owner = self()
+
+    # Inference rescues anything raised inside the transport as an ambiguous
+    # outcome, which this test also expects. Assert on the captured request
+    # here instead, so a failed assertion cannot be swallowed.
     assert {:error, :unknown} =
              Inference.run(budget, 1, @day, :embedding, @input, fn request ->
-               assert request.model == "openai:text-embedding-3-small"
-               assert request.options[:dimensions] == 1536
-               assert Reservations.fetch(budget, 1).status == :reserved
+               send(owner, {:sent, request, Reservations.fetch(budget, 1).status})
                {:error, :timeout}
              end)
+
+    assert_received {:sent, request, :reserved}
+    assert request.model == "openai:text-embedding-3-small"
+    assert request.options[:dimensions] == 1536
+    assert request.options[:req_http_options][:max_retries] == 0
 
     assert %{status: :unknown, ceiling: ceiling} = Reservations.fetch(budget, 1)
     assert ceiling > 0

@@ -525,6 +525,66 @@ reply/handoff transport. VGAS-4 awaits exact-source and staff-fixture
 review. The temporary G036 exception remains feasibility-only. No
 public push, merge, deployment or paid provider call occurred.
 
+## Post-merge independent review of VGAS-3 and VGAS-4
+
+PR #2 merged at `324cb105d749de50b31f3ea007cabd931a915ff0` before
+its exact-head Application CI finished and without a recorded review.
+Independent reviewers then inspected head `1f7150d` against base
+`8456cd4`. This section supersedes the earlier retry statements in
+the F02–F03 sections and preserves them as history.
+
+### Correction · ReqLLM embedding retries
+
+The earlier claim that Req's `retry: false` disables embedding retries
+was wrong. ReqLLM 1.31.0 attaches its own retry step after merging the
+Req options and replaces `retry` with its policy
+(`deps/req_llm/lib/req_llm/step/retry.ex`). That policy decides
+whether a failure is retryable; `max_retries`, which defaults to 3,
+controls the attempt limit. An offline probe with a counting adapter,
+`retry: false` and a 20-second total timeout entered the adapter four
+times for both a synthetic 503 and a synthetic timeout. With `max_retries: 0` in
+`req_http_options` it entered once.
+
+The merged durable path was also exposed. `TransportEvidence` calls
+`Req.merge(plug: ...)`, which sets the returned request's adapter to
+`Req.Plug`, so each retry bypassed the wrapper and its durable claim
+and went straight to the provider. Under the uncorrected options the
+independent review of PR #3 observed one wrapper entry and up to four
+fake-provider calls. A synthetic timeout gave four calls with either a
+5-second or a 20-second total timeout. A plain 503 gave three calls
+within the 5-second deadline the regression test uses and four within
+20 seconds, because retry backoff consumes the deadline. Four is the
+maximum: the first attempt plus three retries. An earlier draft of
+this correction wrongly called the durable path incidentally safe.
+
+The correction adds `max_retries: 0` to both transport option sets.
+Three tests now cover it: a bare-adapter counter, a fake-provider hit
+counter on the durable path, and an assertion on the embedding
+options captured outside the transport callback (an assertion inside
+the callback is rescued as an ambiguous outcome and cannot fail the
+test). With `max_retries: 0` removed from both support modules, all
+three failed; with it restored, the 21 focused tests pass.
+
+### Review outcomes
+
+- **VGAS-3 (F02–F03).** The source supports typed native Ash AI output,
+  the bounded wire request, durable admission, ambiguous-cost retention
+  and the conservative ceilings. The retry finding above was the only
+  blocker. Carried into VGAS-004, not feasibility blockers: let late
+  trusted usage settle a row that already holds timeout evidence, by
+  appending separately keyed reconciliation evidence; fence recovery of
+  a `dispatching` row against the still-running ReqLLM request task;
+  assert real lock waits in the admission race tests.
+- **VGAS-4 (F04–F05).** Accepted with follow-ups for local mechanics.
+  Ordinary CI skips the five pgvector tests because they require the
+  disposable 18.7 / 0.8.7 target. The orchestrator reran them on the
+  approved image at `324cb10`: 49 passed, run-owned resources removed.
+  Staff-labelled retrieval outcomes remain an external VGAS-11 gate.
+  Carried into VGAS-003: recheck validity at worker completion, keep
+  unknown embedding outcomes out of plain requeue, assert the scope
+  field and canonical hash on the wire, and test revocation between
+  ranking and projection.
+
 ## F06 | VGAS-5 signed Chatwoot ingress and fixed delivery
 
 Evidence from `feat/vgas-5-f06-chatwoot-ingress`, based on
