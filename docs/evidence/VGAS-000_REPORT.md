@@ -527,22 +527,33 @@ public push, merge, deployment or paid provider call occurred.
 
 ## F08 · Entra and staff authorisation (VGAS-6)
 
-**PARTIAL.** The local fixture passed its OIDC, PostgreSQL authorisation,
-session denial and audit tests. The clean TEST compile gate is blocked.
+**PASS for local F08 (VGAS-6).** The OIDC fixture, PostgreSQL
+authorisation, session denial, audit and clean build checks passed.
 VGAS-9 owns proof against an authorised live Entra test registration.
+The feasibility brief classifies F08 as **PARTIAL** while that live
+proof is pending.
 
 The 2026-11-25 run used branch `feat/vgas-6-f08-entra-authz` at base
-`324cb105d749de50b31f3ea007cabd931a915ff0`. The tested code and config
-diff against that base has SHA-256
-`c47eb753f34951bcd9d98c1112f2fb4e74836c0532a45f876b9d3f99f5b37bb6`.
+`324cb105d749de50b31f3ea007cabd931a915ff0`. The diff for
+`config`, `lib`, `test` and `mix.exs` against that base has SHA-256
+`fe0ae4b9cbb3b30467253b3fabbab2dbc7a42dd4e6996e312ca6800f207d0adf`.
 The lockfile SHA-256 is
-`d95546bb5684fdb06ba495e5f9b55b294113a8b96132ab8da64a834e8be935ec`.
+`97e956eb45a003ebae63bdbe513d6ecabd187e9fd5a40f68114c732896c71867`.
 Mise pinned Elixir 1.20.5 and Erlang 29.1.2. The fixture used Ash 3.38.1,
 AshPostgres 2.15.2, AshAuthentication 5.0.0-rc.18,
 AshAuthenticationPhoenix 3.0.0-rc.12 and Assent 0.3.2 against DevCore TEST
 PostgreSQL 18.6. Every test ran without `OPENAI_API_KEY`. The fixtures
 generated RSA keys in memory and routed all provider requests through
 private Req.Test stubs.
+
+Ash 3.38.1 checks for a SAT solver when it compiles a policy authorizer.
+Crux 0.1.5 selects `Picosat` at compile time when available, then falls
+back to `SimpleSat`. The application pins `simple_sat` 0.1.4 in all
+environments so policy checks can use the solver at compile time and
+runtime. This release uses pure Elixir, has no Hex dependencies and
+satisfies the optional solver requirement in both Ash and Crux. Only
+the solver entry changed in the lockfile.
+[Hex release metadata](https://hex.pm/api/packages/simple_sat/releases/0.1.4).
 
 ### Expected and observed
 
@@ -599,26 +610,18 @@ pairwise subjects. The relevant pinned implementation is
 
 ### Verification and remaining gates
 
-Local verification completed at approximately 17:55 UTC.
-
 - `mise exec -- mix format --check-formatted`,
   `mise exec -- mix deps.get --check-locked` and `mise exec -- mix hex.audit`
   each exited 0. Hex reported no retired or advisory packages.
-- A clean `MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
-  exited 1. Ash 3.38.1 runs
-  `Ash.Policy.Authorizer.Verifiers.VerifySatSolverImplementation` on both
-  fixture resources. Crux 0.1.5 raises `No SAT solver available` because
-  neither supported optional solver is locked. These strict policy checks
-  evaluated to booleans in the exercised paths, so ordinary ExUnit ran.
-  The dependency scope requires an owner decision before pinning an
-  audited solver and rerunning the clean compile and suite.
-- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+- The clean TEST build reproduced `No SAT solver available` and exited
+  1 before the solver pin. After adding the pin,
+  `rm -rf _build/test && MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  and the DEV `mise exec -- mix compile --warnings-as-errors` each
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --no-color test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
   exited 0 for seeds `0`, `17` and `2026`, with 13 passed each and no skips.
-  The ExUnit timings were 1.2s, 1.2s and 1.1s.
-- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
-  exited 0 with 57 passed and five existing F04 disposable tests skipped
-  in 4.5s. A follow-up `pg_namespace` query in the TEST Repo returned zero
-  `vgas_f08_` schemas.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --no-color`
+  exited 0 with 57 passed and five existing F04 disposable tests skipped.
 - `python3 .github/scripts/plan_tests.py` exited 0 and included F08.
   `git diff --check`, `git diff --cached --check` and
   `mise exec gitleaks@8.30.1 -- gitleaks git --staged --redact` exited 0.

@@ -31,6 +31,8 @@ defmodule VoelgoedAi.MixProject do
     [
       # 01 — Ash domain and persistence foundation
       {:ash, "~> 3.38.1"},
+      # Ash policy authorizers require a SAT solver at compile time and runtime.
+      {:simple_sat, "== 0.1.4"},
       {:ash_postgres, "~> 2.15.2"},
       {:ash_phoenix, "~> 2.3.26"},
       {:ash_state_machine, "~> 0.3.1"},
