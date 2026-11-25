@@ -294,6 +294,20 @@ defmodule VoelgoedAi.Support.Configuration do
 
   def current_revision(_), do: {:error, :stale_policy}
 
+  @doc false
+  def render_fixed_reply(assistant, run, delivery) do
+    with {:ok, revision} <- current_revision(assistant),
+         true <- revision.id == run.assistant_revision_id,
+         :fixed_reply <- revision.response_policy,
+         true <- revision.template_version == delivery.template_version,
+         true <- revision.config_hash == delivery.template_hash,
+         %{fixed_text: text} <- fixture() do
+      {:ok, text}
+    else
+      _ -> {:error, :stale_policy}
+    end
+  end
+
   defp rebind_target(:rebind, %{assistant_id: id}), do: [id]
   defp rebind_target(_action, _args), do: []
 

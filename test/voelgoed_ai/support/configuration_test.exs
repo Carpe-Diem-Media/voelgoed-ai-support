@@ -263,6 +263,16 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
                revision_scope.(pending.id)
              )
 
+    assert {:ok, _} = publish(admin, pending, revision.id)
+
+    assert {:error, _} =
+             invoke(
+               AssistantRevision,
+               :read_configuration,
+               %{id: revision.id},
+               revision_scope.(revision.id)
+             )
+
     assert {:error, _} =
              invoke(InboxBinding, :rebind, Map.put(args, :assistant_id, assistant.id), admin)
 

@@ -43,4 +43,4 @@ if config_env() != :prod do
 end
 
 # F07 must verify the deployed contract before installing a network adapter.
-config :voelgoed_ai, :chatwoot_adapter, :disabled
+config :voelgoed_ai, :chatwoot_adapter, if(config_env() == :test, do: :fixture, else: :disabled)

@@ -139,6 +139,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
     attribute(:lease_expires_at, :utc_datetime_usec, public?: true, allow_nil?: true)
     attribute(:dispatch_authorized_at, :utc_datetime_usec, public?: true, allow_nil?: true)
     attribute(:confirmed_at, :utc_datetime_usec, public?: true, allow_nil?: true)
+    attribute(:recovery_deadline_at, :utc_datetime_usec, public?: true, allow_nil?: true)
     attribute(:last_read_at, :utc_datetime_usec, public?: true, allow_nil?: true)
 
     attribute(:state, :atom,
@@ -268,6 +269,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -288,6 +290,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -308,6 +311,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -328,6 +332,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -348,6 +353,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -368,6 +374,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -388,6 +395,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -408,6 +416,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -428,6 +437,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])
@@ -448,6 +458,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :dispatch_authorized_at,
         :confirmed_at,
         :last_read_at,
+        :recovery_deadline_at,
         :reason_code,
         :uncertainty_reason
       ])

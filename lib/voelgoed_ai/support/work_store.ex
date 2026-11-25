@@ -26,6 +26,7 @@ defmodule VoelgoedAi.Support.WorkStore do
         |> Ash.Query.filter_input(filter)
 
       query = if opts[:lock], do: Ash.Query.lock(query, :for_update), else: query
+      query = if opts[:sort], do: Ash.Query.sort(query, opts[:sort]), else: query
       query = if opts[:limit], do: Ash.Query.limit(query, opts[:limit]), else: query
 
       if opts[:many], do: Ash.read(query), else: Ash.read_one(query)

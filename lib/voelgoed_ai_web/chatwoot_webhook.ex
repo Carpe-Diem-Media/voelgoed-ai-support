@@ -7,6 +7,7 @@ defmodule VoelgoedAiWeb.ChatwootWebhook do
   import Plug.Conn
 
   alias Jason.OrderedObject
+  alias VoelgoedAi.Support.{ChatwootAdapter, Ingress}
 
   @max_bytes 65_536
   @max_id 9_223_372_036_854_775_807
@@ -14,9 +15,22 @@ defmodule VoelgoedAiWeb.ChatwootWebhook do
 
   def init(opts), do: opts
 
-  # B2 mounts intake when it can atomically enqueue the processing worker.
-  def call(%{method: "POST", path_info: ["webhooks", "chatwoot", _]} = conn, _opts) do
-    conn |> send_resp(404, "") |> halt()
+  def call(%{method: "POST", path_info: ["webhooks", "chatwoot", installation]} = conn, _opts) do
+    status =
+      with %{installation_ref: ^installation, signing_key: key, adapter: {_, _}} = fixture <-
+             ChatwootAdapter.fixture(),
+           {:ok, event, conn} <- authenticate(conn, fixture, key, ChatwootAdapter.now()),
+           {:ok, _id} <- Ingress.accept(event) do
+        {conn, 204}
+      else
+        {:reject, status} -> {conn, status}
+        {:error, :scope_denied} -> {conn, 403}
+        {:error, _} -> {conn, 500}
+        _ -> {conn, 404}
+      end
+
+    {conn, code} = status
+    conn |> send_resp(code, "") |> halt()
   end
 
   def call(conn, _opts), do: conn

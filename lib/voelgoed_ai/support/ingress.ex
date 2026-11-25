@@ -5,7 +5,15 @@ defmodule VoelgoedAi.Support.Ingress do
   """
 
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, InboundEvent, WorkStore}
+
+  alias VoelgoedAi.Support.{
+    ChatwootAdapter,
+    Configuration,
+    InboundEvent,
+    Ownership,
+    SupportRun,
+    WorkStore
+  }
 
   @inbox [:installation_ref, :external_account_id, :external_inbox_id]
   @identity [:installation_ref, :external_account_id, :event_type, :message_id]
@@ -59,8 +67,9 @@ defmodule VoelgoedAi.Support.Ingress do
   defp register(event, config) do
     attrs = Map.put(event, :correlation_id, Ash.UUIDv7.generate())
 
-    with {:ok, event} <- WorkStore.create(InboundEvent, :register, attrs),
-         {:ok, event} <- finish_receipt(event, config) do
+    with {:ok, context} <- signed_human_inhibit(event, config),
+         {:ok, event} <- WorkStore.create(InboundEvent, :register, attrs),
+         {:ok, event} <- finish_receipt(event, context) do
       {:ok, event.id}
     end
   end
@@ -79,7 +88,51 @@ defmodule VoelgoedAi.Support.Ingress do
     })
   end
 
-  defp finish_receipt(event, _config) do
+  defp finish_receipt(event, session) do
+    attrs = if session, do: %{session_id: session.id}, else: %{}
+
+    with {:ok, receipts} <-
+           WorkStore.read(
+             InboundEvent,
+             :pending,
+             %{},
+             %{state: :dispatched, disposition: :pending}, many: true, limit: 100),
+         {:ok, runs} <-
+           WorkStore.read(
+             SupportRun,
+             :active,
+             %{},
+             %{state: %{in: [:queued, :running, :retry_wait]}}, many: true, limit: 100) do
+      if length(receipts) + length(runs) >= 100 do
+        WorkStore.update(
+          event,
+          :quarantine,
+          Map.merge(attrs, %{
+            state: :quarantined,
+            disposition: :triage,
+            reason_code: :admission_limited,
+            processed_at: ChatwootAdapter.now()
+          })
+        )
+      else
+        dispatch(event, attrs)
+      end
+    end
+  end
+
+  defp signed_human_inhibit(%{kind: :human_outbound} = event, config) do
+    with {:ok, session} <- Ownership.ensure_session(config, event),
+         true <- session.contact_id == event.contact_id do
+      Ownership.human_takeover(session, %{}, ChatwootAdapter.now())
+    else
+      false -> {:error, :scope_denied}
+      error -> error
+    end
+  end
+
+  defp signed_human_inhibit(_, _), do: {:ok, nil}
+
+  defp dispatch(event, attrs) do
     job =
       Oban.Job.new(%{"event_id" => event.id},
         worker: VoelgoedAi.Support.Workers.ProcessEvent,
@@ -87,7 +140,7 @@ defmodule VoelgoedAi.Support.Ingress do
         max_attempts: 1
       )
 
-    with {:ok, event} <- WorkStore.update(event, :dispatch, %{state: :dispatched}),
+    with {:ok, event} <- WorkStore.update(event, :dispatch, Map.put(attrs, :state, :dispatched)),
          {:ok, _job} <- Oban.insert(job) do
       {:ok, event}
     end

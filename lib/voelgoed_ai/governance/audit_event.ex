@@ -38,7 +38,9 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     :disable_automation
   ]
   @target_kinds [:assistant, :assistant_revision, :inbox_binding, :automation_control]
+  @support_events [:request_handoff, :return_to_bot, :close_session, :abandon_delivery]
   @operational_fields [
+    ownership_epoch: [type: :integer, constraints: [min: 0]],
     status: [
       type: :atom,
       allow_nil?: false,
@@ -51,7 +53,14 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           :draft,
           :published,
           :superseded,
-          :discarded
+          :discarded,
+          :unverified,
+          :bot_active,
+          :handoff_pending,
+          :human_active,
+          :closed,
+          :unknown,
+          :abandoned
         ]
       ]
     ],
@@ -101,6 +110,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       reference(:revision_target, on_delete: :restrict, on_update: :restrict)
       reference(:binding_target, on_delete: :restrict, on_update: :restrict)
       reference(:control_target, on_delete: :restrict, on_update: :restrict)
+      reference(:session_target, on_delete: :restrict, on_update: :restrict)
+      reference(:delivery_target, on_delete: :restrict, on_update: :restrict)
     end
 
     check_constraints do
@@ -113,7 +124,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
 
       check_constraint(:target_kind, "audit_events_exact_target",
         check: """
-          num_nonnulls(target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id) = 1
+          num_nonnulls(target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id, session_target_id, delivery_target_id) = 1
           AND (
             (target_kind = 'staff_user' AND target_id IS NOT NULL
               AND event IN ('provisioned','activated','signed_in','roles_changed','disabled','reactivated','retired')
@@ -126,6 +137,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
               AND event IN ('create_draft','enable','disable','rebind','change_mode','retire'))
             OR (target_kind = 'automation_control' AND control_target_id IS NOT NULL
               AND event IN ('enable_automation','disable_automation'))
+            OR (target_kind = 'support_session' AND session_target_id IS NOT NULL
+              AND event IN ('request_handoff','return_to_bot','close_session'))
+            OR (target_kind = 'outbound_delivery' AND delivery_target_id IS NOT NULL
+              AND event = 'abandon_delivery')
           )
         """
       )
@@ -134,8 +149,9 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         check: """
           (target_kind = 'staff_user' AND after_state IS NOT NULL
             AND operational_before IS NULL AND operational_after IS NULL)
-          OR (target_kind <> 'staff_user' AND actor_kind = 'staff' AND reason_code = 'local_admin'
-            AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL)
+          OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL
+            AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')
+              OR (target_kind NOT IN ('staff_user', 'support_session', 'outbound_delivery') AND reason_code = 'local_admin')))
         """
       )
     end
@@ -149,17 +165,25 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     attribute(:target_kind, :atom,
       allow_nil?: false,
       default: :staff_user,
-      constraints: [one_of: [:staff_user | @target_kinds]]
+      constraints: [one_of: [:staff_user, :support_session, :outbound_delivery | @target_kinds]]
     )
 
     attribute(:event, :atom,
       allow_nil?: false,
-      constraints: [one_of: @staff_events ++ @operational_events]
+      constraints: [one_of: @staff_events ++ @operational_events ++ @support_events]
     )
 
     attribute(:reason_code, :atom,
       allow_nil?: false,
-      constraints: [one_of: [:allowlisted, :verified_oidc, :local_admin, :approved_reprovision]]
+      constraints: [
+        one_of: [
+          :allowlisted,
+          :verified_oidc,
+          :local_admin,
+          :approved_reprovision,
+          :local_operator
+        ]
+      ]
     )
 
     attribute(:before_state, :map, constraints: [fields: @state_fields])
@@ -177,6 +201,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     belongs_to(:revision_target, VoelgoedAi.Intelligence.AssistantRevision)
     belongs_to(:binding_target, VoelgoedAi.Support.InboxBinding)
     belongs_to(:control_target, VoelgoedAi.Governance.AutomationControl)
+    belongs_to(:session_target, VoelgoedAi.Support.SupportSession)
+    belongs_to(:delivery_target, VoelgoedAi.Support.OutboundDelivery)
     belongs_to(:actor_staff, StaffUser)
   end
 
@@ -223,6 +249,27 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       validate(attribute_in(:event, @operational_events))
     end
 
+    create :append_support_operator do
+      transaction?(false)
+
+      accept([
+        :actor_kind,
+        :actor_staff_id,
+        :target_kind,
+        :session_target_id,
+        :delivery_target_id,
+        :event,
+        :reason_code,
+        :operational_before,
+        :operational_after,
+        :correlation_id
+      ])
+
+      validate(present([:actor_staff_id, :operational_before, :operational_after]))
+      validate(attribute_in(:event, @support_events))
+      validate(attribute_equals(:reason_code, :local_operator))
+    end
+
     action :operational_history, {:array, :map} do
       argument(:target_kind, :atom, allow_nil?: false, constraints: [one_of: @target_kinds])
       argument(:id, :uuid, allow_nil?: false)
@@ -252,6 +299,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   end
 
   policies do
+    policy action(:append_support_operator) do
+      authorize_if(VoelgoedAi.Support.WorkStore)
+    end
+
     policy action([:append_operational, :operational_rows]) do
       authorize_if(ActionScope.Storage)
     end

@@ -45,21 +45,112 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
           }
   end
 
+  defmodule History do
+    @moduledoc "A bounded public-message projection qualified to one conversation."
+    @enforce_keys [:destination, :messages]
+    defstruct @enforce_keys
+    @type t :: %__MODULE__{destination: Destination.t(), messages: [Message.t()]}
+  end
+
+  @doc false
+  def in_scope?(row) do
+    keys = [:installation_ref, :external_account_id, :external_inbox_id]
+
+    case fixture() do
+      %{} = configured -> Map.take(configured, keys) == Map.take(row, keys)
+      _ -> false
+    end
+  end
+
   @type read_failure :: :scope_denied | :unavailable | :deadline | :rate_limited
   @type write_failure :: {:not_issued, :scope_denied | :unavailable | :deadline} | :uncertain
 
   @callback conversation(term(), Destination.t(), pos_integer()) ::
               {:ok, Observation.t()} | {:error, read_failure()}
   @callback history(term(), Destination.t(), pos_integer(), pos_integer()) ::
-              {:ok, [Message.t()]} | {:error, read_failure()}
+              {:ok, History.t()} | {:error, read_failure()}
   @callback reply(term(), Destination.t(), String.t(), String.t(), pos_integer()) ::
               {:ok, Destination.t(), pos_integer()} | {:error, write_failure()}
   @callback open_for_handoff(term(), Destination.t(), String.t(), pos_integer()) ::
               :ok | {:error, write_failure()}
 
   @doc false
+  def now do
+    case fixture() do
+      %{clock: clock} -> clock.()
+      _ -> DateTime.utc_now()
+    end
+  end
+
+  @doc false
+  def destination(row) do
+    %Destination{
+      installation: row.installation_ref,
+      account: row.external_account_id,
+      inbox: row.external_inbox_id,
+      conversation: row.conversation_id
+    }
+  end
+
+  @doc false
+  def call(operation, destination, args, deadline) do
+    budget = min(500, DateTime.diff(deadline, now(), :millisecond))
+
+    with true <- budget > 0 and not VoelgoedAi.Repo.in_transaction?(),
+         %{adapter: {module, context}} <- fixture() do
+      apply(module, operation, [context, destination] ++ args ++ [budget])
+    else
+      _ -> {:error, :unavailable}
+    end
+  end
+
+  @doc false
+  def observe(session, deadline) do
+    destination = destination(session)
+
+    case call(:conversation, destination, [], deadline) do
+      {:ok, %Observation{destination: ^destination, contact: contact} = observation}
+      when contact == session.contact_id ->
+        {:ok, observation}
+
+      {:error, _} = error ->
+        error
+
+      _ ->
+        {:error, :scope_denied}
+    end
+  end
+
+  @doc false
+  def history(session, deadline) do
+    limit = fixture()[:history_limit]
+
+    if is_integer(limit) and limit > 0 do
+      destination = destination(session)
+
+      case call(:history, destination, [limit], deadline) do
+        {:ok, %History{destination: ^destination, messages: messages}}
+        when is_list(messages) and length(messages) <= limit ->
+          {:ok, messages}
+
+        {:error, _} = error ->
+          error
+
+        _ ->
+          {:error, :scope_denied}
+      end
+    else
+      {:error, :unavailable}
+    end
+  end
+
+  @doc false
   if Mix.env() == :test do
-    def fixture, do: Application.get_env(:voelgoed_ai, :support_fixture)
+    def fixture do
+      if Application.get_env(:voelgoed_ai, :chatwoot_adapter, :disabled) == :fixture do
+        Application.get_env(:voelgoed_ai, :support_fixture)
+      end
+    end
   else
     def fixture, do: nil
   end
