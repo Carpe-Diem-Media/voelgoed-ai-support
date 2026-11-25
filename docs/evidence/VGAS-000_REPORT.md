@@ -378,3 +378,149 @@ Pricing and limits: [Luna model](https://developers.openai.com/api/docs/models/g
   disposable approval covered F01 and the shared rollout remains separate.
   Actual OpenAI model listing and provider tests remain pending. No paid
   calls, public push, merge or deployment occurred.
+
+## VGAS-4 isolated F04–F05 run
+
+2026-11-25. The reviewer provisionally accepted local F02–F03 at
+`9a58c53`. Exact-source review and provider verification remain pending.
+The uncommitted AGENTS.md edit was inspected and left outside this change.
+Its delegation requirement informed a bounded planning pass. The edit
+itself was neither committed nor treated as a change to the frozen
+business requirements.
+
+### Generation cost-bound follow-up
+
+Retained the 525,375,000 nano-USD Luna reservation and the existing 32 KiB
+serialized request check at the Req adapter. The byte check limits the
+wire request before dispatch but does not certify provider-counted
+tokens. The proposed 8,000 input and 500 output token caps would cost
+1,050,000 nano-USD at uncached Standard short-context base rates.
+That excludes cache-write premiums. OpenAI publishes short-context
+input/output rates of $0.10/$0.50 per million, 30-minute and 12-hour
+write rates of $0.125/$0.25 per million, and a long-context threshold
+above 272,000 input tokens. Above it, input and cache prices double
+and output rises by 1.5 times. Regional processing adds 10% where
+applicable and Fast doubles the applicable rates. This spike retains
+the conservative global Standard ceiling and the existing daily budget.
+
+The OpenAI Responses input-token endpoint accepts messages, instructions
+and the response schema, but the local fixture cannot prove equivalence
+to the billed token count for the final provider request. The pinned
+Ash AI and ReqLLM paths provide the final encoded body, not an
+independently verified provider token count. An exact-request comparison
+against the provider counting endpoint and metered usage would require
+a separately authorized provider check. No estimate replaced the existing
+reservation or wire guard, and no provider count or inference call was
+made in this slice.
+
+Sources: [Luna model and tier rules](https://developers.openai.com/api/docs/models/gpt-6-luna),
+[OpenAI prompt cache and pricing](https://developers.openai.com/api/docs/pricing),
+[Responses input token count](https://developers.openai.com/api/reference/resources/responses/subresources/input_tokens/methods/count).
+
+### F04 · Local PASS
+
+The test harness used application-controlled draft, review, approval,
+queued indexing, indexing completion and publication transitions.
+Approved content is frozen against its review hash. The explicit
+background task claims one revision/locale/profile/hash/generation
+record and runs after the database transaction commits. G027 admission
+and the one-send transport claim precede each fake embedding invocation.
+Approval, indexing readiness and reviewer publication are distinct
+gates. A failed replacement leaves the old publication eligible. Two
+separate PostgreSQL connections raced to publish with the same expected
+pointer. One succeeded and the other returned `stale_pointer`.
+
+The corpus ran 28 synthetic bilingual revisions and 56 locale embedding
+jobs. The fake checked the canonical locale, content and scope payload,
+1536 dimensions and committed reservation, and returned correlated
+usage. Other tests covered draft edits, wrong actor and profile,
+immutable content, stale hash/generation, revoked in-flight work,
+wrong dimension, nonfinite input including PostgreSQL rejection of
+`[NaN]`, expiry before dispatch, missing reservation storage, and
+activation denial before both locales were ready.
+
+Pinned Ash AI 1.5.6's `AshAi.EmbeddingModels.ReqLLM.generate/2` runs
+the one-input native embedding path. The generic automatic/manual
+vectorization change lacks the scenario's revision-state, reservation,
+and generation fences. The fixture therefore wraps the native embedding
+module with an explicit job and a guarded vector write through the
+existing AshPostgres Repo. The queued rows and Task workers prove local
+ordering. Durable Oban execution, recovery scheduling, and production
+Ash authorization remain later work. No production resources or
+migrations were added.
+
+### F05 · Local PASS for retrieval mechanics
+
+A PostgreSQL eligible-candidate CTE gates both exact pgvector cosine
+and simple full-text branches by published current revision, date,
+public audience, enabled collection, current grant, scope, locale,
+hash and profile. Reciprocal-rank fusion uses k=60, deduplicates by
+revision, breaks ties by the synthetic ID and projects at most four
+records after rechecking eligibility. The tests exercised both branches,
+including a case where lexical evidence reverses a cosine tie. Identical
+text and vectors in internal, ungranted, disabled, expired, revoked,
+wrong-scope, wrong-profile and staged revisions failed both branches.
+A separate replacement test excluded the superseded revision and a grant
+withdrawal emptied both result sets.
+
+The basis vectors intentionally encode relevance. Orthogonal fixture
+vectors contribute no semantic candidate. That is a fixture condition,
+not a production relevance threshold. Missing or unresolved evidence
+returns clarify. The 20 expectations are synthetic, author-labelled
+fixtures. Staff validation and actual bilingual embedding quality
+remain pending.
+
+Observed rankings and end-to-end fixture timings follow. Empty lists
+selected no evidence. The ambiguous query was stopped before search.
+
+- `en-card` matched expected `[1]`. Cosine `[1]`, lexical `[1]`, selected `[1]`, 3235 µs.
+- `af-card` matched expected `[1]`. Cosine `[1]`, lexical `[1]`, selected `[1]`, 7400 µs.
+- `en-office` matched expected `[2]`. Cosine `[2]`, lexical `[2]`, selected `[2]`, 7773 µs.
+- `af-parcel` matched expected `[3]`. Cosine `[3]`, lexical `[3]`, selected `[3]`, 3249 µs.
+- `mixed-delivery` matched expected `[4]`. Cosine `[4]`, lexical `[4]`, selected `[4]`, 7084 µs.
+- `af-newsletter` matched expected `[5]`. Cosine `[5]`, lexical `[5]`, selected `[5]`, 3201 µs.
+- `en-access` matched expected `[6]`. Cosine `[6]`, lexical `[6]`, selected `[6]`, 2723 µs.
+- `af-programme` matched expected `[7]`. Cosine `[7]`, lexical `[7]`, selected `[7]`, 2914 µs.
+- `en-receipt` matched expected `[8]`. Cosine `[8]`, lexical `[8]`, selected `[8]`, 3073 µs.
+- `af-hours` matched expected `[9]`. Cosine `[9]`, lexical `[9]`, selected `[9]`, 2808 µs.
+- `mixed-pickup` matched expected `[10]`. Cosine `[10]`, lexical `[10]`, selected `[10]`, 2497 µs.
+- `typo-parking` matched expected `[11]`. Cosine `[11]`, lexical `[11]`, selected `[11]`, 2767 µs.
+- `typo-transfer` matched expected `[12]`. Cosine `[12]`, lexical `[12]`, selected `[12]`, 2862 µs.
+- `vector-only-typo` matched expected `[13]`. Cosine `[13]`, lexical `[]`, selected `[13]`, 2846 µs.
+- `lexical-only-feedback` matched expected `[14]`. Cosine `[]`, lexical `[14]`, selected `[14]`, 2686 µs.
+- `fused-account` matched expected `[19, 15]`. Cosine `[15, 19]`, lexical `[19]`, selected `[19, 15]`, 2808 µs.
+- `af-lost` matched expected `[16]`. Cosine `[16]`, lexical `[16]`, selected `[16]`, 2675 µs.
+- `ambiguous` matched expected `[]`. Cosine `[]`, lexical `[]`, selected `[]`, 0 µs.
+- `off-topic` matched expected `[]`. Cosine `[]`, lexical `[]`, selected `[]`, 2064 µs.
+- `no-relevant-af` matched expected `[]`. Cosine `[]`, lexical `[]`, selected `[]`, 5086 µs.
+
+### Verified environment and cleanup
+
+- Rechecked the tag against immutable image
+  `sha256:c41ec08b3d88535cf84e705cced68f199f40410c60218be157f3435a1544a929`
+  and confirmed port 55434 was free. Docker used `--pull=never` and
+  bound only `127.0.0.1:55434`. The disposable container and dedicated
+  volume were labelled F04-F05. PostgreSQL reported 18.7 and installed
+  vector 0.8.7. The database, owner and role were `vgas_test` and the
+  role had neither superuser nor createdb.
+- Using generated credentials scoped to that target,
+  `MIX_ENV=test mise exec -- mix ecto.migrate` applied
+  `20261125141215` in the fresh instance. With `VGAS_F04_DISPOSABLE=1`
+  and `VGAS_F04_EVIDENCE=1`, `mise exec -- mix test` passed all 49
+  tests, including five pgvector and indexing tests. No OpenAI key was
+  exported for the run. Focused tests first failed before the fixture
+  existed. `mix format --check-formatted`, `mix compile
+  --warnings-as-errors`, `mix deps.get --check-locked`,
+  `mix hex.audit` and `git diff --check` exited 0 under Mise. Hex
+  reported no advisories. Dependency pins were unchanged.
+- After testing, a `pg_tables` query found zero spike tables. Verified
+  labels before stopping the run-owned container, waited for auto-removal
+  and removed only its named volume and temporary files. Docker and
+  `ss -ltnH 'sport = :55434'` confirmed the resources and listener
+  were gone. Shared DevCore services and databases were untouched.
+
+VGAS-5 / F06 is the next local feasibility ticket. It uses signed
+synthetic Chatwoot events, isolated PostgreSQL/Oban work and fake
+reply/handoff transport. VGAS-4 awaits exact-source and staff-fixture
+review. The temporary G036 exception remains feasibility-only. No
+public push, merge, deployment or paid provider call occurred.
