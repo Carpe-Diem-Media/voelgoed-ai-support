@@ -70,6 +70,7 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
              [
                :append,
                :append_operational,
+               :append_support_operator,
                :operational_history,
                :operational_rows,
                :staff_security_history

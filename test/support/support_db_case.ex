@@ -291,7 +291,7 @@ defmodule VoelgoedAi.SupportDBCase do
     SQL.query!(Repo, "DELETE FROM support_sessions WHERE external_inbox_id = $1", [inbox_id])
 
     SQL.query!(Repo, "DELETE FROM support_admission_windows WHERE scope LIKE $1", [
-      "synthetic:1:%:#{inbox_id}:%"
+      "synthetic:#{account_id}:%"
     ])
   end
 

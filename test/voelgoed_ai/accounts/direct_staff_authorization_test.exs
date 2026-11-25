@@ -20,7 +20,11 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
     sign_in_with_entra: :read,
     get_by_subject: :read
   ]
-  @audit_actions [append: :create, staff_security_history: :read]
+  @audit_actions [
+    append: :create,
+    append_support_operator: :create,
+    staff_security_history: :read
+  ]
   @operational_actions [
     append_operational: :create,
     operational_history: :action,
@@ -60,6 +64,7 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
             nil,
             session,
             Map.from_struct(session),
+            %VoelgoedAi.Support.WorkStore{ref: make_ref()},
             %Scope{action: wrong_action, target: context.target.id},
             %Scope{action: action, target: Ash.UUIDv7.generate()}
           ] do
@@ -130,6 +135,20 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
       event: :roles_changed,
       reason_code: :local_admin,
       after_state: %{status: :invited, roles: [:admin], session_generation: 1},
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:append_support_operator, %{session: session}) do
+    %{
+      actor_kind: :staff,
+      actor_staff_id: session.id,
+      target_kind: :support_session,
+      session_target_id: Ash.UUIDv7.generate(),
+      event: :request_handoff,
+      reason_code: :local_operator,
+      operational_before: %{status: :bot_active, ownership_epoch: 1},
+      operational_after: %{status: :handoff_pending, ownership_epoch: 2},
       correlation_id: Ash.UUIDv7.generate()
     }
   end

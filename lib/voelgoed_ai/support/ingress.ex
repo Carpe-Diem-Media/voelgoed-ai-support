@@ -96,13 +96,19 @@ defmodule VoelgoedAi.Support.Ingress do
              InboundEvent,
              :pending,
              %{},
-             %{state: :dispatched, disposition: :pending}, many: true, limit: 100),
+             %{state: :dispatched, disposition: :pending},
+             many: true,
+             limit: 100
+           ),
          {:ok, runs} <-
            WorkStore.read(
              SupportRun,
              :active,
              %{},
-             %{state: %{in: [:queued, :running, :retry_wait]}}, many: true, limit: 100) do
+             %{state: %{in: [:queued, :running, :retry_wait]}},
+             many: true,
+             limit: 100
+           ) do
       if length(receipts) + length(runs) >= 100 do
         WorkStore.update(
           event,
