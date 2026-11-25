@@ -182,7 +182,13 @@ defmodule VoelgoedAi.Support.RunProcessing do
       Admission.window(:contact_minute, contact, now, 60, 10),
       Admission.window(:contact_hour, contact, now, 3_600, 60),
       Admission.window(:inbox_minute, inbox, now, 60, fixture.inbox_limit),
-      Admission.window(:global_minute, "global", now, 60, fixture.global_limit)
+      Admission.window(
+        :global_minute,
+        Map.get(fixture, :global_scope, "global"),
+        now,
+        60,
+        fixture.global_limit
+      )
     ]
 
     turns = [

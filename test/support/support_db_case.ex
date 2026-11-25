@@ -78,7 +78,11 @@ defmodule VoelgoedAi.SupportDBCase do
         batch_size: 5,
         history_limit: 15,
         inbox_limit: 100,
-        global_limit: 100
+        global_limit: 100,
+        # Keep the shared DevCore TEST allocation from combining unrelated
+        # scenarios into one global counter. Each scenario still shares it
+        # across all of its conversations and contacts.
+        global_scope: "synthetic:#{account_id}:fixture_global"
       })
 
     revision = draft(admin, assistant)

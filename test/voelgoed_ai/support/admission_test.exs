@@ -78,6 +78,45 @@ defmodule VoelgoedAi.Support.AdmissionTest do
     end
   end
 
+  for cap <- [:inbox_limit, :global_limit] do
+    test "#{cap} denies a distinct receipt without charging the other windows" do
+      ctx = SupportDBCase.setup()
+      fixture = Application.fetch_env!(:voelgoed_ai, :support_fixture)
+      VoelgoedAi.SupportFixtures.allow_fixture(ctx.assistant, Map.put(fixture, unquote(cap), 1))
+
+      assert {:ok, id} = Ingress.accept(ctx.event)
+      assert :ok = RunProcessing.process_event(id)
+      assert :ok = RunProcessing.process_event(id)
+      after_first = counters(ctx)
+
+      event = %{ctx.event | message_id: ctx.event.message_id + 1}
+      SupportDBCase.append_public_input(ctx, event.message_id)
+      assert {:ok, next} = Ingress.accept(event)
+      assert :ok = RunProcessing.process_event(next)
+
+      assert %{rows: [["triage", "admission_limited"]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT disposition, reason_code FROM inbound_events WHERE id = $1",
+                 [Ecto.UUID.dump!(next)]
+               )
+
+      assert after_first == counters(ctx)
+      assert [] = SupportDBCase.writes(ctx)
+    end
+  end
+
+  defp counters(ctx) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT window_type, count FROM support_admission_windows
+      WHERE scope LIKE $1 AND count > 0 ORDER BY window_type
+      """,
+      ["synthetic:#{ctx.event.external_account_id}:%"]
+    ).rows
+  end
+
   test "contact daily quota follows a contact across conversations and preserves operator access" do
     ctx = SupportDBCase.setup()
     assert {:ok, first} = Ingress.accept(ctx.event)

@@ -322,6 +322,89 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert [_] = SupportDBCase.writes(ctx)
   end
 
+  test "an earlier successful read cannot settle after a newer reservation", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :commit_then_timeout)
+    assert :ok = Delivery.deliver(id)
+    parent = self()
+    Agent.update(ctx.fake, &Map.put(&1, :history_barrier, parent))
+    early = Task.async(fn -> Recovery.reconcile(id) end)
+    assert_receive {:chatwoot_history, worker}, 1_000
+
+    Agent.update(
+      ctx.fake,
+      &Map.update!(&1, :history, fn history ->
+        Enum.reject(history, fn m -> m.sender == :bot end)
+      end)
+    )
+
+    SupportDBCase.advance_clock(ctx, 1)
+    assert :ok = Recovery.reconcile(id)
+    send(worker, :resume_chatwoot_history)
+    assert :ok = Task.await(early)
+
+    assert %{rows: [["unknown", 2, nil]]} =
+             SupportDBCase.delivery_rows(ctx, "state, read_count, external_message_id")
+
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  test "reconciliation expiry does not reserve a read", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :commit_then_timeout)
+    assert :ok = Delivery.deliver(id)
+    SupportDBCase.advance_clock(ctx, 300)
+    assert :ok = Recovery.reconcile(id)
+
+    assert %{rows: [["unknown", "read_exhausted", 0]]} =
+             SupportDBCase.delivery_rows(ctx, "state, reason_code, read_count")
+
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  test "a stale worker cannot dispatch using a replacement worker's claim", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.block_after_claim(ctx, self())
+    first = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:delivery_claimed, original}, 1_000
+
+    SupportDBCase.advance_clock(ctx, 6)
+    assert :ok = Recovery.delivery_deadline(id)
+    SupportDBCase.block_after_claim(ctx, self())
+    second = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:delivery_claimed, replacement}, 1_000
+
+    send(original, :resume_delivery_claim)
+    assert :ok = Task.await(first)
+    assert [] = SupportDBCase.writes(ctx)
+
+    send(replacement, :resume_delivery_claim)
+    assert :ok = Task.await(second)
+    assert %{rows: [["sent", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  test "dispatch refuses a live lease that cannot cover its request margin", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.block_after_claim(ctx, self())
+    task = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:delivery_claimed, worker}, 1_000
+
+    SQL.query!(
+      Repo,
+      "UPDATE outbound_deliveries SET lease_expires_at = last_read_at + interval '500 milliseconds' WHERE id = $1",
+      [Ecto.UUID.dump!(id)]
+    )
+
+    send(worker, :resume_delivery_claim)
+    assert :ok = Task.await(task)
+
+    assert %{rows: [["cancelled", 0, nil]]} =
+             SupportDBCase.delivery_rows(ctx, "state, attempt_count, dispatch_authorized_at")
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   for {barrier, signal, committed?} <- [
         {:before_commit_barrier, :chatwoot_before_commit, false},
         {:write_barrier, :chatwoot_write, true}

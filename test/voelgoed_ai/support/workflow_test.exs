@@ -221,6 +221,54 @@ defmodule VoelgoedAi.Support.WorkflowTest do
     assert [] = SupportDBCase.writes(ctx)
   end
 
+  test "two jobs cannot claim one run and the expired generation cannot complete it", ctx do
+    assert {:ok, receipt} = Ingress.accept(ctx.event)
+    assert :ok = RunProcessing.process_event(receipt)
+    session = Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+
+    assert %{rows: [[id]]} =
+             SQL.query!(Repo, "SELECT id::text FROM support_runs WHERE session_id = $1", [session])
+
+    SupportDBCase.advance_clock(ctx, 2)
+    SupportDBCase.block_next_conversation(ctx, self())
+    first = Task.async(fn -> RunProcessing.process_run(id) end)
+    assert_receive {:chatwoot_read, worker}, 1_000
+    assert :ok = RunProcessing.process_run(id)
+
+    assert %{rows: [["running", 1, 1]]} =
+             SQL.query!(
+               Repo,
+               "SELECT state, attempt_count, claim_generation FROM support_runs WHERE session_id = $1",
+               [session]
+             )
+
+    SupportDBCase.advance_clock(ctx, 6)
+    assert :ok = Recovery.run_deadline(id)
+    send(worker, :resume_chatwoot_read)
+    assert :ok = Task.await(first)
+
+    assert %{rows: [["queued", 1, 2]]} =
+             SQL.query!(
+               Repo,
+               "SELECT state, attempt_count, claim_generation FROM support_runs WHERE session_id = $1",
+               [session]
+             )
+
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "state")
+
+    assert :ok = RunProcessing.process_run(id)
+
+    assert %{rows: [["completed", 2, 3]]} =
+             SQL.query!(
+               Repo,
+               "SELECT state, attempt_count, claim_generation FROM support_runs WHERE session_id = $1",
+               [session]
+             )
+
+    assert %{rows: [["pending"]]} = SupportDBCase.delivery_rows(ctx, "state")
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   test "reopening inherits human inhibit and unresolved delivery across generations", ctx do
     id = SupportDBCase.prepare_reply(ctx)
     session_id = SupportDBCase.session_id(ctx)
@@ -296,16 +344,16 @@ defmodule VoelgoedAi.Support.WorkflowTest do
 
     human = &shape.(&1, %{"type" => "user", "id" => 82})
 
-    assert {:error, :fixture_rejection} =
-             Repo.transact(fn ->
-               SQL.query!(Repo, """
-               ALTER TABLE oban_jobs ADD CONSTRAINT reject_human_fixture_job
-                 CHECK (NOT (args ? 'event_id')) NOT VALID
-               """)
+    SQL.query!(Repo, """
+    ALTER TABLE oban_jobs ADD CONSTRAINT reject_human_fixture_job
+      CHECK (NOT (args ? 'event_id')) NOT VALID
+    """)
 
-               assert SupportDBCase.signed_request(ctx, human).status == 500
-               {:error, :fixture_rejection}
-             end)
+    try do
+      assert SupportDBCase.signed_request(ctx, human).status == 500
+    after
+      SQL.query!(Repo, "ALTER TABLE oban_jobs DROP CONSTRAINT reject_human_fixture_job")
+    end
 
     session_id = Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
 
