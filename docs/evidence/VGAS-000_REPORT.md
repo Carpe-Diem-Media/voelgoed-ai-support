@@ -141,3 +141,49 @@ warning.
 F01 remains blocked. VGAS-3 typed inference and G027 reservation work
 await the F01 baseline. No paid provider calls, public push, merge or
 deployment occurred.
+
+## F01 local DevCore image candidate
+
+This proposal supersedes the earlier CI-image container proposal for the
+isolated feasibility run. DevCore PR #10 rollout and exact-head CI are
+separate from this local check. The proposed temporary deviation applies
+only to F01 and ends with removal of the disposable container and its
+dedicated volume. Standard VGAS development continues to use DevCore.
+
+- `docker image inspect devcore-postgres:18.7-vector0.8.7` identified
+  Linux amd64 image
+  `sha256:c41ec08b3d88535cf84e705cced68f199f40410c60218be157f3435a1544a929`.
+  Its metadata reports PostgreSQL 18.7. This is the local image ID, not
+  proof of PR #10 exact-head CI.
+- Read-only inspection of the image archive found `vector.so`,
+  `vector--0.8.7.sql`, and a `vector.control` with
+  `default_version = '0.8.7'`. The DevCore candidate Dockerfile references
+  PostgreSQL 18.7 Alpine 3.24 and the pinned pgvector 0.8.7 source commit.
+- Port `127.0.0.1:55434` had no listener at inspection time. Recheck
+  immediately before binding.
+
+Proposed commands, pending explicit authorization. The environment file
+would be temporary, mode 0600, and contain a freshly generated synthetic
+password independent of all DevCore credentials.
+
+```sh
+docker volume create vgas-f01-pg187-data
+docker run --rm -d --name vgas-f01-pg187 --pull=never \
+  --publish 127.0.0.1:55434:5432 \
+  --mount type=volume,source=vgas-f01-pg187-data,target=/var/lib/postgresql \
+  --env-file "$VGAS_F01_CONTAINER_ENV" \
+  sha256:c41ec08b3d88535cf84e705cced68f199f40410c60218be157f3435a1544a929
+```
+
+After approval, verify the running image and database identity. Provision
+a fresh disposable `vgas_test` database and restricted `vgas_test` role,
+verify server version and extension availability, enable vector as the
+disposable administrator, run fresh Ecto migrations and the integration
+suite against port 55434, and record installed extension and SQL query
+evidence. Stop the container and remove only its run-owned volume and
+temporary files. No container was started for this inspection.
+
+The prior stable dependency trial remains blocked by the Assent advisory.
+An explicit G036 exception or a patched stable chain is still needed.
+OpenAI model listing awaits confirmation of the key permission change.
+No VGAS-3 inference or reservation work started.
