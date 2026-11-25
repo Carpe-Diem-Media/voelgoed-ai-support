@@ -20,6 +20,46 @@ defmodule VoelgoedAi.RepoFoundationTest do
              )
   end
 
+  test "staff and audit preserve identity, UUIDv7, UTC precision and restrictive references" do
+    assert %{rows: [[2, "bigint", 6, 6, true]]} =
+             SQL.query!(Repo, """
+             SELECT
+
+               (SELECT count(*) FROM information_schema.columns
+                WHERE table_name IN ('staff_users', 'audit_events') AND column_name = 'id'
+                  AND data_type = 'uuid' AND column_default = 'uuidv7()'),
+               (SELECT data_type FROM information_schema.columns
+                  WHERE table_name = 'staff_users' AND column_name = 'session_generation'),
+               (SELECT datetime_precision FROM information_schema.columns
+                  WHERE table_name = 'staff_users' AND column_name = 'last_authenticated_at'),
+               (SELECT datetime_precision FROM information_schema.columns
+                  WHERE table_name = 'audit_events' AND column_name = 'occurred_at'),
+               (SELECT indisunique AND pg_get_indexdef(indexrelid) LIKE '%(identity_issuer, identity_subject)'
+                  FROM pg_index WHERE indexrelid = 'staff_users_issuer_subject_index'::regclass)
+             """)
+
+    assert %{rows: [["audit_events_actor_staff_id_fkey"], ["audit_events_target_id_fkey"]]} =
+             SQL.query!(Repo, """
+             SELECT conname FROM pg_constraint
+             WHERE conrelid = 'audit_events'::regclass AND confrelid = 'staff_users'::regclass
+               AND confdeltype = 'r' AND confupdtype = 'r' AND convalidated
+             ORDER BY conname
+             """)
+
+    assert %{
+             rows: [
+               ["staff_users_generation_nonnegative"],
+               ["staff_users_roles"],
+               ["staff_users_status_timestamps"]
+             ]
+           } =
+             SQL.query!(Repo, """
+             SELECT conname FROM pg_constraint
+             WHERE conrelid = 'staff_users'::regclass AND contype = 'c' AND convalidated
+             ORDER BY conname
+             """)
+  end
+
   @tag :requires_pgvector
   test "the pre-provisioned vector extension executes a cosine distance query" do
     assert %{rows: [[true]]} =

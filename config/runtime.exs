@@ -30,3 +30,14 @@ end
 if config_env() == :dev do
   config :voelgoed_ai, :development_ai, VoelgoedAi.DevelopmentAiConfig.load(System.get_env())
 end
+
+config :voelgoed_ai, :entra,
+  enabled: System.get_env("VGAS_STAFF_AUTH_ENABLED") == "true",
+  tenant_id: System.get_env("VGAS_ENTRA_TENANT_ID"),
+  client_id: System.get_env("VGAS_ENTRA_CLIENT_ID"),
+  client_secret: System.get_env("VGAS_ENTRA_CLIENT_SECRET"),
+  redirect_uri: System.get_env("VGAS_ENTRA_REDIRECT_URI")
+
+if config_env() != :prod do
+  config :voelgoed_ai, VoelgoedAiWeb.Endpoint, secret_key_base: System.get_env("SECRET_KEY_BASE")
+end

@@ -1,6 +1,10 @@
 import Config
 
-config :voelgoed_ai, ecto_repos: [VoelgoedAi.Repo]
+config :voelgoed_ai,
+  ecto_repos: [VoelgoedAi.Repo],
+  ash_domains: [VoelgoedAi.Accounts, VoelgoedAi.Governance]
+
+config :voelgoed_ai, VoelgoedAi.Repo, log: false
 
 config :voelgoed_ai, VoelgoedAiWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
@@ -9,10 +13,9 @@ config :voelgoed_ai, VoelgoedAiWeb.Endpoint,
 config :phoenix, :json_library, Jason
 
 config :req_llm, load_dotenv: false
+config :ash, default_string_length_count: :codepoints
 
 if config_env() == :test do
-  config :ash, default_string_length_count: :codepoints
-
   config :ash_authentication,
          :http_adapter,
          {VoelgoedAi.Feasibility.EntraDiscoveryAdapter,
