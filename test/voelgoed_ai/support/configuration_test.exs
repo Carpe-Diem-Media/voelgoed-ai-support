@@ -56,6 +56,17 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
     admin = bootstrap_admin(ctx.admin)
     assistant = create(admin, ctx.slug)
     assert assistant.status == :disabled
+
+    assert {:error,
+            %Postgrex.Error{
+              postgres: %{code: :check_violation, constraint: "assistants_lifecycle"}
+            }} =
+             SQL.query(
+               Repo,
+               "UPDATE assistants SET status = 'active', disabled_at = NULL WHERE id = $1",
+               [Ecto.UUID.dump!(assistant.id)]
+             )
+
     assert {:error, _} = invoke(Assistant, :activate, %{id: assistant.id}, admin)
     revision = draft(admin, assistant)
     assert {:error, _} = publish(admin, revision, nil)
@@ -83,6 +94,21 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
                },
                admin
              )
+  end
+
+  test "publication requires an explicit expected pointer, including for a first publish", ctx do
+    admin = bootstrap_admin(ctx.admin)
+    assistant = create(admin, ctx.slug)
+    allow_fixture(assistant)
+    revision = draft(admin, assistant)
+
+    assert {:error, error} = invoke(AssistantRevision, :publish, %{id: revision.id}, admin)
+    assert Exception.message(error) =~ "missing_expected_revision_pointer"
+
+    assert {:ok, %{status: :draft}} =
+             invoke(AssistantRevision, :read_configuration, %{id: revision.id}, admin)
+
+    assert {:ok, _} = publish(admin, revision, nil)
   end
 
   test "publish serializes the compare and switch on the assistant row", ctx do
@@ -344,6 +370,16 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
     assert Enum.map(events, & &1.event) == [:create_draft, :publish]
     assert {:ok, staff_history} = Governance.staff_security_history(admin, admin.id)
     assert Enum.all?(staff_history, &(&1.target_kind == :staff_user))
+
+    assert {:error,
+            %Postgrex.Error{
+              postgres: %{code: :check_violation, constraint: "audit_events_exact_target"}
+            }} =
+             SQL.query(
+               Repo,
+               "UPDATE audit_events SET target_id = $1 WHERE revision_target_id = $2",
+               Enum.map([admin.id, revision.id], &Ecto.UUID.dump!/1)
+             )
 
     assert {:error, _} =
              Ash.create(

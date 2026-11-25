@@ -141,7 +141,7 @@ defmodule VoelgoedAi.Support.Configuration do
     do: transition(revision, %{status: :discarded}, :discard, admin)
 
   defp revision_transition(revision, assistant, :publish, args, admin) do
-    with :ok <- expected_pointer(assistant, args.expected_active_revision_id),
+    with :ok <- expected_pointer(assistant, Map.fetch(args, :expected_active_revision_id)),
          {:ok, hash} <- fixture_hash(revision),
          :ok <- supersede(assistant.active_revision_id, admin),
          {:ok, published} <-
@@ -167,7 +167,8 @@ defmodule VoelgoedAi.Support.Configuration do
     end
   end
 
-  defp expected_pointer(%{active_revision_id: expected}, expected), do: :ok
+  defp expected_pointer(%{active_revision_id: expected}, {:ok, expected}), do: :ok
+  defp expected_pointer(_, :error), do: {:error, :missing_expected_revision_pointer}
   defp expected_pointer(_, _), do: {:error, :stale_revision_pointer}
 
   defp supersede(nil, _admin), do: :ok
