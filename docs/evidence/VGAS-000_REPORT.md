@@ -730,26 +730,59 @@ command with a single line selector.
 - `:746`, recovery enqueue removed. The intent stayed SENDING after Oban
   discarded the delivery job. Exit 2, one failure and 51 excluded.
 
-### Delivery intent lifecycle
+### Inbound receipt and delivery lifecycle
 
-Both intents use an atomic claim with one POST per intent. HTTP runs
-outside transactions. An insert in the decision transaction schedules
-the delivery and its independent deadline check. A recurring Oban
-deadline sweep also finds overdue intents if their individual check is
-discarded. Both deadline paths use PostgreSQL only. ExUnit drives Oban
-queues manually and exercises the recurring fallback with a real Cron
-tick against the same disposable schema.
+The receipt and its first Oban job commit together. The qualified message
+key deduplicates signed retries and preserves the receipt time. The
+decision transaction inserts any delivery intent and its deadline job.
+The recurring Oban Cron job sweeps overdue receipts and intents using
+PostgreSQL only. The F06 tests use the real Oban queues and rescue
+engine in a disposable TEST schema. All Req calls use the fake adapter
+outside transactions.
 
-| Intent and transition | Guard and effect | Durable next step and job loss |
-|---|---|---|
-| Reply, create PENDING | A qualified bot owns the active input. The deadline is 45 seconds after receipt. The intent allows one reserved ownership read. | The decision transaction inserts the delivery and deadline jobs. A replacement delivery job cannot restore a spent read or extend the deadline. |
-| Reply, PENDING to SENDING | A fresh qualified GET passes eligibility. The session epoch and active event match before the deadline. | The claim transaction increments the generation, records the single POST attempt and schedules lease recovery at five seconds. |
-| Reply, PENDING to CANCELLED | A fence, ineligible GET or stale input prevents sending. The deadline check cancels an overdue, unclaimed reply and releases its active slot. | Cancellation is terminal. A lost deadline job is covered by the sweep. |
-| Reply, SENDING to SENT, FAILED or UNKNOWN | Settlement checks the generation and epoch. A verified message ID yields SENT. A definitive rejection yields FAILED. An uncertain result, changed epoch or expired claim yields UNKNOWN. | SENT and FAILED are terminal. If the delivery is lost, lease recovery records UNKNOWN. The deadline and sweep cover a lost lease job. UNKNOWN blocks another reply and is terminal for automation in this spike. |
-| Handoff, create PENDING | A qualified bot can hand off. The decision transaction fences unsent work and commits HANDOFF_PENDING. The deadline is five minutes after intent creation. | The decision transaction inserts the delivery and deadline jobs. All jobs share the row's three-read budget, including confirmation after the POST. |
-| Handoff, PENDING to PENDING, SENDING, SENT, CANCELLED or FAILED | An atomic reservation spends one read before a GET. A transient read can retry within budget. Qualified bot ownership permits a claim. Qualified human ownership confirms the goal without a POST. Resolution or a fence cancels the intent. Unverifiable ownership, exhausted preflight or deadline expiry records FAILED when no write was claimed. | Oban retries transient reads. Job replacement cannot restore a spent read. The deadline path closes an unclaimed intent if its delivery job is lost. FAILED keeps the inhibit. |
-| Handoff, SENDING to SENT, FAILED or UNKNOWN | The same claim and lease as the reply apply. A qualified confirming GET yields SENT and human ownership. A definitive rejection yields FAILED. Ambiguity, loss of claim or changed epoch yields UNKNOWN and keeps automation inhibited. | Settlement or lease recovery schedules a read-only job in the transaction that records UNKNOWN, if a read remains before the deadline. The deadline path records UNKNOWN and a recovery failure if the lease job is lost. |
-| Handoff, UNKNOWN to SENT or bounded UNKNOWN | A reserved GET within the original budget and deadline can confirm open status or human ownership. Resolution closes the session without proving the write. Unconfirmed reads exhaust the budget or reach the deadline and record a recovery failure. | Oban retries within the same row budget. If the read-back job is lost or replaced, the deadline path still records the failure without another POST. SENT, FAILED and CANCELLED are terminal. Bounded UNKNOWN stays inhibited for operator review. |
+| Non-terminal state | Concurrent actors and fence | Lost, duplicate or late work | Local evidence |
+|---|---|---|---|
+| Inbound DISPATCHED, awaiting a decision | The original and replacement ingress jobs can read before 45 seconds. The receipt row lock orders those results with the deadline sweep. Only the first decision can update ownership and create an intent. A genuine public human reply inhibits in the receipt transaction. | A lost ingress job leaves a durable receipt for Cron. A signed replay acknowledges without enqueueing again. A replacement can decide before expiry. A terminal or expired receipt cannot admit a late GET result. Delivery recovery and reconciliation have no receipt operation. | Receipt replay and rollback tests, discarded ingress rescue and Cron, overdue original job, original and replacement race, late read with and without the sweep, and lost human observation. |
+| Reply PENDING | Original and replacement delivery jobs share one ownership read. The reservation checks the deadline after locking the row and returns a sequence. Claim checks that sequence, the session epoch, active event and deadline. Deadline or Cron can cancel and release the active slot. A qualified human observation can fence the reply. | A duplicate cannot spend a second read or claim a write. A lost preflight ends in CANCELLED at the deadline. A stale or late GET cannot claim a POST. Lease recovery and reconciliation have no PENDING operation. | Duplicate delivery, late preflight, read blocked on PostgreSQL, human receipt fence, discarded preflight and Cron fallback. |
+| Handoff PENDING | Original and replacement delivery jobs reserve from the same three reads. The latest reservation can claim the write while the session remains eligible. Qualified human ownership confirms the goal without POST. Qualified resolution cancels. Deadline or Cron can record definitive failure before claim. | Safe transient failures may retry within budget. A duplicate spends from that same budget and fences earlier reads. If the last preflight is lost, the deadline records FAILED and keeps the inhibit. Lease recovery and reconciliation have no PENDING operation. | Safe retry, concurrent final reservation, older preflight, discarded final preflight, replacement and deadline tests. |
+| Reply SENDING | The writer rechecks the committed state, claim generation, session epoch and available lease before dispatch. Settlement checks generation, state, ownership and lease. The lease job or deadline can record UNKNOWN under the same locks. | Replacement delivery and reconciliation jobs cannot send. If Oban loses the writer, lease recovery records UNKNOWN. Deadline and Cron cover a lost lease job. A response that returns after expiry or after recovery cannot settle the reply. | Lost executing POST, replacement and reconciliation no-ops, pause at claim commit, intervening human takeover, insufficient lease, and late response tests. |
+| Handoff SENDING | The same dispatch and lease rules apply. The writer can reserve a read for confirmation after POST. Settlement requires the current claim and read reservation. Deadline or recovery can record UNKNOWN and give any remaining read to reconciliation. | A replacement cannot write or spend the confirmation read. Late POST and GET results cannot take over after recovery. If the individual deadline job is lost, Cron closes the window. | Immediate confirmation, exhausted immediate read budget, lost POST, stale writer after recovery and immediate confirmation at the deadline. |
+| Handoff UNKNOWN, recovery still open | Original and replacement reconciliation jobs can reserve GETs. The latest reservation can settle only while the row remains UNKNOWN, the deadline is open and no recovery failure is recorded. Deadline or Cron can close the recovery window. | A discarded reconciliation job can never cause a repeated POST. The deadline records failure if work is lost. A delayed older result cannot displace the latest reservation or a recorded failure. Delivery and lease recovery jobs cannot write here. | Lost reconciliation, replacement budget, older/newer results in both orders, latest result after deadline failure, and qualified resolution. |
+
+An ignored receipt or a dispatched receipt with a durable decision is
+terminal for ingress. SENT, FAILED and CANCELLED are terminal for
+delivery. Reply UNKNOWN is terminal for automation in this spike.
+Handoff UNKNOWN with a recorded recovery failure is terminal for
+automated recovery. The original reason and uncertain outcome remain
+available for operator review.
+
+Under G012, a qualified `resolved` read closes the session even when
+it follows our explicit `open` POST. It cannot prove that our POST
+achieved the open handoff goal. Immediate confirmation and scheduled
+reconciliation therefore both preserve UNKNOWN and record
+`handoff_conversation_closed`. Both stop further reads and writes.
+The spike never reopens a resolved conversation or auto-resolves one.
+
+G009 separates durable dispatch from processing the receipt. G013 sets
+the provisional 45-second interactive window and calls for visible
+operational recovery. If a dispatched receipt missed that window,
+the ingress worker or a bounded Cron sweep records
+`ingress_deadline_exceeded` for operator triage. The spike cannot
+establish automated handoff eligibility for an input it never safely
+processed. It sends no late reply or status change and preserves any
+existing inhibit, including one committed with a human reply. A
+handoff already created within the interactive window retains its
+separate five-minute budget under G012 and G013.
+
+Req receive and response timeout options use the smaller of 500 ms
+and the remaining applicable deadline or claim lease. The injected
+clock is checked after PostgreSQL grants the read reservation lock.
+Rows are unlocked before the Req adapter runs. The interval between
+the final local claim check and dispatch therefore still permits a
+human or recovery process to change the database, or Chatwoot to change
+ownership. The timeout settings and local fences reduce that interval
+without providing a remote conditional write. F07 owns live timeout,
+ownership and channel validation.
 
 ### Verification
 
@@ -840,6 +873,98 @@ refer to the implementation commit.
 - `git diff --check origin/main...HEAD` and
   `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
   exited 0 for the implementation commit. Gitleaks reported no leaks.
+
+### Follow-up review at f26225a
+
+The first regression commit was
+`42af20c32b05f8ce3a6b398ef39c63e1a163507c`. On that commit, the
+`--only f06_followup --seed 0` selection exited 2 with ten failures,
+one pass and 68 excluded. All five suspected failures reproduced.
+The invalid-signature, wrong-inbox and non-human sender case passed
+without a source change.
+
+1. A late, older reconciliation read overwrote durable budget
+   exhaustion. The reservation counter is now the read sequence.
+   Preflight, immediate confirmation and reconciliation check the
+   sequence and expected state. Reconciliation also checks for a
+   recorded recovery failure before evaluating the result.
+2. A preflight blocked on a PostgreSQL row used a clock value taken
+   before the lock wait. The reservation now locks the row and checks
+   the injected clock before spending the read, in the same transaction.
+   Req applies the remaining time at request entry.
+3. Immediate confirmation discarded a qualified resolution. It now
+   uses the same G012 outcome logic as scheduled reconciliation, as
+   described in the lifecycle table.
+4. A writer paused at claim commit entered POST after recovery. The
+   writer now checks the committed claim and session fence in a fresh
+   transaction, checks that the lease can cover the request, and
+   releases the transaction before Req. Settlement rejects expired
+   claims even if the recovery job has yet to run.
+5. Oban could discard the first ingress job without recording a
+   decision. The existing Cron deadline worker now processes up to
+   100 overdue receipts per tick. Each ingress decision checks the
+   receipt under its row lock before applying a GET result. The
+   G009/G013 expiry outcome and G012 inhibit rules are in the table.
+6. Invalid signatures, wrong inbox and signed non-human outgoing
+   events already preserved active work. The regression verifies the
+   response codes, unchanged session state, and exactly one reply POST.
+
+Actor and terminal-state tests are in
+`0d22ef2f4d32fa37092e7a3a4fc7ed4cba053b5f` and
+`02fe44d632ad2607ec98c35e946d3f1304cb1274`. The implementation is in
+`827d082d6e14ea40b30c358a0640861cd5ee3504`.
+
+#### Mutation checks
+
+Each mutation was restored after running
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs<selector> --seed 0`.
+Every selection below exited 2 on test assertions. Line selectors
+refer to `02fe44d632ad2607ec98c35e946d3f1304cb1274`.
+
+| Selector | Guard disabled | Observed regression |
+|---|---|---|
+| `:1244` | Reconciliation ignores both the read sequence and recorded failure | Both older results could change the handoff. |
+| `:1244` | Reconciliation ignores only the read sequence | The older result could settle while the latest read was still in flight. |
+| `:1509` | Reconciliation ignores only the recorded failure | The latest read could overwrite deadline failure. |
+| `:1302` | Capture reservation time before acquiring the delivery row lock | The overdue worker consumed a read. The request boundary still prevented HTTP. |
+| `:1347` | Use the fixed Req receive and response timeouts | The fake saw 500 ms with only 125 ms left. |
+| `:1363` | Discard qualified resolution in immediate confirmation | The session stayed handoff pending and recovery lacked the closure reason. |
+| `:1385` | Dispatch ignores the recovered claim state | The stalled writer entered POST after recovery. |
+| `:1402` | Preflight ignores the read sequence | The older read entered POST after the replacement reserved a read. |
+| `:1439` | Dispatch only requires a positive lease | The writer entered POST with less than one request timeout left. |
+| `:1461` | Dispatch ignores the session fence | The writer entered POST after public human takeover. |
+| `:1486` | Settlement accepts results after lease expiry | The late reply settled before recovery. |
+| `:1584:1620:1676` | Cron skips dispatched receipts | The lost original ingress job and lost human observation kept an undecided receipt. The late GET alone could still record expiry. |
+| `:1607` | Allow Req entry when remaining time is zero | The overdue first ingress job entered GET. |
+| `:1620:1703` | Apply ownership observations even when the receipt is terminal | The late GET changed ownership after expiry or a replacement decision. |
+| `:1651` | Remove the receipt deadline guard before applying the ownership result | The late read created a session after expiry. |
+| `:163:524:798` | Permit a replacement to read a terminal receipt | The rescued-reply case made an extra ingress GET. |
+| `:1738` | Bypass HMAC, inbox qualification or human sender qualification, in three separate runs | Each change failed the active-reply regression. |
+| `:1789` | Omit pending, sending or unknown handoffs from the sweep, in three separate runs | Each change left the corresponding handoff without its deadline outcome. |
+| `:1069:1209` | Accept handoff observations after the deadline | Immediate and scheduled confirmation incorrectly recorded success. |
+
+#### Follow-up verification
+
+- `devcore-project doctor` initially exited 1 because this checkout
+  lacked a generated environment. `devcore-project plan` and
+  `devcore-project activate` each exited 0. The next doctor and the
+  final doctor each exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix format --check-formatted` and
+  `mise exec -- mix hex.audit` each exited 0 in separate invocations.
+  Hex reported no retired packages or security advisories.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/chatwoot_feasibility_test.exs --seed 0`
+  and the same command with seeds `371486` and `739021` each exited 0.
+  Each run passed 89 tests and skipped none.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 at seed `626599` with 135 passed and five existing F04 skips.
+- `python3 .github/scripts/plan_tests.py` exited 0 and included F06
+  in the seven planned shards.
+- `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0. Gitleaks reported no leaks.
 
 ### F07 live gaps
 
