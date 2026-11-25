@@ -17,6 +17,15 @@ Before editing, read the repository's actual instructions, current slice brief a
 - No production credentials, personal data, raw prompts, transcripts or customer payloads in Git, fixtures, CI or logs. Use sanitised fixtures and separate test keys with explicit budget. Never expose secrets in reports. Store minimal operational metadata. No production changes, hosting purchases, DNS changes or deployments without explicit approval. Default automation disabled; assisted fallback if external safety unresolved.
 - Keep changes focused. Raise unrelated findings in existing tracker if authorised, otherwise report them; do not refactor unrelated code. Parallelise only independent slices, never overlapping migration/resource edits.
 
+## Plane execution and Ready authority
+
+Use the **VGAS Implementation Board** in the Voelgoed AI Support project as the live execution queue. During an authorised VGAS development run, the executing agent has standing authority to promote and start eligible tickets within the run's approved scope, including the next slice. Routine handoffs require no separate assignment. Record the owner-reviewed VGAS-000 decision before starting VGAS-001. A conditional GO authorises only the work it explicitly permits.
+
+1. Before choosing work and after each ticket reaches a handoff or blocker, refresh the live queue. Read the candidate ticket's scope, acceptance criteria, priority, dependencies and prerequisites. Keep work already assigned to another agent or sharing resources or migrations with active work out of your queue.
+2. Move an executable ticket from **Backlog** or **Blocked** to **Ready** when its scope and acceptance criteria are agreed, blocking tickets are **Done**, and other prerequisites for starting are satisfied. Record the evidence in Plane. Keep unresolved access, evidence or owner decisions visible as blockers on the affected work. Phase summaries stay in Backlog until their work is scoped for execution.
+3. Start the highest-priority eligible **Ready** ticket in Plane's order and move it to **In Progress**. Record verification evidence at handoff. Use **In Review** while required review is pending and **Done** only after the ticket's acceptance and review gates are met. Refresh downstream tickets and continue with the next eligible item. Stop when the approved scope is complete, the owner pauses the run, or every remaining in-scope item needs a blocker resolved.
+4. Apply the governing specs and slice brief at each transition. Keep independent review and owner approval for merging, and obtain separate authority for paid inference, real customer-data processing, deployment and production activation.
+
 ## Local bootstrap and parallel work
 
 1. Run `git status -sb` and identify the assigned branch or worktree. Use the Erlang and Elixir versions in `.tool-versions`. If the shell uses different versions, run commands through `mise exec -- <command>`.
@@ -47,4 +56,4 @@ PR description: slice/authority IDs; scope and non-goals; changed files, migrati
 
 ## Exit conditions
 
-Deliver only the assigned slice and evidence. No autonomous next slice, no unrelated hardening. If blocked by external access, mark BLOCKED precisely and complete independent tests; don't fake a successful real integration. Update the slice status/runbook/evidence; record narrow follow-up if necessary. The release owner alone approves live automation after G038 gates.
+Deliver each slice with its verification evidence, updated Plane status and applicable runbook. Follow the Plane execution rules above to select the next eligible ticket within the approved scope. If external access blocks a check, record the precise blocker and finish independent checks. Record narrow follow-up when needed. The release owner alone approves live automation after G038 gates.
