@@ -376,14 +376,17 @@ defmodule VoelgoedAi.AshAiFeasibilityTest do
       assert %{state: "released", evidence: nil} = DurableLedger.fetch(ledger, 2)
     end
 
-    # The durable claim makes a second fake send impossible, so counting plug
-    # hits alone would hide a ReqLLM retry. Count entries into the adapter
-    # itself: each entry is one attempt the provider could have received.
-    test "embedding 503 and timeout enter the adapter exactly once", %{ledger: ledger} do
+    # The evidence adapter returns a request whose adapter is `Req.Plug`, so a
+    # ReqLLM retry would bypass the wrapper and its durable claim and reach
+    # the fake provider directly. Count hits at the fake provider: each is a
+    # request the real provider would have received.
+    test "embedding 503 and timeout reach the provider exactly once", %{ledger: ledger} do
       owner = self()
 
       for {id, outcome} <- [{1, :status_503}, {2, :timeout}] do
         Req.Test.stub(Probe, fn conn ->
+          send(owner, {:provider_hit, id})
+
           case outcome do
             :status_503 ->
               conn
@@ -403,27 +406,17 @@ defmodule VoelgoedAi.AshAiFeasibilityTest do
                    "text-embedding-3-small",
                    limits(),
                    fn attempt ->
-                     http_options =
-                       attempt
-                       |> TransportEvidence.options(Probe)
-                       |> Keyword.update!(:adapter, fn adapter ->
-                         fn request ->
-                           send(owner, {:adapter_entry, id})
-                           adapter.(request)
-                         end
-                       end)
-
                      ReqLLM.embed("openai:text-embedding-3-small", "Synthetic text",
                        api_key: "synthetic-placeholder",
                        dimensions: 1536,
                        total_timeout: 5000,
-                       req_http_options: http_options
+                       req_http_options: TransportEvidence.options(attempt, Probe)
                      )
                    end
                  )
 
-        assert_received {:adapter_entry, ^id}
-        refute_received {:adapter_entry, ^id}
+        assert_received {:provider_hit, ^id}
+        refute_received {:provider_hit, ^id}
       end
     end
 

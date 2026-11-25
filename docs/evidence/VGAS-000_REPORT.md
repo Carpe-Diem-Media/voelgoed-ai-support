@@ -544,12 +544,21 @@ adapter and `retry: false` entered the adapter four times for both a
 synthetic 503 and a synthetic timeout. With `max_retries: 0` in
 `req_http_options` it entered once.
 
-The merged spike still sent at most once through
-`TransportEvidence`, because that adapter's return value stopped the
-retry loop. That safety was incidental. The correction adds
-`max_retries: 0` to both transport option sets and a test that swaps
-the evidence adapter for a bare counter. That test failed against the
-uncorrected options (13/14) and passes with the correction.
+The merged durable path was also exposed. `TransportEvidence` calls
+`Req.merge(plug: ...)`, which sets the returned request's adapter to
+`Req.Plug`, so each retry bypassed the wrapper and its durable claim
+and went straight to the provider. The independent review of PR #3
+observed one wrapper entry but four fake-provider calls for both a
+503 and a timeout under the uncorrected options. An earlier draft of
+this correction wrongly called the durable path incidentally safe.
+
+The correction adds `max_retries: 0` to both transport option sets.
+Three tests now cover it: a bare-adapter counter, a fake-provider hit
+counter on the durable path, and an assertion on the embedding
+options captured outside the transport callback (an assertion inside
+the callback is rescued as an ambiguous outcome and cannot fail the
+test). With `max_retries: 0` removed from both support modules, all
+three failed; with it restored, the 21 focused tests pass.
 
 ### Review outcomes
 
