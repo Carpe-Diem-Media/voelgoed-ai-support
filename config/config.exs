@@ -12,4 +12,9 @@ config :req_llm, load_dotenv: false
 
 if config_env() == :test do
   config :ash, default_string_length_count: :codepoints
+
+  config :ash_authentication,
+         :http_adapter,
+         {VoelgoedAi.Feasibility.EntraDiscoveryAdapter,
+          [plug: {Req.Test, VoelgoedAi.Feasibility.EntraProvider}, retry: false, redirect: false]}
 end
