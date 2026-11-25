@@ -1,0 +1,7 @@
+/.env
+/.env.*
+!/.env.example
+/_build/
+/deps/
+/cover/
+/erl_crash.dump
