@@ -2,7 +2,7 @@
 
 Document: VGAS-SPEC | Version: 1.0.0 | Date: 2026-11-25
 
-Status: **Architecture frozen with accepted amendments. VGAS-000 CONDITIONAL GO for local MVP development. Live verification pending.**
+Status: **Architecture frozen; 38/38 decisions accepted, with accepted amendments. VGAS-000 CONDITIONAL GO for local MVP development. Live verification pending.**
 
 ## Amendment A-011 — VGAS-001 authentication release-candidate exception
 
