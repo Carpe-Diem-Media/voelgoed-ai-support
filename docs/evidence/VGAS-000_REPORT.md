@@ -524,3 +524,110 @@ synthetic Chatwoot events, isolated PostgreSQL/Oban work and fake
 reply/handoff transport. VGAS-4 awaits exact-source and staff-fixture
 review. The temporary G036 exception remains feasibility-only. No
 public push, merge, deployment or paid provider call occurred.
+
+## F08 · Entra and staff authorisation (VGAS-6)
+
+**PARTIAL.** The local fixture passed its OIDC, PostgreSQL authorisation,
+session denial and audit tests. The clean TEST compile gate is blocked.
+VGAS-9 owns proof against an authorised live Entra test registration.
+
+The 2026-11-25 run used branch `feat/vgas-6-f08-entra-authz` at base
+`324cb105d749de50b31f3ea007cabd931a915ff0`. The tested code and config
+diff against that base has SHA-256
+`c47eb753f34951bcd9d98c1112f2fb4e74836c0532a45f876b9d3f99f5b37bb6`.
+The lockfile SHA-256 is
+`d95546bb5684fdb06ba495e5f9b55b294113a8b96132ab8da64a834e8be935ec`.
+Mise pinned Elixir 1.20.5 and Erlang 29.1.2. The fixture used Ash 3.38.1,
+AshPostgres 2.15.2, AshAuthentication 5.0.0-rc.18,
+AshAuthenticationPhoenix 3.0.0-rc.12 and Assent 0.3.2 against DevCore TEST
+PostgreSQL 18.6. Every test ran without `OPENAI_API_KEY`. The fixtures
+generated RSA keys in memory and routed all provider requests through
+private Req.Test stubs.
+
+### Expected and observed
+
+- **Verified callback and activation.** The native strategy produced an
+  authorization-code redirect with state, nonce and S256 PKCE. The
+  fixture token stub checked the code, callback URI and verifier. Assent
+  used discovery and JWKS to verify the signed token. Two concurrent
+  callbacks with different provider emails selected the same local UUID
+  and produced one activation and one routine login. The signed cookie
+  carried the staff UUID, generation and expiry. The explicit ADMIN role
+  passed the admin probe. The reviewer probe required its own role.
+- **Identity and protocol denial.** A wrong or missing tenant or issuer,
+  substituted discovery and token issuer, wrong, empty or missing
+  subject, email-only identity, and unlisted or disabled identity all
+  failed. Caller-supplied maps could not invoke sign-in successfully.
+  State or callback-cookie errors stopped before code exchange. Replay
+  reached the provider stub, where the code was already spent. Invalid
+  nonce, audience, times, signature, key and algorithm, plus discovery,
+  token and JWKS errors, all denied. Assent 0.3.2 raises for two malformed
+  inputs tested here. The fixture catches only the observed Assent
+  state/nonce comparison and audience enumeration errors at the callback.
+- **Local revocation.** Each fresh privileged request and direct Ash
+  probe checked the current staff row. An operator failed both privileged
+  probes even with provider ADMIN and reviewer claims. Disable rejected
+  a previously issued cookie, a stale direct action and a new valid
+  sign-in. It also defeated activation with a candidate read before the
+  disable committed. Demotion revoked the old cookie. Restoring the
+  role left that cookie and the interim operator cookie denied. A fresh
+  login used the restored role. The tests denied absent and tampered
+  cookies and expired or unknown actors on direct Ash calls.
+- **Audit and isolation.** A forced PostgreSQL audit constraint failure
+  rolled activation back and prevented cookie issuance. Ordinary staff
+  could neither write an arbitrary audit event nor invoke the raw
+  transition directly. Two schema prefixes with the same provider
+  subject kept staff and audit rows isolated. ExUnit teardown removed
+  each generated schema. The fixture uses bootstrap-only provisioning.
+  Reactivation, retirement and database outage were outside the local run.
+
+The fixture binds the stored issuer and pairwise subject to the configured
+app registration, with the exact signed tenant checked separately. After
+native validation, the preparation recovers the signed issuer and tenant
+from the token and checks the time claim types. Assent drops the protocol
+claims from user info and its expiry check uses Elixir term ordering.
+Provider email, object ID, groups and roles assign no local privilege.
+A different client ID requires explicit allowlist provisioning for its
+pairwise subjects. The relevant pinned implementation is
+`ash_authentication/lib/ash_authentication/strategies/oauth2/plug.ex`
+(`callback/2` and `action_opts/1`) and
+`assent/lib/assent/strategies/oidc.ex` (`fetch_user/2` and
+`validate_id_token/2`).
+[OIDC Core §3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation),
+[OIDC Discovery §4.3](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationValidation),
+[Entra ID-token claims](https://learn.microsoft.com/en-us/entra/identity-platform/id-token-claims-reference#use-claims-to-reliably-identify-a-user).
+
+### Verification and remaining gates
+
+Local verification completed at approximately 17:55 UTC.
+
+- `mise exec -- mix format --check-formatted`,
+  `mise exec -- mix deps.get --check-locked` and `mise exec -- mix hex.audit`
+  each exited 0. Hex reported no retired or advisory packages.
+- A clean `MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 1. Ash 3.38.1 runs
+  `Ash.Policy.Authorizer.Verifiers.VerifySatSolverImplementation` on both
+  fixture resources. Crux 0.1.5 raises `No SAT solver available` because
+  neither supported optional solver is locked. These strict policy checks
+  evaluated to booleans in the exercised paths, so ordinary ExUnit ran.
+  The dependency scope requires an owner decision before pinning an
+  audited solver and rerunning the clean compile and suite.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+  exited 0 for seeds `0`, `17` and `2026`, with 13 passed each and no skips.
+  The ExUnit timings were 1.2s, 1.2s and 1.1s.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 with 57 passed and five existing F04 disposable tests skipped
+  in 4.5s. A follow-up `pg_namespace` query in the TEST Repo returned zero
+  `vgas_f08_` schemas.
+- `python3 .github/scripts/plan_tests.py` exited 0 and included F08.
+  `git diff --check`, `git diff --cached --check` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --staged --redact` exited 0.
+  Gitleaks found no leaks. GitHub Actions on the candidate remains unverified.
+
+VGAS-9 still needs real tenant, app, consent and callback approval.
+Its smoke test must check actual claims, browser cookie delivery, signing
+keys and revocation with approved test users. A later LiveView integration
+must recheck authorisation for each protected event on an existing socket.
+VGAS-001 must reassess compatible patched stable AshAuthentication and
+adapter pins before staff UI work or live testing. The G036 RC exception
+is feasibility-only.
