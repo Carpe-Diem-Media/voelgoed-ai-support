@@ -277,6 +277,8 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
         missing_fields(:header, ~w(alg kid)) ++
         [
           {"invalid compact JWS", [tokens: put_field("id_token", "abc")]},
+          {"extra compact JWS segment",
+           [tokens: &Map.update!(&1, "id_token", fn token -> token <> ".extra" end)]},
           {"invalid signature encoding", [tokens: alter_jws_signature("!%")]},
           {"empty signature segment", [tokens: alter_jws_signature("")]},
           {"other signing algorithm", [algorithm: "RS512"]},
