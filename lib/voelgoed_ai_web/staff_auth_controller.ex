@@ -17,7 +17,11 @@ defmodule VoelgoedAiWeb.StaffAuthController do
     with true <- StaffSession.pending?(conn),
          {:ok, conn} <- callback_params(conn) do
       scope = %Scope{action: :sign_in_with_entra, target: StaffSession.flow_binding(conn)}
-      conn |> Ash.PlugHelpers.set_actor(scope) |> dispatch(:callback)
+
+      conn
+      |> delete_session(:staff_flow)
+      |> Ash.PlugHelpers.set_actor(scope)
+      |> dispatch(:callback)
     else
       _ -> failure(conn, {:entra, :callback}, :invalid_flow)
     end

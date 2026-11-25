@@ -57,8 +57,13 @@ defmodule VoelgoedAi.Accounts.EntraHTTPAdapter do
       retry: false,
       decode_body: false,
       compressed: false,
-      connect_options: [timeout: 2_000, protocols: [:http1]],
-      finch: [pool_timeout: 1_000, receive_timeout: 3_000, request_timeout: 5_000],
+      finch: [
+        protocols: [:http1],
+        conn_opts: [transport_opts: [timeout: 2_000]],
+        pool_timeout: 1_000,
+        receive_timeout: 3_000,
+        request_timeout: 5_000
+      ],
       into: &collect_bounded/2
     ]
 
@@ -69,7 +74,21 @@ defmodule VoelgoedAi.Accounts.EntraHTTPAdapter do
   end
 
   if @fixture_transport do
-    defp fixture_options(opts), do: Keyword.put(opts, :plug, @fixture_transport)
+    defp fixture_options(opts) do
+      case Process.get({__MODULE__, :loopback_port}) do
+        port when is_integer(port) and port in 1..65_535 ->
+          # Rewrite only after the production endpoint allowlist accepts the request.
+          url =
+            opts[:url]
+            |> URI.parse()
+            |> then(&%{&1 | scheme: "http", host: "127.0.0.1", port: port, authority: nil})
+
+          Keyword.put(opts, :url, URI.to_string(url))
+
+        nil ->
+          Keyword.put(opts, :plug, @fixture_transport)
+      end
+    end
   else
     defp fixture_options(opts), do: opts
   end

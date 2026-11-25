@@ -76,6 +76,13 @@ defmodule VoelgoedAi.StaffFixtures do
     StaffLifecycle.authenticate(resolve(id), %Scope{action: :sign_in_with_entra, target: binding})
   end
 
+  def reject_audit(event, operation) do
+    Process.put({VoelgoedAi.Accounts.StaffLifecycle, :reject_audit}, event)
+    operation.()
+  after
+    Process.delete({VoelgoedAi.Accounts.StaffLifecycle, :reject_audit})
+  end
+
   def resolve(id) do
     {:ok, row} =
       StaffUser

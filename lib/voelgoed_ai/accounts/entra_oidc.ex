@@ -2,11 +2,16 @@ defmodule VoelgoedAi.Accounts.EntraOIDC do
   @moduledoc "Keeps the production OIDC flow on the verified single-tenant transport."
   @behaviour Assent.Strategy
 
-  alias VoelgoedAi.Accounts.{EntraConfig, EntraHTTPAdapter}
+  alias VoelgoedAi.Accounts.{EntraConfig, EntraHTTPAdapter, EntraPendingStates}
 
   @impl true
   def authorize_url(config) do
-    with {:ok, config} <- transport(config), do: Assent.Strategy.OIDC.authorize_url(config)
+    with {:ok, config} <- transport(config),
+         {:ok, %{session_params: %{state: state}} = redirect} <-
+           Assent.Strategy.OIDC.authorize_url(config),
+         :ok <- EntraPendingStates.remember(state) do
+      {:ok, redirect}
+    end
   end
 
   @impl true
@@ -15,7 +20,8 @@ defmodule VoelgoedAi.Accounts.EntraOIDC do
              is_binary(state) and byte_size(state) in 1..256 do
     with {:ok, config} <- transport(config),
          %{state: saved, nonce: nonce, code_verifier: verifier} <- config[:session_params],
-         true <- is_binary(saved) and is_binary(nonce) and is_binary(verifier) do
+         true <- is_binary(saved) and is_binary(nonce) and is_binary(verifier),
+         true <- Plug.Crypto.secure_compare(state, saved) and EntraPendingStates.consume(saved) do
       Assent.Strategy.OIDC.callback(config, Map.take(params, ["code", "state", "error"]))
     else
       _ -> {:error, :invalid_callback}
@@ -104,9 +110,15 @@ defmodule VoelgoedAi.Accounts.EntraOIDC.Claims do
     end
   end
 
-  def prepare(query, _, _), do: deny(query)
+  # Let the action policy deny untrusted actors before any query executes.
+  def prepare(query, _, _), do: query
 
-  defp deny(query), do: Ash.Query.add_error(query, :user_info, "Invalid identity")
+  defp deny(query) do
+    Ash.Query.add_error(
+      query,
+      Ash.Error.Query.InvalidArgument.exception(field: :user_info, message: "Invalid identity")
+    )
+  end
 
   defp valid_times?(%{"exp" => expiry, "iat" => issued_at} = claims) do
     now = System.system_time(:second)

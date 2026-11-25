@@ -62,7 +62,12 @@ grants its own permission, including when someone holds ADMIN.
   Secure, HttpOnly, SameSite=Lax cookie. The local session expires after ten
   minutes. The first GET response from `/staff/session` supplies the session's
   own staff projection and the CSRF token for `POST /staff/sign-out`. Send the
-  token as `x-csrf-token`. Sign-out clears the local cookie.
+  token as `x-csrf-token`. Sign-out only clears the browser cookie. A copied
+  cookie stays valid until its 600-second session expiry unless an administrator
+  bumps its generation by disabling the account or changing its roles.
+- A callback consumes its pending OIDC state before exchange. Pending sign-ins
+  are local to the single application instance and expire after 600 seconds.
+  If that instance restarts, start sign-in again.
 - Staff management checks the administrator's current role, state, expiry,
   registration and generation under lock. A real role change, disable,
   reactivation or retirement increments the target's generation. Subsequent
@@ -90,6 +95,8 @@ grants its own permission, including when someone holds ADMIN.
 [A-011](../spec/VGAS_SPEC_v1.0.0.md#amendment-a-011--vgas-001-authentication-release-candidate-exception)
 permits the exact locked AshAuthentication 5.0.0-rc.18,
 ash_authentication_phoenix 3.0.0-rc.12 and Assent 0.3.2 chain for this slice.
+The amendment replaces the dependency decision document planned at
+`docs/decisions/VGAS-001-auth-dependencies.md`.
 Recheck for a patched, compatible stable chain before VGAS-9 and again before
 production. Run the full authentication suite after any authentication pin
 change. Keep the live checks and production approval separate.

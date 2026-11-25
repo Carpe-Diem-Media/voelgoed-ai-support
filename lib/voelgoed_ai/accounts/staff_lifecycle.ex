@@ -254,10 +254,21 @@ defmodule VoelgoedAi.Accounts.StaffLifecycle do
         correlation_id: Ash.UUIDv7.generate()
       })
 
-    Ash.create(AuditEvent, attrs,
+    Ash.create(AuditEvent, audit_attributes(attrs),
       action: :append,
       actor: %Scope{action: :append, target: {staff.id, event}}
     )
+  end
+
+  if Mix.env() == :test do
+    # Exercise Ash validation before any SQL can abort the owning transaction.
+    defp audit_attributes(%{event: event} = attrs) do
+      if Process.get({__MODULE__, :reject_audit}) == event,
+        do: Map.delete(attrs, :reason_code),
+        else: attrs
+    end
+  else
+    defp audit_attributes(attrs), do: attrs
   end
 
   defp audit_state(nil), do: nil

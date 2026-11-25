@@ -14,7 +14,12 @@ defmodule VoelgoedAi.Governance do
     resource(AuditEvent)
   end
 
-  @doc "Read staff security events for one local staff ID as a current administrator."
+  @doc """
+  Read the first 100 staff security events for one local staff ID as a current administrator.
+
+  Events are ordered by occurrence time and ID. The result is truncated to
+  100 rows, with no indication of whether more events exist.
+  """
   def staff_security_history(session, id) do
     StaffAccess.with_current(session, :admin, fn _admin ->
       AuditEvent
