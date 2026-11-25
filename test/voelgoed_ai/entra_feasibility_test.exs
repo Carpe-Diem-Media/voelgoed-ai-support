@@ -40,6 +40,7 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
 
     cases = [
       wrong_tenant: [claims: %{"tid" => other_tenant}],
+      inexact_tenant: [claims: %{"tid" => String.upcase(EntraProvider.tenant())}],
       missing_tenant: [omit: ["tid"]],
       wrong_issuer: [claims: %{"iss" => other_issuer}],
       missing_issuer: [omit: ["iss"]],
@@ -58,6 +59,39 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
     end
 
     assert EntraStore.staff_snapshot(context.schema) == [[staff.id, "invited", 0]]
+  end
+
+  test "an invitation preserves the pairwise subject byte for byte", context do
+    subject = " staff-subject\t"
+    assert {:ok, staff} = EntraStore.invite(context.schema, subject, [:admin])
+
+    assert_sign_in_denied(EntraProvider.sign_in(context, "staff-subject"))
+    assert EntraStore.staff_snapshot(context.schema) == [[staff.id, "invited", 0]]
+    assert [%{action: :provision}] = audit(context.schema)
+    assert {:ok, %{subject: ^subject}} = EntraStore.member(context.schema, staff.id)
+
+    assert EntraProvider.sign_in(context, subject).status == 204
+  end
+
+  test "provisioning does not trim issuer or tenant input" do
+    issuer = EntraProvider.issuer() <> " "
+    tenant = String.upcase(EntraProvider.tenant())
+
+    input = %{
+      issuer: issuer,
+      subject: "staff-subject",
+      tenant_id: tenant,
+      roles: []
+    }
+
+    changeset = Ash.Changeset.for_create(EntraStaff, :provision, input)
+    assert changeset.valid?
+    assert Ash.Changeset.get_attribute(changeset, :issuer) == issuer
+    assert Ash.Changeset.get_attribute(changeset, :tenant_id) == tenant
+
+    for attrs <- [%{tenant_id: input.tenant_id <> " "}, %{issuer: ""}, %{subject: ""}] do
+      refute Ash.Changeset.for_create(EntraStaff, :provision, Map.merge(input, attrs)).valid?
+    end
   end
 
   test "an inexact discovery issuer prevents the authorization redirect", context do
@@ -102,6 +136,48 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
         ] do
       assert_discovery_denied(context, document)
     end
+  end
+
+  test "discovery denies malformed or insecure endpoints in either phase", context do
+    metadata = EntraProvider.metadata()
+
+    for field <- ~w(authorization_endpoint token_endpoint jwks_uri),
+        endpoint <- [
+          42,
+          "/relative",
+          "//entra.example.test/endpoint",
+          "http://entra.example.test/endpoint",
+          "https:/endpoint",
+          "https://:443/endpoint",
+          "https://@entra.example.test/endpoint",
+          "https://entra.example.test/endpoint#",
+          "https://entra.example.test:65536/endpoint",
+          "https://entra.example.test:bad/endpoint",
+          "https://entra.example.test/endpoint name",
+          "https://entra.example.test/endpoint%GG"
+        ] do
+      assert_discovery_denied(context, Map.replace!(metadata, field, endpoint))
+    end
+  end
+
+  test "discovery denies malformed or unsupported token authentication methods", context do
+    metadata = EntraProvider.metadata()
+
+    for methods <- [12, "none", nil, [], ["none", 12], ["client_secret_basic"]] do
+      assert_discovery_denied(
+        context,
+        Map.replace!(metadata, "token_endpoint_auth_methods_supported", methods)
+      )
+    end
+  end
+
+  test "the callback accepts discovery without optional token authentication methods", context do
+    assert {:ok, _staff} = EntraStore.invite(context.schema, "staff-subject", [:admin])
+    metadata = Map.delete(EntraProvider.metadata(), "token_endpoint_auth_methods_supported")
+    flow = EntraProvider.start_sign_in(context, "staff-subject", callback_metadata: metadata)
+
+    assert EntraProvider.callback(flow).status == 204
+    assert :atomics.get(flow.exchange_count, 1) == 1
   end
 
   test "valid but unlisted identity is denied", context do

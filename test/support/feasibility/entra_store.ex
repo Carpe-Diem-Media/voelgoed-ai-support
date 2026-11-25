@@ -21,7 +21,7 @@ defmodule VoelgoedAi.Feasibility.EntraStore do
           id uuid PRIMARY KEY,
           issuer text NOT NULL,
           subject text NOT NULL,
-          tenant_id uuid NOT NULL,
+          tenant_id text NOT NULL,
           status text NOT NULL CHECK (status IN ('invited', 'active', 'disabled')),
           roles text[] NOT NULL CHECK (
             roles <@ ARRAY['admin', 'knowledge_editor', 'knowledge_reviewer', 'support_operator']
@@ -244,7 +244,11 @@ defmodule VoelgoedAi.Feasibility.EntraStaff do
         base_url(VoelgoedAi.Feasibility.EntraProvider.issuer())
         client_id(VoelgoedAi.Feasibility.EntraProvider.client_id())
         redirect_uri(VoelgoedAi.Feasibility.EntraProvider.redirect_uri())
-        client_authentication_method("none")
+
+        client_authentication_method(
+          VoelgoedAi.Feasibility.EntraProvider.client_authentication_method()
+        )
+
         registration_enabled?(false)
         identity_resource(false)
         warn_on_missing_identity_resource?(false)
@@ -257,9 +261,27 @@ defmodule VoelgoedAi.Feasibility.EntraStaff do
 
   attributes do
     uuid_v7_primary_key(:id)
-    attribute(:issuer, :string, allow_nil?: false)
-    attribute(:subject, :string, allow_nil?: false, constraints: [max_length: 255])
-    attribute(:tenant_id, :uuid, allow_nil?: false)
+
+    attribute(:issuer, :string,
+      allow_nil?: false,
+      constraints: [trim?: false, allow_empty?: false]
+    )
+
+    attribute(:subject, :string,
+      allow_nil?: false,
+      constraints: [trim?: false, allow_empty?: false, max_length: 255]
+    )
+
+    # Ash's UUID cast trims and lowercases text. Keep the tenant claim's exact
+    # text while still requiring the hyphenated UUID shape.
+    attribute(:tenant_id, :string,
+      allow_nil?: false,
+      constraints: [
+        trim?: false,
+        allow_empty?: false,
+        match: ~r/\A[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\z/i
+      ]
+    )
 
     attribute(:status, :atom,
       allow_nil?: false,

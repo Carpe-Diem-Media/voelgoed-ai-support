@@ -24,7 +24,8 @@ defmodule VoelgoedAi.Feasibility.EntraDiscoveryAdapter do
   defp validate_discovery({:ok, %HTTPResponse{status: 200, body: metadata}} = response, issuer) do
     with %{"issuer" => discovered_issuer} <- metadata,
          true <- discovered_issuer === issuer,
-         true <- Enum.all?(@required_endpoints, &endpoint_present?(metadata[&1])) do
+         true <- Enum.all?(@required_endpoints, &valid_endpoint?(metadata[&1])),
+         true <- valid_auth_methods?(metadata) do
       response
     else
       _ -> {:error, :invalid_discovery_metadata}
@@ -33,7 +34,26 @@ defmodule VoelgoedAi.Feasibility.EntraDiscoveryAdapter do
 
   defp validate_discovery(response, _issuer), do: response
 
-  defp endpoint_present?(value), do: is_binary(value) and String.trim(value) != ""
+  defp valid_endpoint?(value) when is_binary(value) do
+    case URI.new(value) do
+      {:ok, %URI{scheme: "https", host: host, userinfo: nil, fragment: nil, port: port}}
+      when is_binary(host) and host != "" and port in 1..65_535 ->
+        # URI.new/1 accepts malformed percent escapes.
+        not Regex.match?(~r/%(?![0-9a-fA-F]{2})/, value)
+
+      _ ->
+        false
+    end
+  end
+
+  defp valid_endpoint?(_value), do: false
+
+  defp valid_auth_methods?(%{"token_endpoint_auth_methods_supported" => methods}) do
+    is_list(methods) and Enum.all?(methods, &is_binary/1) and
+      EntraProvider.client_authentication_method() in methods
+  end
+
+  defp valid_auth_methods?(_metadata), do: true
 end
 
 defmodule VoelgoedAi.Feasibility.EntraClaims do

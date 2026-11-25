@@ -9,12 +9,14 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
   @tenant "78d3ded7-c72b-4172-9d1c-c4179aa2d6ab"
   @issuer "https://#{@host}/#{@tenant}/v2.0"
   @client_id "vgas-f08"
+  @client_authentication_method "none"
   @redirect "https://support.example.test/staff/entra/callback"
   @authorize "https://#{@host}/authorize"
 
   def tenant, do: @tenant
   def issuer, do: @issuer
   def client_id, do: @client_id
+  def client_authentication_method, do: @client_authentication_method
   def redirect_uri, do: @redirect
 
   def sign_in(context, subject, opts \\ []) do
@@ -109,7 +111,7 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
       "authorization_endpoint" => @authorize,
       "token_endpoint" => "https://#{@host}/token",
       "jwks_uri" => "https://#{@host}/keys",
-      "token_endpoint_auth_methods_supported" => ["none"]
+      "token_endpoint_auth_methods_supported" => [@client_authentication_method]
     }
   end
 
