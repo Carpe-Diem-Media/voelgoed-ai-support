@@ -74,6 +74,7 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
         assert Base.url_encode64(:crypto.hash(:sha256, verifier), padding: false) == challenge
 
         if opts[:raise_token_response], do: raise("synthetic adapter detail")
+        if opts[:fail_fixture_assertion], do: flunk("synthetic fixture assertion")
 
         if attempt == 1 and opts[:unavailable] != :token do
           json(conn, tokens)

@@ -267,11 +267,12 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
   end
 
   test "malformed token responses and protected headers deny the callback", context do
-    fields = ~w(id_token access_token token_type refresh_token expires_in scope)
+    text_fields = ~w(id_token token_type expires_in scope)
 
     cases =
       malformed_documents(:tokens) ++
-        field_mutations(:tokens, fields) ++
+        field_mutations(:tokens, text_fields) ++
+        compact_token_mutations(~w(access_token refresh_token)) ++
         missing_fields(:tokens, ~w(id_token access_token)) ++
         malformed_documents(:header) ++
         field_mutations(:header, ~w(alg kid typ cty b64 crit)) ++
@@ -337,6 +338,54 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
       :jwks,
       cases ++ key_members ++ missing_key_members ++ additional_cases
     )
+  end
+
+  test "weak, oversized or nonstandard RSA keys deny the callback", context do
+    zero_top_bit =
+      Base.url_encode64(<<0, :crypto.strong_rand_bytes(255)::binary>>, padding: false)
+
+    short_modulus = Base.url_encode64(<<1::1, 0::1023>>, padding: false)
+    oversized_modulus = Base.url_encode64(<<1::1, 0::4103>>, padding: false)
+    weak = JOSE.JWK.generate_key({:rsa, 1024})
+    {_, weak_public} = JOSE.JWK.to_public_map(weak)
+    weak_jwks = %{"keys" => [Map.put(weak_public, "kid", "fixture-key")]}
+
+    assert_malformed_responses(context, :jwks, [
+      {"modulus without its top bit", [jwks: alter_key("n", zero_top_bit)]},
+      {"1024-bit modulus", [jwks: alter_key("n", short_modulus)]},
+      {"4104-bit modulus", [jwks: alter_key("n", oversized_modulus)]},
+      {"exponent 3", [jwks: alter_key("e", "Aw")]},
+      {"oversized exponent", [jwks: alter_key("e", String.duplicate("A", 4_000))]},
+      {"signed by a published 1024-bit key", [signing_key: weak, jwks: fn _ -> weak_jwks end]}
+    ])
+  end
+
+  test "access and refresh tokens up to the compact-token bound are accepted", context do
+    assert {:ok, _staff} = EntraStore.invite(context.schema, "staff-subject", [])
+
+    flow =
+      EntraProvider.start_sign_in(context, "staff-subject",
+        tokens:
+          &Map.merge(&1, %{
+            "access_token" => String.duplicate("a", 32_768),
+            "refresh_token" => String.duplicate("r", 5_000)
+          })
+      )
+
+    assert EntraProvider.callback(flow).status == 204
+  end
+
+  test "a failed fixture assertion inside the provider stub is not rescued as a denial",
+       context do
+    assert {:ok, _staff} = EntraStore.invite(context.schema, "staff-subject", [:admin])
+
+    # Plug.Router wraps the re-raised assertion; the original must survive.
+    error =
+      assert_raise Plug.Conn.WrapperError, fn ->
+        EntraProvider.sign_in(context, "staff-subject", fail_fixture_assertion: true)
+      end
+
+    assert %ExUnit.AssertionError{message: "synthetic fixture assertion"} = error.reason
   end
 
   test "the callback accepts supported optional provider fields", context do
@@ -693,6 +742,13 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
     for field <- fields,
         {shape, value} <- malformed_values(),
         do: {"#{option}.#{field}/#{shape}", [{option, put_field(field, value)}]}
+  end
+
+  defp compact_token_mutations(fields) do
+    for field <- fields,
+        {shape, value} <- malformed_values(),
+        value = if(shape == "oversized", do: String.duplicate("a", 32_769), else: value),
+        do: {"tokens.#{field}/#{shape}", [tokens: put_field(field, value)]}
   end
 
   defp missing_fields(option, fields) do

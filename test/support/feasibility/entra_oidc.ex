@@ -20,9 +20,9 @@ defmodule VoelgoedAi.Feasibility.EntraOIDCResponse do
   @max_text_bytes 4_096
 
   def valid_tokens?(%{"id_token" => token, "access_token" => access_token} = tokens) do
-    valid_id_token?(token) and text?(access_token) and
+    valid_id_token?(token) and compact_token?(access_token) and
       optional?(tokens, "token_type", &text?/1) and
-      optional?(tokens, "refresh_token", &text?/1) and
+      optional?(tokens, "refresh_token", &compact_token?/1) and
       optional?(tokens, "expires_in", &is_integer/1) and
       optional?(tokens, "scope", &text?/1)
   end
@@ -80,8 +80,10 @@ defmodule VoelgoedAi.Feasibility.EntraOIDCResponse do
   defp valid_audience?([_ | _] = audience), do: Enum.all?(audience, &text?/1)
   defp valid_audience?(audience), do: text?(audience)
 
-  defp valid_key?(%{"kty" => "RSA", "kid" => kid, "n" => modulus, "e" => exponent} = key) do
-    text?(kid) and base64url?(modulus) and base64url?(exponent) and
+  # Entra publishes 2048-bit RSA keys with exponent 65537 ("AQAB"). Accept
+  # 2048-4096 bit moduli so weak or oversized keys never reach Assent.
+  defp valid_key?(%{"kty" => "RSA", "kid" => kid, "n" => modulus, "e" => "AQAB"} = key) do
+    text?(kid) and rsa_modulus?(modulus) and
       optional?(key, "use", &text?/1) and optional?(key, "alg", &text?/1) and
       not Map.has_key?(key, "d")
   end
@@ -91,6 +93,19 @@ defmodule VoelgoedAi.Feasibility.EntraOIDCResponse do
   defp base64url?(value) do
     text?(value) and match?({:ok, <<_, _::binary>>}, Base.url_decode64(value, padding: false))
   end
+
+  defp rsa_modulus?(value) do
+    text?(value) and
+      case Base.url_decode64(value, padding: false) do
+        {:ok, <<1::1, _::bitstring>> = bytes} -> byte_size(bytes) in 256..512
+        _ -> false
+      end
+  end
+
+  # Access and refresh tokens are opaque here but can be JWTs that grow with
+  # claims, so they share the compact-token bound rather than the text bound.
+  defp compact_token?(value),
+    do: is_binary(value) and byte_size(value) in 1..@max_token_bytes
 
   defp text?(value), do: is_binary(value) and byte_size(value) in 1..@max_text_bytes
 
@@ -120,9 +135,14 @@ defmodule VoelgoedAi.Feasibility.EntraOIDCCallback do
   end
 
   # Keep both dependency calls separate from policy and activation code.
+  # Fixture assertions raised inside the Req stub must still fail the test
+  # instead of looking like an ordinary denial.
   defp decode(dependency_call) do
     dependency_call.()
   rescue
+    error in ExUnit.AssertionError ->
+      reraise error, __STACKTRACE__
+
     _ ->
       Logger.warning("entra_oidc_callback_exception")
       {:error, :entra_oidc_callback_exception}
