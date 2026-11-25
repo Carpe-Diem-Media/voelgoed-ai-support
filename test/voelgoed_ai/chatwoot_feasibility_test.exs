@@ -215,6 +215,11 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
       %{"event" => "unknown"},
       %{"message_type" => "activity"},
       %{"message_type" => "outgoing", "sender" => %{"type" => "agent_bot", "id" => 5}},
+      %{
+        "message_type" => "outgoing",
+        "private" => true,
+        "sender" => %{"type" => "user", "id" => 6}
+      },
       %{"private" => true},
       %{"attachments" => [%{"id" => 1}]},
       %{"sender" => %{"id" => 9, "account" => %{"id" => 1}}},
@@ -225,9 +230,9 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
       assert submit(ctx, body: payload(Map.put(changes, "id", id))).status == 204
     end
 
-    assert counts(ctx) == [7, 0, 0, 0]
+    assert counts(ctx) == [8, 0, 0, 0]
 
-    assert %{rows: [["ignored", 7]]} =
+    assert %{rows: [["ignored", 8]]} =
              sql!(ctx, "SELECT outcome, count(*) FROM @schema.inbound_events GROUP BY outcome")
   end
 
@@ -245,6 +250,8 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
              ChatwootStore.delivery(ctx.prefix, id)
 
     assert :ok == ChatwootDelivery.deliver(ctx, id)
+    assert drain(ctx, :f06_recovery, with_scheduled: DateTime.add(@now, 5)).success == 1
+    assert %{state: "sent", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
     assert_fake_calls(ctx, [:get, :get, :reply])
   end
 
@@ -267,7 +274,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
 
     assert submit(ctx, body: payload(%{"id" => 102})).status == 204
     assert drain(ctx, :f06_ingress).success == 1
-    assert counts(ctx) == [2, 3, 1, 1]
+    assert counts(ctx) == [2, 4, 1, 1]
     assert %{state: "human_active", epoch: 3} = session(ctx)
     assert_fake_calls(ctx, [:get, :get, :handoff, :get, :get])
   end
@@ -419,7 +426,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert_fake_calls(ctx, [:get, :get, :get, :get])
   end
 
-  test "a human outbound hint checks current ownership and fences pending work", ctx do
+  test "a public human reply fences pending work and reconciles current ownership", ctx do
     ctx = fake(ctx, [get(pending()), get(pending(%{"status" => "open"}))])
     id = prepare(ctx)
 
@@ -429,12 +436,49 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
       "sender" => %{"type" => "user", "id" => 6}
     }
 
+    rollback = Map.put(ctx, :after_receipt_enqueue, fn -> :rollback end)
+    assert submit(rollback, body: payload(event)).status == 500
+    assert %{state: "pending", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+    assert %{state: "bot_active"} = session(ctx)
+
     assert submit(ctx, body: payload(event)).status == 204
+    assert %{state: "cancelled", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
     assert drain(ctx, :f06_ingress).success == 1
     assert %{state: "human_active"} = session(ctx)
     assert drain(ctx, :f06_delivery).success == 1
     assert %{state: "cancelled", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
     assert_fake_calls(ctx, [:get, :get])
+  end
+
+  test "a signed public human reply inhibits before its job runs, despite bot ownership reads",
+       ctx do
+    ctx =
+      fake(ctx, [
+        get(pending()),
+        get(pending()),
+        get(pending()),
+        reply(response(200, reply_body()))
+      ])
+
+    outbound =
+      payload(%{
+        "id" => 100,
+        "message_type" => "outgoing",
+        "sender" => %{"type" => "user", "id" => 6}
+      })
+
+    assert submit(ctx, body: outbound).status == 204
+    inhibited_at_ack = session(ctx)
+    assert drain(ctx, :f06_ingress).success == 1
+    assert submit(ctx).status == 204
+    assert drain(ctx, :f06_ingress).success == 1
+    drain(ctx, :f06_delivery)
+
+    {_remaining, calls} = Agent.get(ctx.fake_agent, & &1)
+    assert Enum.reverse(calls) == [:get, :get]
+    assert %{state: "human_active", epoch: 1} = inhibited_at_ack
+    assert %{state: "human_active", epoch: 1} = session(ctx)
+    assert counts(ctx) == [2, 2, 1, 0]
   end
 
   for replay? <- [false, true] do
@@ -487,11 +531,13 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
 
   test "at the handoff recovery deadline an unsent intent fails and stays inhibited", ctx do
     later_input = pending(%{"last_non_activity_message" => %{"id" => 102}})
-    ctx = fake(%{ctx | decision: "handoff"}, [get(pending()), get(pending()), get(later_input)])
+    timeout = {:get, @path, write_result(:timeout)}
+    ctx = fake(%{ctx | decision: "handoff"}, [get(pending()), timeout, get(later_input)])
     id = prepare(ctx)
     expired = %{ctx | now: fn -> DateTime.add(@now, 300) end}
 
-    assert drain(expired, :f06_delivery).success == 1
+    assert drain(ctx, :f06_delivery).failure == 1
+    assert drain(expired, :f06_delivery, with_scheduled: true).success == 1
 
     assert %{
              state: "failed",
@@ -543,6 +589,45 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert %{state: "unknown", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
     assert :ok = ChatwootDelivery.deliver(ctx, id)
     assert_fake_calls(ctx, [:get, :get, :get, :handoff])
+  end
+
+  test "closing the public reply window after admission still permits an explicit handoff", ctx do
+    blocked = pending(%{"can_reply" => false})
+
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(blocked),
+        handoff(response(200, %{"payload" => %{"current_status" => "open"}})),
+        get(unassigned("open"))
+      ])
+
+    assert submit(ctx).status == 204
+    assert drain(ctx, :f06_ingress).success == 1
+    assert drain(ctx, :f06_delivery).success == 1
+    assert %{state: "sent", attempts: 1} = ChatwootStore.delivery(ctx.prefix, intent_id(ctx))
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  for status <- [429, 503] do
+    test "handoff retries a pre-write HTTP #{status} inside its own deadline", ctx do
+      ctx =
+        fake(%{ctx | decision: "handoff"}, [
+          get(pending()),
+          {:get, @path, response(unquote(status), %{})},
+          get(pending()),
+          handoff(response(200, %{"payload" => %{"current_status" => "open"}})),
+          get(unassigned("open"))
+        ])
+
+      id = prepare(ctx)
+      advanced = %{ctx | now: fn -> DateTime.add(@now, 46) end}
+      assert drain(advanced, :f06_delivery).failure == 1
+      assert %{state: "pending", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+      assert drain(advanced, :f06_delivery, with_scheduled: true).success == 1
+      assert %{state: "sent", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+      assert_fake_calls(ctx, [:get, :get, :get, :handoff, :get])
+    end
   end
 
   test "unknown handoff assignment fails closed without issuing a status POST", ctx do
@@ -658,7 +743,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     end
   end
 
-  test "after a write-side process dies, claim expiry and replays preserve UNKNOWN without resending",
+  test "a lost executing Oban reply is rescued and its expired claim becomes UNKNOWN without resending",
        ctx do
     parent = self()
 
@@ -685,13 +770,26 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
       ])
 
     id = prepare(ctx)
-    {pid, ref} = spawn_monitor(fn -> ChatwootDelivery.deliver(ctx, id) end)
+    {pid, ref} = spawn_monitor(fn -> drain(ctx, :f06_delivery) end)
     assert_receive :synthetic_remote_commit, 5_000
     assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 5_000
     assert %{state: "sending"} = ChatwootStore.delivery(ctx.prefix, id)
 
+    assert %{rows: [[job_id, "executing", 1, 1]]} =
+             sql!(
+               ctx,
+               "SELECT id, state, attempt, max_attempts FROM @schema.oban_jobs WHERE queue = 'f06_delivery'"
+             )
+
+    assert {:ok, [%{id: ^job_id, state: "discarded"}]} =
+             Oban.Engine.rescue_jobs(Oban.config(ctx.oban), Oban.Job, rescue_after: 0)
+
+    assert drain(ctx, :f06_recovery, with_scheduled: DateTime.add(@now, 4)).success == 0
+    assert %{state: "sending"} = ChatwootStore.delivery(ctx.prefix, id)
+
     advanced = %{ctx | now: fn -> DateTime.add(@now, 5) end}
-    assert drain(advanced, :f06_delivery).success == 1
+    assert drain(advanced, :f06_delivery).success == 0
+    drain(advanced, :f06_recovery, with_scheduled: advanced.now.())
 
     assert %{state: "unknown", attempts: 1, reason: "claim_expired"} =
              ChatwootStore.delivery(ctx.prefix, id)
@@ -702,7 +800,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     assert submit(ctx, body: payload(%{"id" => 102})).status == 204
     assert drain(advanced, :f06_ingress).success == 1
     assert %{state: "unknown", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
-    assert counts(ctx) == [2, 3, 1, 1]
+    assert counts(ctx) == [2, 4, 1, 1]
     assert_fake_calls(ctx, [:get, :get, :reply, :get, :get, :get])
   end
 
@@ -859,16 +957,19 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
   end
 
   defp session(ctx, conversation \\ 3) do
-    %{rows: [[state, epoch, active]]} =
+    result =
       sql!(
         ctx,
-        """
-        SELECT state, epoch, active_event FROM @schema.sessions WHERE conversation_id = $1
-        """,
-        [conversation]
+        "SELECT state, epoch, active_event FROM @schema.sessions WHERE conversation_id = $1",
+        [
+          conversation
+        ]
       )
 
-    %{state: state, epoch: epoch, active_event: active}
+    case result do
+      %{rows: [[state, epoch, active]]} -> %{state: state, epoch: epoch, active_event: active}
+      %{rows: []} -> nil
+    end
   end
 
   defp sql!(ctx, statement, params \\ []) do

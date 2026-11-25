@@ -16,13 +16,28 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
 
   def decide(ctx, event_id) do
     event = Store.event(ctx.prefix, event_id)
-    Store.decide(ctx, event_id, event, ownership(ctx, event, event.purpose == "input"))
+
+    operation =
+      case {event.purpose, ctx.decision} do
+        {"input", "reply"} -> :reply
+        {"input", "handoff"} -> :handoff_input
+        _ -> :observe
+      end
+
+    Store.decide(ctx, event_id, event, ownership(ctx, event, operation))
   end
 
   def deliver(ctx, delivery_id, retry_preflight? \\ false) do
     case Store.delivery(ctx.prefix, delivery_id) do
       %{state: "pending"} = delivery ->
-        ownership = ownership(ctx, delivery, delivery.kind == "reply")
+        operation = if delivery.kind == "reply", do: :reply, else: :handoff
+
+        ownership =
+          if operation == :handoff and not DateTime.before?(ctx.now.(), delivery.deadline) do
+            :unknown
+          else
+            ownership(ctx, delivery, operation)
+          end
 
         case Store.claim(ctx, delivery, ownership, retry_preflight?) do
           {:ok, {:send, generation}} ->
@@ -37,10 +52,6 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
             :ok
         end
 
-      %{state: "sending"} = delivery ->
-        Store.recover(ctx, delivery)
-        :ok
-
       _ ->
         :ok
     end
@@ -48,10 +59,10 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
 
   def reconcile(ctx, delivery_id) do
     delivery = Store.delivery(ctx.prefix, delivery_id)
-    Store.reconcile(ctx, delivery, ownership(ctx, delivery, false))
+    Store.reconcile(ctx, delivery, ownership(ctx, delivery, :observe))
   end
 
-  defp ownership(ctx, scope, check_message?) do
+  defp ownership(ctx, scope, operation) do
     case request(ctx, scope, :get, "", []) do
       {:ok,
        %{
@@ -66,7 +77,10 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
        }}
       when account === scope.account_id and inbox === scope.inbox_id and
              conversation === scope.conversation_id and contact === scope.contact_id ->
-        classify(ctx, scope, body, check_message?)
+        classify(ctx, scope, body, operation)
+
+      {:ok, %{status: status}} when status == 429 or status in 500..599 ->
+        :transient_read_error
 
       {:error, %Req.TransportError{}} ->
         :transient_read_error
@@ -76,14 +90,14 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     end
   end
 
-  defp classify(_ctx, _scope, %{"status" => "resolved"}, _check_message?), do: :closed
-  defp classify(_ctx, _scope, %{"status" => "open"}, _check_message?), do: :human
+  defp classify(_ctx, _scope, %{"status" => "resolved"}, _operation), do: :closed
+  defp classify(_ctx, _scope, %{"status" => "open"}, _operation), do: :human
 
   defp classify(
          _ctx,
          _scope,
          %{"meta" => %{"assignee_type" => "User", "assignee" => %{"id" => id}}},
-         _check_message?
+         _operation
        )
        when is_integer(id) and id > 0, do: :human
 
@@ -92,20 +106,20 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
          scope,
          %{
            "status" => "pending",
-           "can_reply" => true,
            "meta" => %{"assignee_type" => "AgentBot", "assignee" => %{"id" => bot}}
          } = body,
-         check_message?
+         operation
        )
-       when bot === ctx.bot_id do
+       when bot === ctx.bot_id and
+              (operation != :reply or :erlang.map_get("can_reply", body) === true) do
     case body["last_non_activity_message"] do
       %{"id" => id} when id === scope.message_id -> :bot
-      _ when not check_message? -> :bot
+      _ when operation in [:handoff, :observe] -> :bot
       _ -> :stale
     end
   end
 
-  defp classify(_ctx, _scope, _body, _check_message?), do: :unknown
+  defp classify(_ctx, _scope, _body, _operation), do: :unknown
 
   defp write(ctx, %{kind: "reply"} = delivery) do
     result =
@@ -142,7 +156,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     case result do
       {:ok, %{status: status, body: %{"payload" => %{"current_status" => "open"}}}}
       when status in 200..299 ->
-        if ownership(ctx, delivery, false) == :human do
+        if ownership(ctx, delivery, :observe) == :human do
           {"sent", "handoff_confirmed", nil}
         else
           {"unknown", "handoff_unconfirmed", nil}
@@ -176,6 +190,25 @@ defmodule VoelgoedAi.Feasibility.ChatwootDelivery do
     )
     |> Req.Request.put_private(:f06_adapter, adapter)
     |> Req.request()
+  end
+end
+
+defmodule VoelgoedAi.Feasibility.ChatwootRecoveryJob do
+  @moduledoc false
+  use Oban.Worker, queue: :f06_recovery, max_attempts: 3
+  alias VoelgoedAi.Feasibility.ChatwootDelivery
+  alias VoelgoedAi.Feasibility.ChatwootStore, as: Store
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{args: %{"delivery_id" => id}, conf: conf}) do
+    ctx = Process.get({ChatwootDelivery, conf.prefix})
+    delivery = Store.delivery(ctx.prefix, id)
+
+    case Store.recover(ctx, delivery) do
+      {:ok, {:snooze, seconds}} -> {:snooze, seconds}
+      {:ok, _} -> :ok
+      {:error, _} -> {:error, :recovery_rolled_back}
+    end
   end
 end
 

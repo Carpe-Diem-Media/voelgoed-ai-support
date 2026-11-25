@@ -146,7 +146,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootIngress do
          },
          %{event_type: "message_created"}
        )
-       when is_integer(id) and id in 1..@max_id, do: "observe"
+       when is_integer(id) and id in 1..@max_id, do: "human_reply"
 
   defp purpose(_payload, _event), do: "ignore"
 end

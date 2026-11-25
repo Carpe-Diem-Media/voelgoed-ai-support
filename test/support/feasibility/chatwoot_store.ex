@@ -17,7 +17,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootMigration do
       message_id bigint CHECK (message_id > 0),
       event_type text NOT NULL,
       outcome text NOT NULL CHECK (outcome IN ('dispatched','ignored')),
-      purpose text NOT NULL CHECK (purpose IN ('input','observe','ignore')),
+      purpose text NOT NULL CHECK (purpose IN ('input','human_reply','ignore')),
       received_at timestamptz NOT NULL,
       processed boolean NOT NULL DEFAULT false,
       decision text,
@@ -73,10 +73,17 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
   Receipt insertion admits one job. Session row locks serialize decision, claim
   and settlement. Request adapters run after the corresponding transaction commits.
   """
-  alias VoelgoedAi.Feasibility.{ChatwootDeliveryJob, ChatwootIngressJob, ChatwootMigration}
+  alias VoelgoedAi.Feasibility.{
+    ChatwootDeliveryJob,
+    ChatwootIngressJob,
+    ChatwootMigration,
+    ChatwootRecoveryJob
+  }
+
   alias VoelgoedAi.Repo
 
   @reply_deadline_seconds 45
+  @claim_lease_microseconds 5_000_000
   # G013 gives operational handoff its own five-minute recovery window and three
   # safe attempts. This budget never authorizes a second POST.
   @handoff_recovery_seconds 300
@@ -152,6 +159,12 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
         )
 
       if count == 1 and outcome == "dispatched" do
+        if purpose == "human_reply" do
+          # CE can leave a conversation pending after a public human reply.
+          # Commit the inhibit with the receipt, before either job queue can act on it.
+          observe(ctx, session_for(p, event, :human), :human)
+        end
+
         enqueue!(oban, ChatwootIngressJob.new(%{"event_id" => id}))
         checkpoint(ctx, :after_receipt_enqueue)
       end
@@ -239,7 +252,7 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
     end)
   end
 
-  def claim(%{prefix: p} = ctx, delivery, ownership, retry_preflight?) do
+  def claim(%{prefix: p, oban: oban} = ctx, delivery, ownership, retry_preflight?) do
     Repo.transaction(fn ->
       session = lock_session(p, delivery.session_id)
       current = lock_delivery(p, delivery.id)
@@ -276,6 +289,8 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
             finish(ctx, current, "failed", "handoff_ownership_unverified", nil)
 
           ownership == :bot and DateTime.before?(ctx.now.(), current.deadline) ->
+            claimed_at = ctx.now.()
+
             %{rows: [[generation]]} =
               query!(
                 """
@@ -283,8 +298,16 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
                 SET state = 'sending', generation = generation + 1, attempts = 1, claimed_at = $2
                 WHERE id = $1 RETURNING generation
                 """,
-                [current.id, ctx.now.()]
+                [current.id, claimed_at]
               )
+
+            # Persist recovery with the claim since Oban may discard the lost write job.
+            enqueue!(
+              oban,
+              ChatwootRecoveryJob.new(%{"delivery_id" => Ecto.UUID.load!(current.id)},
+                scheduled_at: claim_expires_at(claimed_at)
+              )
+            )
 
             {:send, generation}
 
@@ -322,12 +345,21 @@ defmodule VoelgoedAi.Feasibility.ChatwootStore do
       lock_session(p, delivery.session_id)
       current = lock_delivery(p, delivery.id)
 
-      if current.state == "sending" and
-           DateTime.compare(ctx.now.(), DateTime.add(current.claimed_at, 5)) != :lt do
-        finish(ctx, current, "unknown", "claim_expired", nil)
+      if current.state == "sending" and current.generation == delivery.generation do
+        expires_at = claim_expires_at(current.claimed_at)
+        now = ctx.now.()
+
+        if DateTime.before?(now, expires_at) do
+          {:snooze, DateTime.diff(expires_at, now) + 1}
+        else
+          finish(ctx, current, "unknown", "claim_expired", nil)
+        end
       end
     end)
   end
+
+  defp claim_expires_at(claimed_at),
+    do: DateTime.add(claimed_at, @claim_lease_microseconds, :microsecond)
 
   def reconcile(%{prefix: p} = ctx, delivery, ownership) do
     Repo.transaction(fn ->
