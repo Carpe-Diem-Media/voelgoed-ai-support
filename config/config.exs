@@ -2,7 +2,12 @@ import Config
 
 config :voelgoed_ai,
   ecto_repos: [VoelgoedAi.Repo],
-  ash_domains: [VoelgoedAi.Accounts, VoelgoedAi.Governance]
+  ash_domains: [
+    VoelgoedAi.Accounts,
+    VoelgoedAi.Governance,
+    VoelgoedAi.Intelligence,
+    VoelgoedAi.Support
+  ]
 
 config :voelgoed_ai, VoelgoedAi.Repo, log: false
 

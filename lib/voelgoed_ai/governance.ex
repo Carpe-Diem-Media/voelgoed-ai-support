@@ -12,6 +12,7 @@ defmodule VoelgoedAi.Governance do
 
   resources do
     resource(AuditEvent)
+    resource(VoelgoedAi.Governance.AutomationControl)
   end
 
   @doc """
