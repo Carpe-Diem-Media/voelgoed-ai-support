@@ -10,6 +10,7 @@ permissions:
 
 env:
   MIX_ENV: test
+  VGAS_VERIFY_PGVECTOR: "true"
 
 jobs:
   plan:
@@ -115,20 +116,131 @@ jobs:
           if-no-files-found: error
           retention-days: 21
 
+  snapshots:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # config/runtime.exs requires the TEST connection settings at boot.
+    # Snapshot comparison opens no connection, so these point at an unused
+    # port and the password is a non-secret placeholder.
+    env:
+      TEST_DATABASE_HOST: 127.0.0.1
+      TEST_DATABASE_PORT: '1'
+      TEST_DATABASE_USERNAME: vgas_snapshot_check
+      TEST_DATABASE_NAME: vgas_snapshot_check
+      TEST_DATABASE_PASSWORD: not-a-credential
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/beam
+      - run: mix ash.codegen --check
+
+  migrations:
+    name: PostgreSQL migration ${{ matrix.lane }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [fresh, upgrade]
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.4-pg18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_HOST: 127.0.0.1
+      TEST_DATABASE_PORT: '55433'
+      TEST_DATABASE_USERNAME: vgas_test
+      TEST_DATABASE_NAME: vgas_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/beam
+      - name: Create isolated TEST database
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          docker exec -i "$POSTGRES_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U postgres <<SQL
+          CREATE ROLE vgas_test LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$password';
+          CREATE DATABASE vgas_test OWNER vgas_test;
+          \connect vgas_test
+          CREATE EXTENSION vector;
+          SQL
+          echo "TEST_DATABASE_PASSWORD=$password" >> "$GITHUB_ENV"
+      - name: Install the immutable foundation before upgrade
+        if: matrix.lane == 'upgrade'
+        shell: bash
+        run: |
+          base_migrations=$(mktemp -d)
+          trap 'rm -rf "$base_migrations"' EXIT
+          foundation=20261125141215_foundation_extensions_1.exs
+          git show "aa93104fd476d208206288658e67bfe70e0780cd:priv/repo/migrations/$foundation" > "$base_migrations/$foundation"
+          cmp "$base_migrations/$foundation" "priv/repo/migrations/$foundation"
+          mix ecto.migrate --migrations-path "$base_migrations" --strict-version-order
+      - name: Apply and verify candidate migrations
+        shell: bash
+        run: |
+          mix ecto.migrate --strict-version-order
+          migrations=$(mix ecto.migrations)
+          echo "$migrations"
+          if [[ "$migrations" =~ (^|[[:space:]])down[[:space:]] ]]; then
+            exit 1
+          fi
+          mix test --seed 0 test/voelgoed_ai/repo_foundation_test.exs
+
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan the candidate commit range
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          range=HEAD
+          if [[ "$BASE" =~ ^[0-9a-f]{40}$ && "$BASE" != 0000000000000000000000000000000000000000 ]]; then
+            git cat-file -e "$BASE^{commit}"
+            range="$BASE..HEAD"
+          fi
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --volume "$PWD:/repo:ro" --workdir /repo ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git --redact=100 --log-opts="$range" --no-banner .
+
   gate:
     name: Application CI gate
     if: always()
-    needs: [plan, build, test]
+    needs: [plan, build, test, snapshots, migrations, secrets]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
       PLAN: ${{ needs.plan.result }}
       BUILD: ${{ needs.build.result }}
+      SNAPSHOTS: ${{ needs.snapshots.result }}
+      MIGRATIONS: ${{ needs.migrations.result }}
+      SECRETS: ${{ needs.secrets.result }}
       TEST: ${{ needs.test.result }}
       HAS_TESTS: ${{ needs.plan.outputs.has_tests }}
     steps:
       - run: |
-          [[ "$PLAN" == success && "$BUILD" == success ]]
+          [[ "$PLAN" == success && "$BUILD" == success && "$SNAPSHOTS" == success &&
+             "$MIGRATIONS" == success && "$SECRETS" == success ]] || exit 1
           if [[ "$HAS_TESTS" == true ]]; then
             [[ "$TEST" == success ]]
           else

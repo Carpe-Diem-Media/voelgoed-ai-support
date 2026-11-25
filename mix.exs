@@ -40,6 +40,7 @@ defmodule VoelgoedAi.MixProject do
       # 02 — Staff identity and authorization (Entra OIDC)
       {:ash_authentication, "== 5.0.0-rc.18"},
       {:ash_authentication_phoenix, "== 3.0.0-rc.12"},
+      {:assent, "== 0.3.2"},
 
       # 03 — AI and external integrations
       {:ash_ai, "~> 1.5.6"},

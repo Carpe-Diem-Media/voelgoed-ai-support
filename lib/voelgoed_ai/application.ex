@@ -15,7 +15,12 @@ defmodule VoelgoedAi.Application do
       end
     end
 
-    children = [VoelgoedAi.Repo, VoelgoedAiWeb.Endpoint]
+    children = [
+      VoelgoedAi.Repo,
+      VoelgoedAi.Accounts.EntraPendingStates,
+      VoelgoedAiWeb.Endpoint
+    ]
+
     Supervisor.start_link(children, strategy: :one_for_one, name: VoelgoedAi.Supervisor)
   end
 end
