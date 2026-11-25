@@ -9,8 +9,10 @@ defmodule VoelgoedAiWeb.Endpoint do
     log: {__MODULE__, :request_log_level, []}
   )
 
+  plug(VoelgoedAiWeb.ChatwootWebhook)
   plug(VoelgoedAiWeb.Router)
 
   def request_log_level(%{path_info: ["staff" | _]}), do: false
+  def request_log_level(%{path_info: ["webhooks", "chatwoot" | _]}), do: false
   def request_log_level(_), do: :info
 end

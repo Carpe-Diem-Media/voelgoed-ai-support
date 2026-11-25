@@ -407,6 +407,64 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
              )
   end
 
+  test "a binding action rejects a rebind committed while it waits for the old assistant", ctx do
+    admin = bootstrap_admin(ctx.admin)
+    assistant = create(admin, ctx.slug)
+    fixture = allow_fixture(assistant)
+    replacement = create(admin, ctx.slug <> "-other")
+
+    attrs =
+      Map.take(fixture, [
+        :assistant_id,
+        :installation_ref,
+        :external_account_id,
+        :external_inbox_id
+      ])
+
+    assert {:ok, binding} = invoke(InboxBinding, :create_draft, attrs, admin)
+
+    # Keep the candidate disabled so the mode change would otherwise succeed.
+    # The first connection models the rebind's atomic storage changes while
+    # the second connection waits on the assistant selected by its first read.
+    assert {:ok, waiter} =
+             Repo.transact(fn ->
+               lock_row("assistants", assistant.id)
+               lock_row("assistants", replacement.id)
+
+               waiter =
+                 blocked_task(fn ->
+                   invoke(
+                     InboxBinding,
+                     :change_mode,
+                     %{id: binding.id, operating_mode: :assisted},
+                     admin
+                   )
+                 end)
+
+               lock_row("inbox_bindings", binding.id, "NOWAIT")
+
+               SQL.query!(
+                 Repo,
+                 """
+                 UPDATE inbox_bindings
+                 SET assistant_id = $1, status = 'disabled', security_epoch = security_epoch + 1
+                 WHERE id = $2
+                 """,
+                 [Ecto.UUID.dump!(replacement.id), Ecto.UUID.dump!(binding.id)]
+               )
+
+               {:ok, waiter}
+             end)
+
+    assert {:error, error} = Task.await(waiter, 5_000)
+    assert Exception.message(error) =~ "concurrent_configuration_change"
+
+    assert {:ok, %{assistant_id: replacement_id, operating_mode: :shadow}} =
+             invoke(InboxBinding, :read_configuration, %{id: binding.id}, admin)
+
+    assert replacement_id == replacement.id
+  end
+
   test "operational audit is distinct and an audit error rolls back publication", ctx do
     admin = bootstrap_admin(ctx.admin)
     assistant = create(admin, ctx.slug)
