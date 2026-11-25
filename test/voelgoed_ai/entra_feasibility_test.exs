@@ -2,7 +2,15 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
   use ExUnit.Case, async: true
   @moduletag capture_log: true
 
-  alias VoelgoedAi.Feasibility.{EntraAudit, EntraProvider, EntraSession, EntraStaff, EntraStore}
+  alias VoelgoedAi.Feasibility.{
+    EntraAudit,
+    EntraOIDCResponse,
+    EntraProvider,
+    EntraSession,
+    EntraStaff,
+    EntraStore
+  }
+
   alias VoelgoedAi.Repo
 
   setup_all do
@@ -25,6 +33,7 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
     assert %{"staff" => {id, 0, expiry}} = Plug.Conn.get_session(callback)
     assert id == staff.id and expiry > System.system_time(:second)
     assert map_size(Plug.Conn.get_session(callback)) == 1
+    assert callback.private.plug_session_info == :renew
 
     assert {:ok, %{last_authenticated_at: %DateTime{}}} =
              EntraStore.member(context.schema, staff.id)
@@ -62,15 +71,32 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
   end
 
   test "an invitation preserves the pairwise subject byte for byte", context do
-    subject = " staff-subject\t"
+    subject = String.duplicate("A", 252) <> "_-z"
     assert {:ok, staff} = EntraStore.invite(context.schema, subject, [:admin])
 
-    assert_sign_in_denied(EntraProvider.sign_in(context, "staff-subject"))
+    assert_sign_in_denied(EntraProvider.sign_in(context, String.downcase(subject)))
     assert EntraStore.staff_snapshot(context.schema) == [[staff.id, "invited", 0]]
     assert [%{action: :provision}] = audit(context.schema)
     assert {:ok, %{subject: ^subject}} = EntraStore.member(context.schema, staff.id)
 
     assert EntraProvider.sign_in(context, subject).status == 204
+  end
+
+  test "subjects outside the supported ASCII format are invalid at invite and callback",
+       context do
+    assert {:ok, staff} = EntraStore.invite(context.schema, "staff-subject", [:admin])
+
+    for {label, subject} <- invalid_subjects() do
+      assert match?(
+               {:error, %Ash.Error.Invalid{}},
+               EntraStore.invite(context.schema, subject, [:admin])
+             ),
+             label
+
+      flow = EntraProvider.start_sign_in(context, subject)
+      refute EntraOIDCResponse.valid_tokens?(flow.tokens), label
+      assert_callback_denied(context, staff, EntraProvider.callback(flow))
+    end
   end
 
   test "provisioning does not trim issuer or tenant input" do
@@ -222,6 +248,7 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
       future_not_before: [claims: %{"nbf" => System.system_time(:second) + 300}],
       invalid_signature: [signing_key: JOSE.JWK.generate_key({:rsa, 2048})],
       unknown_key: [kid: "unlisted-key"],
+      unsigned: [algorithm: "none"],
       unsupported_algorithm: [algorithm: "RS512"],
       unavailable_discovery: [unavailable: :callback_discovery],
       unavailable_token: [unavailable: :token],
@@ -236,6 +263,114 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
     end
 
     assert EntraStore.staff_snapshot(context.schema) == [[staff.id, "invited", 0]]
+  end
+
+  test "malformed token responses and protected headers deny the callback", context do
+    fields = ~w(id_token access_token token_type refresh_token expires_in scope)
+
+    cases =
+      malformed_documents(:tokens) ++
+        field_mutations(:tokens, fields) ++
+        missing_fields(:tokens, ~w(id_token access_token)) ++
+        malformed_documents(:header) ++
+        field_mutations(:header, ~w(alg kid typ cty b64 crit)) ++
+        missing_fields(:header, ~w(alg kid)) ++
+        [
+          {"invalid compact JWS", [tokens: put_field("id_token", "abc")]},
+          {"invalid signature encoding", [tokens: alter_jws_signature("!%")]},
+          {"empty signature segment", [tokens: alter_jws_signature("")]},
+          {"other signing algorithm", [algorithm: "RS512"]},
+          {"oversized compact JWS",
+           [payload: put_field("unused", String.duplicate("a", 32_769))]},
+          {"unencoded JWS payload", [header: put_field("b64", false)]}
+        ]
+
+    assert_malformed_responses(context, :tokens, cases)
+  end
+
+  test "malformed signed claims deny the callback", context do
+    fields = ~w(iss sub aud azp exp nbf iat nonce tid)
+
+    cases =
+      malformed_documents(:payload) ++
+        field_mutations(:payload, fields) ++
+        missing_fields(:payload, fields -- ~w(azp nbf)) ++
+        [
+          {"empty audience list", [payload: put_field("aud", [])]},
+          {"mixed audience list", [payload: put_field("aud", [EntraProvider.client_id(), 42])]},
+          {"empty audience member", [payload: put_field("aud", [""])]},
+          {"oversized audience member", [payload: put_field("aud", [oversized_text()])]}
+        ]
+
+    assert_malformed_responses(context, :tokens, cases)
+  end
+
+  test "malformed public key sets deny the callback even with a valid matching key", context do
+    key_members =
+      for field <- ~w(kty kid use alg n e d),
+          {shape, value} <- malformed_values() do
+        {"JWK #{field}/#{shape}", [jwks: alter_key(field, value)]}
+      end
+
+    missing_key_members =
+      for field <- ~w(kty kid n e) do
+        {"missing JWK #{field}",
+         [jwks: fn %{"keys" => [key]} -> %{"keys" => [Map.delete(key, field)]} end]}
+      end
+
+    additional_cases = [
+      {"empty keys", [jwks: put_field("keys", [])]},
+      {"missing keys", [jwks: fn _ -> %{} end]},
+      {"EC key", [jwks: alter_key("kty", "EC")]},
+      {"invalid RSA modulus encoding", [jwks: alter_key("n", "!%")]},
+      {"invalid RSA exponent encoding", [jwks: alter_key("e", "!%")]},
+      {"malformed trailing key", [jwks: fn %{"keys" => keys} -> %{"keys" => keys ++ [nil]} end]}
+    ]
+
+    cases = malformed_documents(:jwks) ++ field_mutations(:jwks, ["keys"])
+
+    assert_malformed_responses(
+      context,
+      :jwks,
+      cases ++ key_members ++ missing_key_members ++ additional_cases
+    )
+  end
+
+  test "the callback accepts supported optional provider fields", context do
+    assert {:ok, _staff} = EntraStore.invite(context.schema, "staff-subject", [])
+
+    flow =
+      EntraProvider.start_sign_in(context, "staff-subject",
+        tokens:
+          &Map.merge(&1, %{
+            "token_type" => "Bearer",
+            "expires_in" => 300,
+            "scope" => "openid",
+            "refresh_token" => "synthetic-refresh"
+          }),
+        jwks: alter_key("use", "sig"),
+        header: &Map.put(&1, "typ", "JWT"),
+        claims: %{
+          "aud" => [EntraProvider.client_id()],
+          "azp" => EntraProvider.client_id(),
+          "nbf" => System.system_time(:second)
+        }
+      )
+
+    assert EntraProvider.callback(flow).status == 204
+  end
+
+  test "an exception inside Assent's HTTP adapter returns a generic denial", context do
+    assert {:ok, staff} = EntraStore.invite(context.schema, "staff-subject", [:admin])
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        conn = EntraProvider.sign_in(context, "staff-subject", raise_token_response: true)
+        assert_callback_denied(context, staff, conn)
+      end)
+
+    assert log =~ "entra_oidc_callback_exception"
+    refute log =~ "synthetic adapter detail"
   end
 
   test "the sign-in action rejects caller-supplied claim maps", context do
@@ -503,8 +638,90 @@ defmodule VoelgoedAi.EntraFeasibilityTest do
 
   defp assert_sign_in_denied(conn) do
     assert conn.status == 401
+    assert conn.resp_body == "Sign-in denied"
     assert Plug.Conn.get_resp_header(conn, "location") == []
     assert Plug.Conn.get_session(conn) == %{}
+  end
+
+  defp assert_callback_denied(context, staff, conn) do
+    assert_sign_in_denied(conn)
+    assert EntraStore.staff_snapshot(context.schema) == [[staff.id, "invited", 0]]
+    assert [%{action: :provision}] = audit(context.schema)
+  end
+
+  defp assert_malformed_responses(context, kind, cases) do
+    assert {:ok, staff} = EntraStore.invite(context.schema, "staff-subject", [:admin])
+
+    for {label, opts} <- cases do
+      flow = EntraProvider.start_sign_in(context, "staff-subject", opts)
+      assert_invalid_shape(kind, flow, label)
+      conn = EntraProvider.callback(flow)
+      assert conn.status == 401, label
+      assert_callback_denied(context, staff, conn)
+      assert :atomics.get(flow.exchange_count, 1) == 1, label
+    end
+  end
+
+  defp assert_invalid_shape(:tokens, flow, label) do
+    refute EntraOIDCResponse.valid_tokens?(flow.tokens), label
+  end
+
+  defp assert_invalid_shape(:jwks, flow, label) do
+    refute EntraOIDCResponse.valid_jwks?(flow.jwks), label
+  end
+
+  defp malformed_documents(option) do
+    for {shape, value} <- malformed_values(),
+        do: {"#{option}/#{shape}", [{option, fn _ -> value end}]}
+  end
+
+  defp field_mutations(option, fields) do
+    for field <- fields,
+        {shape, value} <- malformed_values(),
+        do: {"#{option}.#{field}/#{shape}", [{option, put_field(field, value)}]}
+  end
+
+  defp missing_fields(option, fields) do
+    for field <- fields, do: {"missing #{option}.#{field}", [{option, &Map.delete(&1, field)}]}
+  end
+
+  defp malformed_values do
+    [
+      {"null", nil},
+      {"number", 12.5},
+      {"list", [42]},
+      {"object", %{"bad" => true}},
+      {"empty", ""},
+      {"oversized", oversized_text()}
+    ]
+  end
+
+  defp invalid_subjects do
+    [
+      {"empty", ""},
+      {"oversized", String.duplicate("a", 256)},
+      {"non-ASCII", "onderstéun"},
+      {"embedded tab", "staff\t-subject"},
+      {"trailing tab", "staff-subject\t"},
+      {"embedded NUL", "staff\0-subject"},
+      {"embedded DEL", "staff\x7F-subject"},
+      {"leading space", " another-staff-subject"},
+      {"trailing space", "another-staff-subject "}
+    ]
+  end
+
+  defp put_field(field, value), do: &Map.put(&1, field, value)
+  defp oversized_text, do: String.duplicate("a", 4_097)
+
+  defp alter_key(field, value) do
+    fn %{"keys" => [key]} -> %{"keys" => [Map.put(key, field, value)]} end
+  end
+
+  defp alter_jws_signature(signature) do
+    fn tokens ->
+      [header, claims, _signature] = String.split(tokens["id_token"], ".")
+      Map.put(tokens, "id_token", Enum.join([header, claims, signature], "."))
+    end
   end
 
   defp audit(schema) do

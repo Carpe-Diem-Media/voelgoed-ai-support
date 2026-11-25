@@ -46,12 +46,17 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
     assert state != "" and nonce != ""
 
     {token, public_key} = credentials(context.key, subject, nonce, opts)
+    tokens = %{"id_token" => token, "access_token" => "synthetic-access"}
+    tokens = Keyword.get(opts, :tokens, &Function.identity/1).(tokens)
+    jwks = Keyword.get(opts, :jwks, &Function.identity/1).(%{"keys" => [public_key]})
 
     flow = %{
       context: context,
       redirect: redirect,
       params: %{"state" => state, "code" => code},
-      exchange_count: exchange_count
+      exchange_count: exchange_count,
+      tokens: tokens,
+      jwks: jwks
     }
 
     stub(fn
@@ -68,8 +73,10 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
 
         assert Base.url_encode64(:crypto.hash(:sha256, verifier), padding: false) == challenge
 
+        if opts[:raise_token_response], do: raise("synthetic adapter detail")
+
         if attempt == 1 and opts[:unavailable] != :token do
-          Req.Test.json(conn, %{"id_token" => token, "access_token" => "synthetic-access"})
+          json(conn, tokens)
         else
           send_resp(conn, 400, "")
         end
@@ -78,7 +85,7 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
         if opts[:unavailable] == :keys do
           send_resp(conn, 503, "")
         else
-          Req.Test.json(conn, %{"keys" => [public_key]})
+          json(conn, jwks)
         end
 
       conn ->
@@ -136,6 +143,12 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
 
   defp stub(handler), do: Req.Test.stub(__MODULE__, handler)
 
+  defp json(conn, body) do
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode!(body))
+  end
+
   defp credentials(key, subject, nonce, opts) do
     now = System.system_time(:second)
 
@@ -161,12 +174,31 @@ defmodule VoelgoedAi.Feasibility.EntraProvider do
     algorithm = opts[:algorithm] || "RS256"
     kid = opts[:kid] || "fixture-key"
 
-    {_, token} =
-      signing_key
-      |> JOSE.JWT.sign(%{"alg" => algorithm, "kid" => kid}, claims)
-      |> JOSE.JWS.compact()
+    header = %{"alg" => algorithm, "kid" => kid}
+
+    token =
+      if opts[:header] || opts[:payload] || algorithm == "none" do
+        header = Keyword.get(opts, :header, &Function.identity/1).(header)
+        claims = Keyword.get(opts, :payload, &Function.identity/1).(claims)
+        compact_fixture_jws(signing_key, algorithm, header, claims)
+      else
+        {_, token} = signing_key |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+        token
+      end
 
     {_, public_key} = JOSE.JWK.to_public_map(key)
     {token, Map.put(public_key, "kid", "fixture-key")}
+  end
+
+  # JOSE's signer builds only well-formed headers. Sign the fixture input
+  # directly so a malformed protected header still carries a real signature.
+  defp compact_fixture_jws(key, algorithm, header, claims) do
+    encoded_header = header |> Jason.encode!() |> Base.url_encode64(padding: false)
+    encoded_claims = claims |> Jason.encode!() |> Base.url_encode64(padding: false)
+    input = encoded_header <> "." <> encoded_claims
+    {_, rsa_key} = JOSE.JWK.to_key(key)
+
+    signature = if algorithm == "none", do: "", else: :public_key.sign(input, :sha256, rsa_key)
+    input <> "." <> Base.url_encode64(signature, padding: false)
   end
 end

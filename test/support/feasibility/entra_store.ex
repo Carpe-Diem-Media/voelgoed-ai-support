@@ -269,7 +269,12 @@ defmodule VoelgoedAi.Feasibility.EntraStaff do
 
     attribute(:subject, :string,
       allow_nil?: false,
-      constraints: [trim?: false, allow_empty?: false, max_length: 255]
+      constraints: [
+        trim?: false,
+        allow_empty?: false,
+        max_length: 255,
+        match: VoelgoedAi.Feasibility.EntraSubject.pattern()
+      ]
     )
 
     # Ash's UUID cast trims and lowercases text. Keep the tenant claim's exact

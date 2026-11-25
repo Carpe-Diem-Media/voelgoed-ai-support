@@ -3,7 +3,7 @@ defmodule VoelgoedAi.Feasibility.EntraDiscoveryAdapter do
   @behaviour Assent.HTTPAdapter
 
   alias Assent.HTTPAdapter.{HTTPResponse, Req}
-  alias VoelgoedAi.Feasibility.EntraProvider
+  alias VoelgoedAi.Feasibility.{EntraOIDCResponse, EntraProvider}
 
   @required_endpoints ~w(authorization_endpoint token_endpoint jwks_uri)
 
@@ -12,10 +12,20 @@ defmodule VoelgoedAi.Feasibility.EntraDiscoveryAdapter do
     response = Req.request(method, url, body, headers, opts)
     issuer = EntraProvider.issuer()
 
-    if method == :get and url == issuer <> "/.well-known/openid-configuration" do
-      validate_discovery(response, issuer)
-    else
-      response
+    case {method, url, response} do
+      {:get, discovery_url, _}
+      when discovery_url == issuer <> "/.well-known/openid-configuration" ->
+        validate_discovery(response, issuer)
+
+      {:post, _, {:ok, %HTTPResponse{status: status, body: tokens}}} when status in [200, 201] ->
+        if EntraOIDCResponse.valid_tokens?(tokens), do: response, else: {:error, :invalid_tokens}
+
+      # The only other GET in this OIDC flow fetches public signing keys.
+      {:get, _, {:ok, %HTTPResponse{status: 200, body: jwks}}} ->
+        if EntraOIDCResponse.valid_jwks?(jwks), do: response, else: {:error, :invalid_jwks}
+
+      _ ->
+        response
     end
   end
 
@@ -211,7 +221,7 @@ defmodule VoelgoedAi.Feasibility.EntraRouter do
   use Plug.Router
 
   alias AshAuthentication.Plug.Dispatcher
-  alias VoelgoedAi.Feasibility.{EntraController, EntraSession, EntraStaff}
+  alias VoelgoedAi.Feasibility.{EntraController, EntraOIDCCallback, EntraSession, EntraStaff}
 
   plug(Plug.Session, store: :cookie, key: "_vgas_f08", signing_salt: "vgas-f08", secure: true)
   plug(:fetch_session)
@@ -252,30 +262,11 @@ defmodule VoelgoedAi.Feasibility.EntraRouter do
   end
 
   defp dispatch_oidc(conn, phase) do
-    strategy = AshAuthentication.Info.strategy!(EntraStaff, :entra)
+    strategy = %{
+      AshAuthentication.Info.strategy!(EntraStaff, :entra)
+      | assent_strategy: EntraOIDCCallback
+    }
+
     Dispatcher.call(conn, {phase, strategy, EntraController})
-  rescue
-    error in FunctionClauseError ->
-      # Assent 0.3.2 expects strings for state and nonce. A malformed value
-      # can raise before the strategy returns its normal denial result.
-      case error do
-        %FunctionClauseError{module: Assent, function: :constant_time_compare, arity: 2}
-        when phase == :callback ->
-          EntraController.failure(conn, {:entra, :callback}, :invalid_challenge)
-
-        _ ->
-          reraise error, __STACKTRACE__
-      end
-
-    error in Protocol.UndefinedError ->
-      if phase == :callback and error.protocol == Enumerable and
-           Enum.any?(
-             __STACKTRACE__,
-             &match?({Assent.Strategy.OIDC, :validate_audience, 3, _}, &1)
-           ) do
-        EntraController.failure(conn, {:entra, :callback}, :invalid_audience)
-      else
-        reraise error, __STACKTRACE__
-      end
   end
 end
