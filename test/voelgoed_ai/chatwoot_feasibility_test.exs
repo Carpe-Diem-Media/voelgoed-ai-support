@@ -9,6 +9,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     ChatwootDelivery,
     ChatwootDeliveryJob,
     ChatwootEndpoint,
+    ChatwootIngressJob,
     ChatwootStore
   }
 
@@ -1025,27 +1026,7 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
     discard_checks(ctx, :f06_deadline)
     assert %{state: "pending"} = ChatwootStore.delivery(ctx.prefix, id)
 
-    cron_name = {ChatwootDeadlineJob, ctx.prefix}
-
-    start_supervised!(
-      {Oban,
-       name: cron_name,
-       repo: Repo,
-       prefix: ctx.prefix,
-       queues: false,
-       peer: Oban.Peers.Isolated,
-       cron: [crontab: ChatwootDeadlineJob.crontab()],
-       log: false}
-      |> Supervisor.child_spec(id: cron_name)
-    )
-
-    cron = Oban.Registry.whereis(cron_name, {:plugin, Oban.Cron})
-    send(cron, :evaluate)
-    :sys.get_state(cron)
-
-    assert %{rows: [[true]]} =
-             sql!(ctx, "SELECT meta->'cron' FROM @schema.oban_jobs WHERE state = 'available'")
-
+    tick_deadline_cron(ctx)
     assert drain(at(ctx, 60), :f06_deadline).success == 1
 
     assert %{state: "cancelled", reason: "reply_deadline_exceeded"} =
@@ -1255,6 +1236,382 @@ defmodule VoelgoedAi.ChatwootFeasibilityTest do
 
     assert %{state: "handoff_pending"} = session(ctx)
     assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  @tag :f06_followup
+  test "a late older read cannot undo durable budget exhaustion", ctx do
+    parent = self()
+
+    late_open = fn request ->
+      barrier(parent, :older_read)
+      response(200, unassigned("open")).(request)
+    end
+
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(pending()),
+        handoff(write_result(:timeout)),
+        {:get, @path, late_open},
+        get(pending())
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).success == 1
+    older = Task.async(fn -> drain(ctx, :f06_reconcile, with_scheduled: true) end)
+    assert_receive {:older_read, worker, _backend}, 5_000
+    insert_reconciliation(ctx, id)
+    assert drain(ctx, :f06_reconcile).success == 1
+    before = ChatwootStore.delivery(ctx.prefix, id)
+    assert %{state: "unknown", recovery_failure: "handoff_read_budget_exhausted"} = before
+
+    send(worker, {:release, :older_read, :ok})
+    assert Task.await(older).success == 1
+    assert ChatwootStore.delivery(ctx.prefix, id) == before
+    assert %{state: "handoff_pending"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get, :get])
+  end
+
+  @tag :f06_followup
+  test "a read waiting on PostgreSQL cannot enter HTTP after the delivery deadline", ctx do
+    parent = self()
+    clock = :atomics.new(1, [])
+
+    ctx =
+      fake(%{ctx | now: fn -> DateTime.add(@now, :atomics.get(clock, 1)) end}, [get(pending())])
+
+    id = prepare(ctx)
+    :atomics.put(clock, 1, 44)
+
+    locker =
+      Task.async(fn ->
+        Repo.transaction(fn ->
+          sql!(ctx, "SELECT id FROM @schema.deliveries WHERE id = $1::text::uuid FOR UPDATE", [id])
+
+          transaction_barrier(parent, :delivery_locked)
+        end)
+      end)
+
+    assert_receive {:delivery_locked, lock_worker, lock_backend}, 5_000
+
+    delivery =
+      Task.async(fn ->
+        Repo.checkout(fn ->
+          barrier(parent, :delivery_start)
+          drain(ctx, :f06_delivery)
+        end)
+      end)
+
+    assert_receive {:delivery_start, worker, worker_backend}, 5_000
+    send(worker, {:release, :delivery_start, :ok})
+    assert_blocked_by(worker_backend, lock_backend)
+    :atomics.put(clock, 1, 45)
+    send(lock_worker, {:release, :delivery_locked, :ok})
+
+    assert {:ok, :ok} = Task.await(locker)
+    assert Task.await(delivery).success == 1
+
+    assert %{state: "cancelled", read_attempts: 0, reason: "reply_deadline_exceeded"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert_fake_calls(ctx, [:get])
+  end
+
+  @tag :f06_followup
+  test "a GET receive timeout is capped by the remaining deadline", ctx do
+    close_to_deadline = fn request ->
+      assert request.options.receive_timeout == 125
+      write_result(:timeout).(request)
+    end
+
+    ctx = fake(ctx, [get(pending()), {:get, @path, close_to_deadline}])
+    id = prepare(ctx)
+    advanced = %{ctx | now: fn -> DateTime.add(@now, 44_875, :millisecond) end}
+    assert drain(advanced, :f06_delivery).success == 1
+    assert %{state: "cancelled", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+    assert_fake_calls(ctx, [:get, :get])
+  end
+
+  @tag :f06_followup
+  test "immediate confirmation stops at qualified resolution and preserves UNKNOWN", ctx do
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        get(pending()),
+        handoff(response(200, %{"payload" => %{"current_status" => "open"}})),
+        get(unassigned("resolved"))
+      ])
+
+    id = prepare(ctx)
+    assert drain(ctx, :f06_delivery).success == 1
+
+    assert %{state: "unknown", recovery_failure: "handoff_conversation_closed"} =
+             ChatwootStore.delivery(ctx.prefix, id)
+
+    assert %{state: "closed"} = session(ctx)
+    insert_reconciliation(ctx, id)
+    assert drain(ctx, :f06_reconcile, with_scheduled: true).success == 1
+    assert_fake_calls(ctx, [:get, :get, :handoff, :get])
+  end
+
+  @tag :f06_followup
+  test "a claim recovered at commit cannot enter the POST adapter", ctx do
+    parent = self()
+    clock = :atomics.new(1, [])
+
+    ctx =
+      fake(%{ctx | now: fn -> DateTime.add(@now, :atomics.get(clock, 1)) end}, [
+        get(pending()),
+        get(pending())
+      ])
+
+    id = prepare(ctx)
+    handler = make_ref()
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:voelgoed_ai, :repo, :query],
+        &__MODULE__.pause_after_claim_commit/4,
+        parent
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    writer =
+      Task.async(fn ->
+        Process.put(:pause_f06_commit, true)
+        drain(ctx, :f06_delivery)
+      end)
+
+    assert_receive {:claim_committed, worker}, 5_000
+    assert %{state: "sending"} = ChatwootStore.delivery(ctx.prefix, id)
+
+    :atomics.put(clock, 1, 5)
+    assert drain(ctx, :f06_recovery, with_scheduled: true).success == 1
+    assert %{state: "unknown", reason: "claim_expired"} = ChatwootStore.delivery(ctx.prefix, id)
+
+    send(worker, :continue_f06_delivery)
+    assert Task.await(writer).success == 1
+    assert_fake_calls(ctx, [:get, :get])
+  end
+
+  @tag :f06_followup
+  test "an older handoff preflight cannot claim the write after a newer read begins", ctx do
+    parent = self()
+
+    paused = fn phase, result ->
+      {:get, @path,
+       fn request ->
+         barrier(parent, phase)
+         result.(request)
+       end}
+    end
+
+    ctx =
+      fake(%{ctx | decision: "handoff"}, [
+        get(pending()),
+        paused.(:old_preflight, response(200, pending())),
+        paused.(:new_preflight, response(200, unassigned("resolved")))
+      ])
+
+    id = prepare(ctx)
+    older = Task.async(fn -> drain(ctx, :f06_delivery) end)
+    assert_receive {:old_preflight, old_worker, _backend}, 5_000
+    insert_delivery(ctx, id)
+    newer = Task.async(fn -> drain(ctx, :f06_delivery) end)
+    assert_receive {:new_preflight, new_worker, _backend}, 5_000
+
+    send(old_worker, {:release, :old_preflight, :ok})
+    assert Task.await(older).success == 1
+    assert %{state: "pending", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+    send(new_worker, {:release, :new_preflight, :ok})
+    assert Task.await(newer).success == 1
+
+    assert %{state: "cancelled", read_attempts: 2} = ChatwootStore.delivery(ctx.prefix, id)
+    assert %{state: "closed"} = session(ctx)
+    assert_fake_calls(ctx, [:get, :get, :get])
+  end
+
+  @doc false
+  def pause_after_claim_commit(_event, _measurements, %{query: "commit"}, parent) do
+    if Process.get(:pause_f06_commit) && Process.get(:f06_claim_staged) do
+      Process.delete(:pause_f06_commit)
+      send(parent, {:claim_committed, self()})
+
+      receive do
+        :continue_f06_delivery -> :ok
+      after
+        5_000 -> raise "F06 claim commit barrier timed out"
+      end
+    end
+  end
+
+  def pause_after_claim_commit(_event, _measurements, %{query: query}, _parent) do
+    if Process.get(:pause_f06_commit) && String.contains?(query, "generation = generation + 1"),
+      do: Process.put(:f06_claim_staged, true)
+  end
+
+  @tag :f06_followup
+  test "the deadline sweep records a discarded ingress receipt without sending a late reply",
+       ctx do
+    ctx = fake(ctx, [{:get, @path, &kill_worker/1}])
+    assert submit(ctx).status == 204
+    id = event_id(ctx, 101)
+    assert %{state: "discarded"} = kill_and_rescue(ctx, :f06_ingress)
+    assert submit(ctx, delivery: "replay").status == 204
+    assert drain(at(ctx, 360), :f06_ingress).success == 0
+
+    tick_deadline_cron(ctx)
+    assert drain(at(ctx, 360), :f06_deadline).success == 1
+
+    assert %{processed: true, decision: "ingress_deadline_exceeded"} =
+             ChatwootStore.event(ctx.prefix, id)
+
+    assert [1, 2, 0, 0] = counts(ctx)
+
+    assert {:ok, _} = Oban.insert(ctx.oban, ChatwootIngressJob.new(%{"event_id" => id}))
+    assert drain(at(ctx, 360), :f06_ingress).success == 1
+    assert_fake_calls(ctx, [:get])
+  end
+
+  @tag :f06_followup
+  test "an overdue first ingress job records the missed deadline without a GET", ctx do
+    ctx = fake(ctx, [])
+    assert submit(ctx).status == 204
+    assert drain(at(ctx, 45), :f06_ingress).success == 1
+
+    assert %{processed: true, decision: "ingress_deadline_exceeded"} =
+             ChatwootStore.event(ctx.prefix, event_id(ctx, 101))
+
+    assert [1, 1, 0, 0] = counts(ctx)
+    assert_fake_calls(ctx, [])
+  end
+
+  @tag :f06_followup
+  test "the deadline sweep wins over an ingress GET that returns after the deadline", ctx do
+    parent = self()
+    clock = :atomics.new(1, [])
+
+    late_bot = fn request ->
+      barrier(parent, :ingress_get)
+      response(200, pending()).(request)
+    end
+
+    ctx =
+      fake(%{ctx | now: fn -> DateTime.add(@now, :atomics.get(clock, 1)) end}, [
+        {:get, @path, late_bot}
+      ])
+
+    assert submit(ctx).status == 204
+    original = Task.async(fn -> drain(ctx, :f06_ingress) end)
+    assert_receive {:ingress_get, worker, _backend}, 5_000
+    :atomics.put(clock, 1, 45)
+    tick_deadline_cron(ctx)
+    assert drain(ctx, :f06_deadline).success == 1
+    send(worker, {:release, :ingress_get, :ok})
+    assert Task.await(original).success == 1
+
+    assert %{processed: true, decision: "ingress_deadline_exceeded"} =
+             ChatwootStore.event(ctx.prefix, event_id(ctx, 101))
+
+    assert [1, 2, 0, 0] = counts(ctx)
+    assert_fake_calls(ctx, [:get])
+  end
+
+  @tag :f06_followup
+  test "a replacement ingress decision fences the original job's late observation", ctx do
+    parent = self()
+
+    late_resolved = fn request ->
+      barrier(parent, :older_ingress)
+      response(200, unassigned("resolved")).(request)
+    end
+
+    ctx =
+      fake(ctx, [
+        {:get, @path, late_resolved},
+        get(pending()),
+        get(pending()),
+        reply(response(200, reply_body()))
+      ])
+
+    assert submit(ctx).status == 204
+    event = event_id(ctx, 101)
+    original = Task.async(fn -> drain(ctx, :f06_ingress) end)
+    assert_receive {:older_ingress, worker, _backend}, 5_000
+
+    assert {:ok, _} = Oban.insert(ctx.oban, ChatwootIngressJob.new(%{"event_id" => event}))
+    assert drain(ctx, :f06_ingress).success == 1
+    id = intent_id(ctx)
+
+    send(worker, {:release, :older_ingress, :ok})
+    assert Task.await(original).success == 1
+    assert %{state: "bot_active"} = session(ctx)
+    assert %{state: "pending"} = ChatwootStore.delivery(ctx.prefix, id)
+    assert drain(ctx, :f06_delivery).success == 1
+    assert %{state: "sent", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+    assert_fake_calls(ctx, [:get, :get, :get, :reply])
+  end
+
+  @tag :f06_followup
+  test "untrusted events cannot fence the active reply", ctx do
+    ctx = fake(ctx, [get(pending()), get(pending()), reply(response(200, reply_body()))])
+    id = prepare(ctx)
+    active = session(ctx)
+
+    outbound = %{
+      "id" => 102,
+      "message_type" => "outgoing",
+      "sender" => %{"type" => "user", "id" => 6}
+    }
+
+    assert submit(ctx, body: payload(outbound), key: :crypto.strong_rand_bytes(32)).status == 401
+
+    wrong_inbox =
+      Map.merge(outbound, %{
+        "inbox" => %{"id" => 9},
+        "conversation" => conversation(%{"inbox_id" => 9})
+      })
+
+    assert submit(ctx, body: payload(wrong_inbox)).status == 403
+
+    for {type, message_id} <- Enum.with_index(~w(agent_bot contact system), 103) do
+      body = payload(%{outbound | "id" => message_id, "sender" => %{"type" => type, "id" => 6}})
+      assert submit(ctx, body: body).status == 204
+      assert drain(ctx, :f06_ingress).success == 0
+      assert session(ctx) == active
+      assert %{state: "pending", attempts: 0} = ChatwootStore.delivery(ctx.prefix, id)
+    end
+
+    assert drain(ctx, :f06_delivery).success == 1
+    insert_delivery(ctx, id)
+    assert drain(ctx, :f06_delivery).success == 1
+    assert %{state: "sent", attempts: 1} = ChatwootStore.delivery(ctx.prefix, id)
+    assert_fake_calls(ctx, [:get, :get, :reply])
+  end
+
+  defp tick_deadline_cron(ctx) do
+    cron_name = {ChatwootDeadlineJob, ctx.prefix}
+
+    start_supervised!(
+      {Oban,
+       name: cron_name,
+       repo: Repo,
+       prefix: ctx.prefix,
+       queues: false,
+       peer: Oban.Peers.Isolated,
+       cron: [crontab: ChatwootDeadlineJob.crontab()],
+       log: false}
+      |> Supervisor.child_spec(id: cron_name)
+    )
+
+    cron = Oban.Registry.whereis(cron_name, {:plugin, Oban.Cron})
+    send(cron, :evaluate)
+    :sys.get_state(cron)
+
+    assert %{rows: [[true]]} =
+             sql!(ctx, "SELECT meta->'cron' FROM @schema.oban_jobs WHERE state = 'available'")
   end
 
   defp at(ctx, seconds), do: %{ctx | now: fn -> DateTime.add(@now, seconds) end}
