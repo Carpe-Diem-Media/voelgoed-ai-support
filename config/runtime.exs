@@ -26,3 +26,7 @@ else
     secret_key_base: System.fetch_env!("SECRET_KEY_BASE"),
     server: System.get_env("PHX_SERVER") == "true"
 end
+
+if config_env() == :dev do
+  config :voelgoed_ai, :development_ai, VoelgoedAi.DevelopmentAiConfig.load(System.get_env())
+end
