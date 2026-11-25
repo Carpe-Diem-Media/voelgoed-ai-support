@@ -58,6 +58,8 @@ defmodule VoelgoedAi.Feasibility.TransportEvidence do
     [
       receive_timeout: 5000,
       retry: false,
+      # ReqLLM's retry step replaces `retry: false` and reads only this limit.
+      max_retries: 0,
       redirect: false,
       adapter: fn request ->
         with :ok <- validate(request, model),

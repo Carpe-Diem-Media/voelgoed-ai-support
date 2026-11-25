@@ -118,6 +118,42 @@ defmodule VoelgoedAi.AshAiFeasibilityTest do
     refute_received :provider_attempt
   end
 
+  # ReqLLM 1.31 attaches its own retry step after Req's options are merged,
+  # overriding `retry: false` (deps/req_llm/lib/req_llm/step/retry.ex). Only
+  # `max_retries: 0` in the Req options limits it. Replace the evidence
+  # adapter with a bare counter so the result depends on the option set
+  # alone, not on how the evidence adapter shapes its return value.
+  test "transport options alone limit an embedding to one attempt" do
+    owner = self()
+
+    for outcome <- [:status_503, :timeout] do
+      counter = fn request ->
+        send(owner, {:attempt, outcome})
+
+        case outcome do
+          :status_503 -> {request, Req.Response.new(status: 503, body: %{})}
+          :timeout -> {request, %Req.TransportError{reason: :timeout}}
+        end
+      end
+
+      http_options =
+        {"unused_table", 1, "text-embedding-3-small"}
+        |> TransportEvidence.options(Probe)
+        |> Keyword.put(:adapter, counter)
+
+      assert {:error, _} =
+               ReqLLM.embed("openai:text-embedding-3-small", "Synthetic text",
+                 api_key: "synthetic-placeholder",
+                 dimensions: 1536,
+                 total_timeout: 20_000,
+                 req_http_options: http_options
+               )
+
+      assert_received {:attempt, ^outcome}
+      refute_received {:attempt, ^outcome}
+    end
+  end
+
   test "direct ReqLLM retains the provider response ID and usage" do
     Req.Test.expect(Probe, fn conn ->
       conn
@@ -338,6 +374,57 @@ defmodule VoelgoedAi.AshAiFeasibilityTest do
                )
 
       assert %{state: "released", evidence: nil} = DurableLedger.fetch(ledger, 2)
+    end
+
+    # The durable claim makes a second fake send impossible, so counting plug
+    # hits alone would hide a ReqLLM retry. Count entries into the adapter
+    # itself: each entry is one attempt the provider could have received.
+    test "embedding 503 and timeout enter the adapter exactly once", %{ledger: ledger} do
+      owner = self()
+
+      for {id, outcome} <- [{1, :status_503}, {2, :timeout}] do
+        Req.Test.stub(Probe, fn conn ->
+          case outcome do
+            :status_503 ->
+              conn
+              |> Plug.Conn.put_status(503)
+              |> Req.Test.json(%{"error" => %{"message" => "synthetic"}})
+
+            :timeout ->
+              Req.Test.transport_error(conn, :timeout)
+          end
+        end)
+
+        assert {:error, _} =
+                 TransportEvidence.run(
+                   ledger,
+                   id,
+                   ~D[2026-11-30],
+                   "text-embedding-3-small",
+                   limits(),
+                   fn attempt ->
+                     http_options =
+                       attempt
+                       |> TransportEvidence.options(Probe)
+                       |> Keyword.update!(:adapter, fn adapter ->
+                         fn request ->
+                           send(owner, {:adapter_entry, id})
+                           adapter.(request)
+                         end
+                       end)
+
+                     ReqLLM.embed("openai:text-embedding-3-small", "Synthetic text",
+                       api_key: "synthetic-placeholder",
+                       dimensions: 1536,
+                       total_timeout: 5000,
+                       req_http_options: http_options
+                     )
+                   end
+                 )
+
+        assert_received {:adapter_entry, ^id}
+        refute_received {:adapter_entry, ^id}
+      end
     end
 
     test "embeddings retain trusted usage and the transport header", %{ledger: ledger} do

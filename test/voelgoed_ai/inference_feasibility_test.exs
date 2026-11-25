@@ -50,6 +50,7 @@ defmodule VoelgoedAi.InferenceFeasibilityTest do
              Inference.run(budget, 1, @day, :embedding, @input, fn request ->
                assert request.model == "openai:text-embedding-3-small"
                assert request.options[:dimensions] == 1536
+               assert request.options[:req_http_options][:max_retries] == 0
                assert Reservations.fetch(budget, 1).status == :reserved
                {:error, :timeout}
              end)
