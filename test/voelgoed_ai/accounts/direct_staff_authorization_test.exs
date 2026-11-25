@@ -21,6 +21,11 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
     get_by_subject: :read
   ]
   @audit_actions [append: :create, staff_security_history: :read]
+  @operational_actions [
+    append_operational: :create,
+    operational_history: :action,
+    operational_rows: :read
+  ]
 
   setup do
     context = StaffFixtures.setup()
@@ -30,7 +35,10 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
   end
 
   test "the direct-call matrix covers every staff and audit action" do
-    for {resource, covered} <- [{StaffUser, @staff_actions}, {AuditEvent, @audit_actions}] do
+    for {resource, covered} <- [
+          {StaffUser, @staff_actions},
+          {AuditEvent, @audit_actions ++ @operational_actions}
+        ] do
       assert Ash.Resource.Info.actions(resource) |> Map.new(&{&1.name, &1.type}) ==
                Map.new(covered)
     end

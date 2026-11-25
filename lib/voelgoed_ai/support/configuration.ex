@@ -1,0 +1,564 @@
+defmodule VoelgoedAi.Support.Configuration do
+  @moduledoc """
+  Runs authorized configuration actions on the application Repo. Staff grants
+  and rows are rechecked under locks. Audit and epoch changes commit together.
+
+  Every mutation locks rows in one order: staff row, global control,
+  assistants in id order, then the binding. Later support work follows the
+  same order before it locks sessions, so the two cannot deadlock.
+  """
+
+  use Ash.Resource.Actions.Implementation
+
+  alias VoelgoedAi.Accounts.StaffAccess
+  alias VoelgoedAi.Accounts.StaffAccess.Session
+  alias VoelgoedAi.Governance.{AuditEvent, AutomationControl}
+  alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
+  alias VoelgoedAi.Repo
+  alias VoelgoedAi.Support.{ActionScope, InboxBinding}
+  alias VoelgoedAi.Support.ActionScope.Storage
+
+  @revision_fields [:workflow_version, :template_version, :locale, :response_policy]
+  @inbox_fields [:installation_ref, :external_account_id, :external_inbox_id]
+  @routing_fields [:credential_ref, :handoff_team_id]
+
+  @impl true
+  def run(input, _opts, %{actor: %Session{} = session}) do
+    StaffAccess.with_current(session, :admin, fn admin ->
+      execute(input.resource, input.action.name, input.arguments, admin.id)
+    end)
+    |> result()
+  end
+
+  def run(input, _opts, %{actor: scope}) do
+    if ActionScope.permits?(scope, input) do
+      Repo.transact(fn -> scoped_read(input.resource, input.arguments, scope.inbox) end)
+      |> result()
+    else
+      {:error, "configuration access denied"}
+    end
+  end
+
+  defp execute(Assistant, :create, args, admin) do
+    insert(Assistant, Map.put(args, :disabled_at, DateTime.utc_now()), :create, admin)
+  end
+
+  defp execute(Assistant, :read_configuration, %{id: id}, _admin),
+    do: project(get(Assistant, id))
+
+  defp execute(Assistant, action, %{id: id}, admin) do
+    with {:ok, assistant} <- get(Assistant, id, :for_update),
+         {:ok, attrs} <- assistant_transition(assistant, action) do
+      transition(assistant, attrs, action, admin)
+    end
+  end
+
+  defp execute(AssistantRevision, :create_draft, %{assistant_id: id} = args, admin) do
+    with {:ok, assistant} <- get(Assistant, id, :for_update),
+         :ok <- editable_assistant(assistant),
+         {:ok, latest} <- read(AssistantRevision, :latest_revision, %{assistant_id: id}) do
+      number = if latest, do: latest.revision_number + 1, else: 1
+      attrs = Map.merge(args, %{created_by_id: admin, revision_number: number})
+      insert(AssistantRevision, attrs, :create_draft, admin)
+    end
+  end
+
+  defp execute(AssistantRevision, :read_configuration, %{id: id}, _admin),
+    do: project(get(AssistantRevision, id))
+
+  defp execute(AssistantRevision, action, %{id: id} = args, admin) do
+    # Read the immutable parent key first. Every draft operation then locks the
+    # assistant before locking or changing any of its revisions.
+    with {:ok, candidate} <- get(AssistantRevision, id),
+         {:ok, assistant} <- get(Assistant, candidate.assistant_id, :for_update),
+         :ok <- editable_assistant(assistant),
+         {:ok, %{status: :draft} = revision} <- get(AssistantRevision, id, :for_update) do
+      revision_transition(revision, assistant, action, args, admin)
+    else
+      {:ok, _} -> {:error, :invalid_transition}
+      error -> error
+    end
+  end
+
+  defp execute(InboxBinding, :create_draft, %{assistant_id: id} = args, admin) do
+    with {:ok, assistant} <- get(Assistant, id, :for_update),
+         :ok <- editable_assistant(assistant),
+         {:ok, fixture} <- binding_fixture(args) do
+      insert(
+        InboxBinding,
+        Map.merge(args, Map.take(fixture, @routing_fields)),
+        :create_draft,
+        admin
+      )
+    end
+  end
+
+  defp execute(InboxBinding, :read_configuration, %{id: id}, _admin),
+    do: project(get(InboxBinding, id))
+
+  defp execute(InboxBinding, action, %{id: id} = args, admin) do
+    with {:ok, binding} <- lock_binding(id, rebind_target(action, args)),
+         {:ok, attrs} <- binding_transition(binding, action, args) do
+      transition(binding, epoch(binding, attrs), action, admin)
+    end
+  end
+
+  defp execute(AutomationControl, :read_configuration, %{}, _admin),
+    do: project(get(AutomationControl, :global))
+
+  defp execute(AutomationControl, action, args, admin) do
+    with {:ok, control} <- get(AutomationControl, :global, :for_update),
+         {:ok, attrs} <- control_transition(control, action, args) do
+      transition(control, epoch(control, attrs), action, admin)
+    end
+  end
+
+  defp execute(AuditEvent, :operational_history, args, _admin), do: history(args)
+
+  defp assistant_transition(%{status: :disabled} = assistant, :activate) do
+    with :ok <- published_fixture(assistant) do
+      {:ok, epoch(assistant, %{status: :active, disabled_at: nil})}
+    end
+  end
+
+  defp assistant_transition(%{status: :active} = assistant, :disable),
+    do: {:ok, epoch(assistant, %{status: :disabled, disabled_at: DateTime.utc_now()})}
+
+  # In this slice no work can be admitted. The disabled state and new epoch
+  # fence the assistant without deleting its pointer or history. Enabled
+  # bindings must be disabled first. The assistant lock held here blocks a
+  # concurrent enable or rebind, which locks the assistant before the binding.
+  defp assistant_transition(%{status: :disabled} = assistant, :retire) do
+    case read(InboxBinding, :enabled_for_assistant, %{assistant_id: assistant.id}) do
+      {:ok, nil} -> {:ok, epoch(assistant, %{status: :retired})}
+      {:ok, _binding} -> {:error, :enabled_binding}
+      error -> error
+    end
+  end
+
+  defp assistant_transition(_, _), do: {:error, :invalid_transition}
+
+  defp editable_assistant(%{status: :retired}), do: {:error, :invalid_transition}
+  defp editable_assistant(_assistant), do: :ok
+
+  defp revision_transition(revision, _assistant, :edit_draft, args, admin) do
+    attrs =
+      args |> Map.take(@revision_fields) |> Map.reject(fn {_key, value} -> is_nil(value) end)
+
+    transition(revision, attrs, :edit_draft, admin)
+  end
+
+  defp revision_transition(revision, _assistant, :discard, _args, admin),
+    do: transition(revision, %{status: :discarded}, :discard, admin)
+
+  defp revision_transition(revision, assistant, :publish, args, admin) do
+    with :ok <- expected_pointer(assistant, Map.fetch(args, :expected_active_revision_id)),
+         {:ok, hash} <- fixture_hash(revision),
+         :ok <- supersede(assistant.active_revision_id, admin),
+         {:ok, published} <-
+           change(
+             revision,
+             %{
+               status: :published,
+               config_hash: hash,
+               published_by_id: admin,
+               published_at: DateTime.utc_now()
+             },
+             :publish,
+             admin
+           ),
+         {:ok, _} <-
+           change(
+             assistant,
+             epoch(assistant, %{active_revision_id: revision.id}),
+             :switch_revision,
+             admin
+           ) do
+      {:ok, projection(published)}
+    end
+  end
+
+  defp expected_pointer(%{active_revision_id: expected}, {:ok, expected}), do: :ok
+  defp expected_pointer(_, :error), do: {:error, :missing_expected_revision_pointer}
+  defp expected_pointer(_, _), do: {:error, :stale_revision_pointer}
+
+  defp supersede(nil, _admin), do: :ok
+
+  defp supersede(id, admin) do
+    with {:ok, %{status: :published} = revision} <- get(AssistantRevision, id, :for_update),
+         {:ok, _} <- change(revision, %{status: :superseded}, :supersede, admin) do
+      :ok
+    else
+      {:ok, _} -> {:error, :invalid_revision_pointer}
+      error -> error
+    end
+  end
+
+  defp binding_transition(%{status: status} = binding, :enable, _args)
+       when status in [:draft, :disabled] do
+    with :ok <- eligible_binding(binding) do
+      {:ok, %{status: :enabled}}
+    end
+  end
+
+  defp binding_transition(%{status: :enabled}, :disable, _args), do: {:ok, %{status: :disabled}}
+
+  defp binding_transition(%{status: :disabled} = binding, :rebind, %{assistant_id: id}) do
+    candidate = %{binding | assistant_id: id}
+
+    with {:ok, fixture} <- binding_fixture(candidate),
+         :ok <- eligible_assistant(id) do
+      {:ok, Map.put(Map.take(fixture, @routing_fields), :assistant_id, id)}
+    end
+  end
+
+  defp binding_transition(%{status: status} = binding, :change_mode, %{operating_mode: :automatic})
+       when status != :retired do
+    with :ok <- eligible_binding(binding), do: {:ok, %{operating_mode: :automatic}}
+  end
+
+  defp binding_transition(%{status: status}, :change_mode, %{operating_mode: mode})
+       when status != :retired,
+       do: {:ok, %{operating_mode: mode}}
+
+  defp binding_transition(%{status: :disabled}, :retire, _args), do: {:ok, %{status: :retired}}
+  defp binding_transition(_, _, _), do: {:error, :invalid_transition}
+
+  defp control_transition(_control, :disable_automation, _args),
+    do: {:ok, %{status: :disabled, mode: :disabled}}
+
+  defp control_transition(%{status: :disabled}, :enable_automation, %{binding_id: id}) do
+    with {:ok, %{status: :enabled, operating_mode: :automatic} = binding} <-
+           lock_binding(id),
+         :ok <- eligible_binding(binding) do
+      {:ok, %{status: :enabled, mode: :fake}}
+    else
+      {:ok, _} -> {:error, :invalid_transition}
+      error -> error
+    end
+  end
+
+  defp control_transition(_, _, _), do: {:error, :invalid_transition}
+
+  # The binding's assistant is read unlocked first so that its lock is taken
+  # before the binding's. A rebind between the two reads is reported as a
+  # conflict instead of locking a different assistant out of order.
+  defp lock_binding(id, other_assistants \\ []) do
+    with {:ok, candidate} <- get(InboxBinding, id),
+         :ok <- lock_assistants([candidate.assistant_id | other_assistants]),
+         {:ok, binding} <- get(InboxBinding, id, :for_update) do
+      if binding.assistant_id == candidate.assistant_id,
+        do: {:ok, binding},
+        else: {:error, :concurrent_configuration_change}
+    end
+  end
+
+  # UUID strings share one fixed format, so string order matches PostgreSQL's.
+  defp lock_assistants(ids) do
+    ids
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.reduce_while(:ok, fn id, :ok ->
+      case get(Assistant, id, :for_update) do
+        {:ok, _} -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp rebind_target(:rebind, %{assistant_id: id}), do: [id]
+  defp rebind_target(_action, _args), do: []
+
+  defp eligible_binding(binding) do
+    with {:ok, fixture} <- binding_fixture(binding),
+         true <- same_fields?(binding, fixture, @routing_fields) do
+      eligible_assistant(binding.assistant_id)
+    else
+      _ -> {:error, :unverified_test_binding}
+    end
+  end
+
+  defp eligible_assistant(id) do
+    with {:ok, %{status: :active, audience: :public} = assistant} <-
+           get(Assistant, id, :for_update) do
+      published_fixture(assistant)
+    else
+      {:ok, _} -> {:error, :inactive_assistant}
+      error -> error
+    end
+  end
+
+  defp published_fixture(assistant) do
+    with :public <- assistant.audience,
+         id when not is_nil(id) <- assistant.active_revision_id,
+         {:ok, %{status: :published, assistant_id: owner} = revision} <-
+           get(AssistantRevision, id),
+         true <- owner == assistant.id,
+         {:ok, hash} <- fixture_hash(revision),
+         true <- revision.config_hash == hash do
+      :ok
+    else
+      _ -> {:error, :unverified_test_revision}
+    end
+  end
+
+  defp binding_fixture(binding) do
+    case fixture() do
+      %{credential_ref: ref, handoff_team_id: team} = fixture
+      when is_binary(ref) and is_integer(team) ->
+        if same_fields?(binding, fixture, [:assistant_id | @inbox_fields]),
+          do: {:ok, fixture},
+          else: {:error, :unverified_test_binding}
+
+      _ ->
+        {:error, :unverified_test_binding}
+    end
+  end
+
+  defp fixture_hash(revision) do
+    case fixture() do
+      %{fixed_text: text} = fixture when is_binary(text) and byte_size(text) in 1..4096 ->
+        if same_fields?(revision, fixture, [:assistant_id | @revision_fields]) do
+          value = Enum.map(@revision_fields ++ [:fixed_text], &Map.fetch!(fixture, &1))
+
+          {:ok,
+           :crypto.hash(:sha256, :erlang.term_to_binary(value)) |> Base.encode16(case: :lower)}
+        else
+          {:error, :unverified_test_revision}
+        end
+
+      _ ->
+        {:error, :unverified_test_revision}
+    end
+  end
+
+  # Only deterministic TEST fixtures can authorize activation in this slice.
+  if Mix.env() == :test do
+    defp fixture, do: Application.get_env(:voelgoed_ai, :support_fixture)
+  else
+    defp fixture, do: nil
+  end
+
+  defp same_fields?(left, right, fields), do: Map.take(left, fields) == Map.take(right, fields)
+  defp epoch(row, attrs), do: Map.put(attrs, :security_epoch, row.security_epoch + 1)
+
+  defp scoped_read(resource, args, {installation, account, inbox}) do
+    with {:ok, %InboxBinding{} = binding} <-
+           read(InboxBinding, :qualified_inbox, %{
+             installation_ref: installation,
+             external_account_id: account,
+             external_inbox_id: inbox
+           }) do
+      scoped_configuration(resource, args, binding)
+    else
+      _ -> {:error, :denied}
+    end
+  end
+
+  defp scoped_read(_, _, _), do: {:error, :denied}
+
+  defp scoped_configuration(InboxBinding, %{id: id}, %{id: id} = binding),
+    do: {:ok, projection(binding)}
+
+  defp scoped_configuration(Assistant, %{id: id}, %{assistant_id: id}),
+    do: project(get(Assistant, id))
+
+  # Workers see only revisions that were published. Drafts and discarded
+  # revisions stay visible to admins only.
+  defp scoped_configuration(AssistantRevision, %{id: id}, %{assistant_id: assistant_id}) do
+    with {:ok, %{assistant_id: ^assistant_id, status: status} = revision}
+         when status in [:published, :superseded] <- get(AssistantRevision, id) do
+      {:ok, projection(revision)}
+    else
+      _ -> {:error, :denied}
+    end
+  end
+
+  defp scoped_configuration(AutomationControl, %{}, _binding),
+    do: project(get(AutomationControl, :global))
+
+  defp scoped_configuration(AuditEvent, %{target_kind: :inbox_binding, id: id} = args, %{id: id}),
+    do: history(args)
+
+  defp scoped_configuration(AuditEvent, %{target_kind: :assistant, id: id} = args, %{
+         assistant_id: id
+       }),
+       do: history(args)
+
+  defp scoped_configuration(
+         AuditEvent,
+         %{target_kind: :assistant_revision, id: id} = args,
+         binding
+       ) do
+    with {:ok, _} <- scoped_configuration(AssistantRevision, %{id: id}, binding),
+         do: history(args)
+  end
+
+  defp scoped_configuration(_, _, _), do: {:error, :denied}
+
+  defp projection(%Assistant{} = row),
+    do:
+      Map.take(row, [
+        :id,
+        :slug,
+        :display_name,
+        :kind,
+        :audience,
+        :status,
+        :active_revision_id,
+        :security_epoch,
+        :disabled_at
+      ])
+
+  defp projection(%AssistantRevision{} = row),
+    do:
+      Map.take(row, [
+        :id,
+        :assistant_id,
+        :revision_number,
+        :status,
+        :config_hash,
+        :published_at | @revision_fields
+      ])
+
+  defp projection(%InboxBinding{} = row),
+    do:
+      Map.take(row, [
+        :id,
+        :assistant_id,
+        :status,
+        :operating_mode,
+        :handoff_team_id,
+        :security_epoch | @inbox_fields
+      ])
+
+  defp projection(%AutomationControl{} = row),
+    do: Map.take(row, [:id, :status, :mode, :security_epoch])
+
+  defp project({:ok, row}), do: {:ok, projection(row)}
+  defp project(error), do: error
+
+  defp get(resource, id, lock \\ nil) do
+    args = if id == :global, do: %{}, else: %{id: id}
+
+    case read(resource, :configuration_row, args, lock) do
+      {:ok, nil} -> {:error, :not_found}
+      result -> result
+    end
+  end
+
+  defp read(resource, action, args, lock \\ nil) do
+    storage(resource, action, fn actor ->
+      query = Ash.Query.for_read(resource, action, args, actor: actor)
+      query = if lock, do: Ash.Query.lock(query, lock), else: query
+      Ash.read_one(query)
+    end)
+  end
+
+  defp insert(resource, attrs, event, admin) do
+    with {:ok, row} <-
+           storage(
+             resource,
+             :create_row,
+             &Ash.create(resource, attrs, action: :create_row, actor: &1)
+           ),
+         {:ok, _} <- audit(nil, row, event, admin) do
+      {:ok, projection(row)}
+    end
+  end
+
+  defp transition(row, attrs, event, admin), do: project(change(row, attrs, event, admin))
+
+  defp change(%resource{} = row, attrs, event, admin) do
+    with {:ok, updated} <-
+           storage(resource, :update_row, &Ash.update(row, attrs, action: :update_row, actor: &1)),
+         {:ok, _} <- audit(row, updated, event, admin) do
+      {:ok, updated}
+    end
+  end
+
+  defp audit(before, row, event, admin) do
+    {kind, foreign_key} = audit_target(row.__struct__)
+
+    attrs = %{
+      foreign_key => row.id,
+      target_kind: kind,
+      actor_kind: :staff,
+      actor_staff_id: admin,
+      event: event,
+      reason_code: :local_admin,
+      operational_before: audit_state(before),
+      operational_after: audit_state(row),
+      correlation_id: Ash.UUIDv7.generate()
+    }
+
+    storage(AuditEvent, :append_operational, fn actor ->
+      Ash.create(AuditEvent, audit_attributes(attrs), action: :append_operational, actor: actor)
+    end)
+  end
+
+  if Mix.env() == :test do
+    defp audit_attributes(%{event: event} = attrs) do
+      if Process.get({__MODULE__, :reject_audit}) == event,
+        do: Map.delete(attrs, :actor_staff_id),
+        else: attrs
+    end
+  else
+    defp audit_attributes(attrs), do: attrs
+  end
+
+  defp audit_state(nil), do: nil
+  defp audit_state(row), do: projection(row) |> Map.drop([:id, :disabled_at, :published_at])
+
+  defp audit_target(Assistant), do: {:assistant, :assistant_target_id}
+  defp audit_target(AssistantRevision), do: {:assistant_revision, :revision_target_id}
+  defp audit_target(InboxBinding), do: {:inbox_binding, :binding_target_id}
+  defp audit_target(AutomationControl), do: {:automation_control, :control_target_id}
+
+  defp history(args) do
+    storage(AuditEvent, :operational_rows, fn actor ->
+      AuditEvent
+      |> Ash.Query.for_read(:operational_rows, args, actor: actor)
+      |> Ash.read()
+    end)
+    |> case do
+      {:ok, rows} ->
+        {:ok,
+         Enum.map(
+           rows,
+           &Map.take(&1, [
+             :id,
+             :event,
+             :reason_code,
+             :actor_staff_id,
+             :target_kind,
+             :correlation_id,
+             :occurred_at,
+             :operational_before,
+             :operational_after
+           ])
+         )}
+
+      error ->
+        error
+    end
+  end
+
+  # Only private calls in this module mint capabilities. They expire before
+  # the action returns and cannot be reused across processes or actions.
+  defp storage(resource, action, operation) do
+    key = {__MODULE__, :storage}
+    ref = make_ref()
+    previous = Process.put(key, {ref, resource, action})
+
+    try do
+      operation.(%Storage{ref: ref})
+    after
+      if previous, do: Process.put(key, previous), else: Process.delete(key)
+    end
+  end
+
+  defp result({:error, reason}) when is_atom(reason), do: {:error, Atom.to_string(reason)}
+  defp result({:error, _}), do: {:error, "configuration storage failed"}
+  defp result(success), do: success
+end

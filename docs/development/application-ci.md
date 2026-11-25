@@ -24,16 +24,21 @@ The workflow follows the whole-file scheduling pattern from
 [NewYou PR 322](https://github.com/Carpe-Diem-Media/NewYou/pull/322).
 Coverage relies on complete file assignment and ExUnit's exit status.
 
-The gate also requires `mix ash.codegen --check`, both migration lanes and a
+The gate also requires `mix ash.codegen --check`, all three migration lanes and a
 redacted Gitleaks 8.30.1 scan of the candidate commit range. Only the ExUnit
 matrix may be skipped, and only when the planner emits `has_tests=false`.
 The migration lanes use separate disposable PostgreSQL/pgvector services. The
 fresh lane applies the candidate migrations to an empty database. The upgrade
 lane checks the foundation file against `aa93104`, applies that file alone,
-then applies the candidate. Both lanes check for pending migrations before
-running the same schema tests.
+then applies the candidate. The `vgas001-upgrade` lane checks both immutable
+predecessor migrations against `92ef0e3`, applies them, and inserts a synthetic
+staff and audit record before upgrading. All lanes check for pending migrations
+and verify Oban v14 on the application Repo. Tests use manual Oban and prove that
+a separate connection cannot see an uncommitted job and that rollback removes
+it. The predecessor lane also verifies the exact staff and audit facts it
+inserted. Oban starts with no queues, plugins, peer or stager in this slice.
 
 Use DevCore for local bootstrap and keep DEV and TEST separate. The workstation
 TEST role cannot install server extensions. On a pgvector-enabled TEST target,
 run the vector probe with `VGAS_VERIFY_PGVECTOR=true`. CI sets this flag in
-every shard and both migration lanes, so missing pgvector fails the gate.
+every shard and all migration lanes, so missing pgvector fails the gate.

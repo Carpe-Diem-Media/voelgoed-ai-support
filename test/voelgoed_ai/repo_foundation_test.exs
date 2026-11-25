@@ -62,6 +62,67 @@ defmodule VoelgoedAi.RepoFoundationTest do
              """)
   end
 
+  test "Oban v14 uses the application Repo in manual mode with no worker queues" do
+    assert %{repo: Repo, testing: :manual, queues: [], plugins: []} = Oban.config()
+    assert 14 == Oban.Migration.migrated_version(repo: Repo)
+  end
+
+  test "Oban insertion participates in the caller transaction" do
+    reference = Ash.UUIDv7.generate()
+
+    job =
+      Oban.Job.new(%{reference: reference},
+        queue: :storage_probe,
+        worker: "VoelgoedAi.RepoFoundationTest.StorageProbe"
+      )
+
+    visible = fn ->
+      SQL.query!(Repo, "SELECT count(*) FROM oban_jobs WHERE args->>'reference' = $1", [reference])
+    end
+
+    assert {:error, :rollback_probe} =
+             Repo.transact(fn ->
+               assert {:ok, %Oban.Job{}} = Oban.insert(job)
+               assert %{rows: [[1]]} = visible.()
+               assert %{rows: [[0]]} = Task.async(visible) |> Task.await(5_000)
+               {:error, :rollback_probe}
+             end)
+
+    assert %{rows: [[0]]} = visible.()
+  end
+
+  @tag :requires_vgas001_upgrade
+  test "the predecessor upgrade preserves existing staff and audit facts" do
+    assert %{
+             rows: [
+               [
+                 "019ac560-0000-7000-8000-000000000001",
+                 "vgas001-upgrade-fixture",
+                 "invited",
+                 ["admin"],
+                 0,
+                 "019ac560-0000-7000-8000-000000000002",
+                 "019ac560-0000-7000-8000-000000000003",
+                 "bootstrap",
+                 "staff-bootstrap",
+                 "staff_user",
+                 "provisioned",
+                 "allowlisted",
+                 %{"status" => "invited", "roles" => ["admin"], "session_generation" => 0},
+                 nil,
+                 nil
+               ]
+             ]
+           } =
+             SQL.query!(Repo, """
+             SELECT s.id::text, s.identity_subject, s.status, s.roles, s.session_generation,
+                    a.id::text, a.correlation_id::text, a.actor_kind, a.operator_ref, a.target_kind,
+                    a.event, a.reason_code, a.after_state, a.operational_before, a.operational_after
+             FROM staff_users s JOIN audit_events a ON a.target_id = s.id
+             WHERE s.id = '019ac560-0000-7000-8000-000000000001'
+             """)
+  end
+
   @tag :requires_pgvector
   test "the pre-provisioned vector extension executes a cosine distance query" do
     assert %{rows: [[true]]} =

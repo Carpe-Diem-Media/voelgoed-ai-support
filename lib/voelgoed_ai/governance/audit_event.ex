@@ -1,5 +1,5 @@
 defmodule VoelgoedAi.Governance.AuditEvent do
-  @moduledoc "An immutable staff security event with only local references and authorization state."
+  @moduledoc "An immutable staff security or support configuration event with local references."
 
   use Ash.Resource,
     domain: VoelgoedAi.Governance,
@@ -8,6 +8,73 @@ defmodule VoelgoedAi.Governance.AuditEvent do
 
   alias VoelgoedAi.Accounts.{StaffAccess, StaffUser}
   alias VoelgoedAi.Accounts.StaffAccess.Scope
+
+  alias VoelgoedAi.Support.{ActionScope, Configuration}
+
+  @staff_events [
+    :provisioned,
+    :activated,
+    :signed_in,
+    :roles_changed,
+    :disabled,
+    :reactivated,
+    :retired
+  ]
+  @operational_events [
+    :create,
+    :activate,
+    :disable,
+    :retire,
+    :switch_revision,
+    :create_draft,
+    :edit_draft,
+    :publish,
+    :supersede,
+    :discard,
+    :enable,
+    :rebind,
+    :change_mode,
+    :enable_automation,
+    :disable_automation
+  ]
+  @target_kinds [:assistant, :assistant_revision, :inbox_binding, :automation_control]
+  @operational_fields [
+    status: [
+      type: :atom,
+      allow_nil?: false,
+      constraints: [
+        one_of: [
+          :active,
+          :disabled,
+          :enabled,
+          :retired,
+          :draft,
+          :published,
+          :superseded,
+          :discarded
+        ]
+      ]
+    ],
+    security_epoch: [type: :integer, constraints: [min: 0]],
+    slug: [type: :string, constraints: [max_length: 64]],
+    display_name: [type: :string, constraints: [max_length: 120]],
+    kind: [type: :atom, constraints: [one_of: [:customer_support]]],
+    audience: [type: :atom, constraints: [one_of: [:public, :internal]]],
+    active_revision_id: [type: :uuid],
+    assistant_id: [type: :uuid],
+    revision_number: [type: :integer, constraints: [min: 1]],
+    workflow_version: [type: :string, constraints: [max_length: 64]],
+    template_version: [type: :string, constraints: [max_length: 64]],
+    locale: [type: :atom, constraints: [one_of: [:af, :en]]],
+    response_policy: [type: :atom, constraints: [one_of: [:fixed_reply, :handoff]]],
+    config_hash: [type: :string, constraints: [max_length: 64]],
+    installation_ref: [type: :string, constraints: [max_length: 64]],
+    external_account_id: [type: :integer, constraints: [min: 1]],
+    external_inbox_id: [type: :integer, constraints: [min: 1]],
+    handoff_team_id: [type: :integer, constraints: [min: 1]],
+    operating_mode: [type: :atom, constraints: [one_of: [:shadow, :assisted, :automatic]]],
+    mode: [type: :atom, constraints: [one_of: [:disabled, :fake]]]
+  ]
 
   @state_fields [
     status: [
@@ -30,6 +97,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     references do
       reference(:target, on_delete: :restrict, on_update: :restrict)
       reference(:actor_staff, on_delete: :restrict, on_update: :restrict)
+      reference(:assistant_target, on_delete: :restrict, on_update: :restrict)
+      reference(:revision_target, on_delete: :restrict, on_update: :restrict)
+      reference(:binding_target, on_delete: :restrict, on_update: :restrict)
+      reference(:control_target, on_delete: :restrict, on_update: :restrict)
     end
 
     check_constraints do
@@ -37,6 +108,34 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         check: """
         (actor_kind = 'bootstrap' AND actor_staff_id IS NULL AND operator_ref = 'staff-bootstrap' AND operator_ref IS NOT NULL)
         OR (actor_kind = 'staff' AND actor_staff_id IS NOT NULL AND operator_ref IS NULL)
+        """
+      )
+
+      check_constraint(:target_kind, "audit_events_exact_target",
+        check: """
+          num_nonnulls(target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id) = 1
+          AND (
+            (target_kind = 'staff_user' AND target_id IS NOT NULL
+              AND event IN ('provisioned','activated','signed_in','roles_changed','disabled','reactivated','retired')
+              AND reason_code IN ('allowlisted','verified_oidc','local_admin','approved_reprovision'))
+            OR (target_kind = 'assistant' AND assistant_target_id IS NOT NULL
+              AND event IN ('create','activate','disable','retire','switch_revision'))
+            OR (target_kind = 'assistant_revision' AND revision_target_id IS NOT NULL
+              AND event IN ('create_draft','edit_draft','publish','supersede','discard'))
+            OR (target_kind = 'inbox_binding' AND binding_target_id IS NOT NULL
+              AND event IN ('create_draft','enable','disable','rebind','change_mode','retire'))
+            OR (target_kind = 'automation_control' AND control_target_id IS NOT NULL
+              AND event IN ('enable_automation','disable_automation'))
+          )
+        """
+      )
+
+      check_constraint(:target_kind, "audit_events_state_shape",
+        check: """
+          (target_kind = 'staff_user' AND after_state IS NOT NULL
+            AND operational_before IS NULL AND operational_after IS NULL)
+          OR (target_kind <> 'staff_user' AND actor_kind = 'staff' AND reason_code = 'local_admin'
+            AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL)
         """
       )
     end
@@ -50,22 +149,12 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     attribute(:target_kind, :atom,
       allow_nil?: false,
       default: :staff_user,
-      constraints: [one_of: [:staff_user]]
+      constraints: [one_of: [:staff_user | @target_kinds]]
     )
 
     attribute(:event, :atom,
       allow_nil?: false,
-      constraints: [
-        one_of: [
-          :provisioned,
-          :activated,
-          :signed_in,
-          :roles_changed,
-          :disabled,
-          :reactivated,
-          :retired
-        ]
-      ]
+      constraints: [one_of: @staff_events ++ @operational_events]
     )
 
     attribute(:reason_code, :atom,
@@ -74,14 +163,20 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     )
 
     attribute(:before_state, :map, constraints: [fields: @state_fields])
-    attribute(:after_state, :map, allow_nil?: false, constraints: [fields: @state_fields])
+    attribute(:after_state, :map, constraints: [fields: @state_fields])
+    attribute(:operational_before, :map, constraints: [fields: @operational_fields])
+    attribute(:operational_after, :map, constraints: [fields: @operational_fields])
     attribute(:correlation_id, :uuid, allow_nil?: false)
     attribute(:occurred_at, :utc_datetime_usec, allow_nil?: false, default: &DateTime.utc_now/0)
     create_timestamp(:inserted_at)
   end
 
   relationships do
-    belongs_to(:target, StaffUser, allow_nil?: false)
+    belongs_to(:target, StaffUser)
+    belongs_to(:assistant_target, VoelgoedAi.Intelligence.Assistant)
+    belongs_to(:revision_target, VoelgoedAi.Intelligence.AssistantRevision)
+    belongs_to(:binding_target, VoelgoedAi.Support.InboxBinding)
+    belongs_to(:control_target, VoelgoedAi.Governance.AutomationControl)
     belongs_to(:actor_staff, StaffUser)
   end
 
@@ -100,16 +195,72 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         :after_state,
         :correlation_id
       ])
+
+      validate(present([:target_id, :after_state]))
+      validate(attribute_in(:event, @staff_events))
+    end
+
+    create :append_operational do
+      transaction?(false)
+
+      accept([
+        :actor_kind,
+        :actor_staff_id,
+        :target_kind,
+        :assistant_target_id,
+        :revision_target_id,
+        :binding_target_id,
+        :control_target_id,
+        :event,
+        :reason_code,
+        :operational_before,
+        :operational_after,
+        :correlation_id
+      ])
+
+      validate(present([:actor_staff_id, :operational_after]))
+      validate(attribute_in(:target_kind, @target_kinds))
+      validate(attribute_in(:event, @operational_events))
+    end
+
+    action :operational_history, {:array, :map} do
+      argument(:target_kind, :atom, allow_nil?: false, constraints: [one_of: @target_kinds])
+      argument(:id, :uuid, allow_nil?: false)
+      run(Configuration)
+    end
+
+    read :operational_rows do
+      argument(:target_kind, :atom, allow_nil?: false, constraints: [one_of: @target_kinds])
+      argument(:id, :uuid, allow_nil?: false)
+
+      filter(
+        expr(
+          target_kind == ^arg(:target_kind) and
+            (assistant_target_id == ^arg(:id) or revision_target_id == ^arg(:id) or
+               binding_target_id == ^arg(:id) or control_target_id == ^arg(:id))
+        )
+      )
+
+      prepare(build(sort: [:occurred_at, :id], limit: 100))
     end
 
     read :staff_security_history do
       argument(:target_id, :uuid, allow_nil?: false)
-      filter(expr(target_id == ^arg(:target_id)))
+      filter(expr(target_kind == :staff_user and target_id == ^arg(:target_id)))
       prepare(build(sort: [:occurred_at, :id], limit: 100))
     end
   end
 
   policies do
+    policy action([:append_operational, :operational_rows]) do
+      authorize_if(ActionScope.Storage)
+    end
+
+    policy action(:operational_history) do
+      authorize_if(ActionScope.Admin)
+      authorize_if(ActionScope)
+    end
+
     policy action([:append, :staff_security_history]) do
       authorize_if(Scope)
     end

@@ -67,7 +67,13 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
              )
 
     assert Ash.Resource.Info.actions(AuditEvent) |> Enum.map(& &1.name) |> Enum.sort() ==
-             [:append, :staff_security_history]
+             [
+               :append,
+               :append_operational,
+               :operational_history,
+               :operational_rows,
+               :staff_security_history
+             ]
   end
 
   test "roles are additive and a restored role does not revive a cookie", %{
