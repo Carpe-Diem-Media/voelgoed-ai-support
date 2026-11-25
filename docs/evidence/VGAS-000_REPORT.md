@@ -920,3 +920,37 @@ All mutations were reverted before verification.
 Local F08 passed using synthetic identities and DevCore TEST. Live
 Entra proof remains pending in VGAS-9, so F08 is still partial overall.
 Independent review and CI for the published candidate remain pending.
+
+### Independent review of 71d3069 and low-finding fixes
+
+An independent Claude Opus 5.5 review of `71d3069` approved the code.
+It found no fail-open path, crash path or authentication bypass, and
+each of the 21 guard removals it tried made a committed test fail. It
+raised three low findings, fixed in `cd78a33`:
+
+- The callback rescue caught `ExUnit.AssertionError` raised by the
+  provider stub, so a broken PKCE or redirect assertion could pass as an
+  expected 401. The rescue now re-raises fixture assertions, and a
+  regression confirms the original assertion reaches the test.
+- RSA keys had no size or exponent bounds. The adapter now requires a
+  2048 to 4096 bit modulus with its top bit set and exponent `AQAB`.
+  Regressions deny a modulus without its top bit, 1024-bit and 4104-bit
+  moduli, exponent 3, an oversized exponent and a token signed by a
+  published 1024-bit key.
+- Access and refresh tokens shared the 4 KiB text bound. They now use the
+  32 KiB compact-token bound, and a regression accepts a 32 KiB access
+  token with a 5,000-byte refresh token.
+
+Removing the re-raise, the modulus bounds, the exponent rule or the
+access-token bound each exited 2 with the targeted test failing. With
+the fixes restored, the F08 file passed 34 tests on seeds `0`, `17` and
+`2026`. The full suite passed 80 with five existing F04 skips on seed
+`543717`. Locked and unused dependency checks, formatting, `hex.audit`,
+warnings-as-errors compilation, `plan_tests.py`, `git diff --check` and
+gitleaks (10 commits, no leaks) exited 0.
+
+The review's informational notes stay open for VGAS-9: duplicate JSON
+member names resolve consistently across Jason, Elixir `JSON` and JOSE;
+there is no maximum token lifetime or future `iat` rule; and the signed
+issuer and tenant comparisons are redundant with Assent and the database
+filter, so no test isolates them.
