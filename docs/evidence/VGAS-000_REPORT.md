@@ -585,6 +585,376 @@ three failed; with it restored, the 21 focused tests pass.
   field and canonical hash on the wire, and test revocation between
   ranking and projection.
 
+## F08 · Entra and staff authorisation (VGAS-6)
+
+**PASS for local F08 (VGAS-6).** The OIDC fixture, PostgreSQL
+authorisation, session denial, audit and clean build checks passed.
+VGAS-9 owns proof against an authorised live Entra test registration.
+The feasibility brief classifies F08 as **PARTIAL** while that live
+proof is pending.
+
+The initial 2026-11-25 run used branch `feat/vgas-6-f08-entra-authz` at base
+`324cb105d749de50b31f3ea007cabd931a915ff0`. The diff for
+`config`, `lib`, `test` and `mix.exs` against that base has SHA-256
+`fe0ae4b9cbb3b30467253b3fabbab2dbc7a42dd4e6996e312ca6800f207d0adf`.
+The lockfile SHA-256 is
+`97e956eb45a003ebae63bdbe513d6ecabd187e9fd5a40f68114c732896c71867`.
+Mise pinned Elixir 1.20.5 and Erlang 29.1.2. The fixture used Ash 3.38.1,
+AshPostgres 2.15.2, AshAuthentication 5.0.0-rc.18,
+AshAuthenticationPhoenix 3.0.0-rc.12 and Assent 0.3.2 against DevCore TEST
+PostgreSQL 18.6. Every test ran without `OPENAI_API_KEY`. The fixtures
+generated RSA keys in memory and routed all provider requests through
+private Req.Test stubs.
+
+Ash 3.38.1 checks for a SAT solver when it compiles a policy authorizer.
+Crux 0.1.5 selects `Picosat` at compile time when available, then falls
+back to `SimpleSat`. The application pins `simple_sat` 0.1.4 in all
+environments so policy checks can use the solver at compile time and
+runtime. This release uses pure Elixir, has no Hex dependencies and
+satisfies the optional solver requirement in both Ash and Crux. Only
+the solver entry changed in the lockfile.
+[Hex release metadata](https://hex.pm/api/packages/simple_sat/releases/0.1.4).
+
+### Expected and observed
+
+- **Verified callback and activation.** The native strategy produced an
+  authorization-code redirect with state, nonce and S256 PKCE. The
+  fixture token stub checked the code, callback URI and verifier. Assent
+  used discovery and JWKS to verify the signed token. Two concurrent
+  callbacks with different provider emails selected the same local UUID
+  and produced one activation and one routine login. The signed cookie
+  carried the staff UUID, generation and expiry. The explicit ADMIN role
+  passed the admin probe. The reviewer probe required its own role.
+- **Identity and protocol denial.** A wrong or missing tenant or issuer,
+  substituted discovery and token issuer, wrong, empty or missing
+  subject, email-only identity, and unlisted or disabled identity all
+  failed. Caller-supplied maps could not invoke sign-in successfully.
+  State or callback-cookie errors stopped before code exchange. Replay
+  reached the provider stub, where the code was already spent. Invalid
+  nonce, audience, times, signature, key and algorithm, plus discovery,
+  token and JWKS errors, all denied. Assent 0.3.2 raises for two malformed
+  inputs tested here. The fixture catches only the observed Assent
+  state/nonce comparison and audience enumeration errors at the callback.
+- **Local revocation.** Each fresh privileged request and direct Ash
+  probe checked the current staff row. An operator failed both privileged
+  probes even with provider ADMIN and reviewer claims. Disable rejected
+  a previously issued cookie, a stale direct action and a new valid
+  sign-in. It also defeated activation with a candidate read before the
+  disable committed. Demotion revoked the old cookie. Restoring the
+  role left that cookie and the interim operator cookie denied. A fresh
+  login used the restored role. The tests denied absent and tampered
+  cookies and expired or unknown actors on direct Ash calls.
+- **Audit and isolation.** A forced PostgreSQL audit constraint failure
+  rolled activation back and prevented cookie issuance. Ordinary staff
+  could neither write an arbitrary audit event nor invoke the raw
+  transition directly. Two schema prefixes with the same provider
+  subject kept staff and audit rows isolated. ExUnit teardown removed
+  each generated schema. The fixture uses bootstrap-only provisioning.
+  Reactivation, retirement and database outage were outside the local run.
+
+The fixture binds the stored issuer and pairwise subject to the configured
+app registration, with the exact signed tenant checked separately. After
+native validation, the preparation recovers the signed issuer and tenant
+from the token and checks the time claim types. Assent drops the protocol
+claims from user info and its expiry check uses Elixir term ordering.
+Provider email, object ID, groups and roles assign no local privilege.
+A different client ID requires explicit allowlist provisioning for its
+pairwise subjects. The relevant pinned implementation is
+`ash_authentication/lib/ash_authentication/strategies/oauth2/plug.ex`
+(`callback/2` and `action_opts/1`) and
+`assent/lib/assent/strategies/oidc.ex` (`fetch_user/2` and
+`validate_id_token/2`).
+[OIDC Core §3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation),
+[OIDC Discovery §4.3](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationValidation),
+[Entra ID-token claims](https://learn.microsoft.com/en-us/entra/identity-platform/id-token-claims-reference#use-claims-to-reliably-identify-a-user).
+
+### Verification and remaining gates
+
+- `mise exec -- mix format --check-formatted`,
+  `mise exec -- mix deps.get --check-locked` and `mise exec -- mix hex.audit`
+  each exited 0. Hex reported no retired or advisory packages.
+- The clean TEST build reproduced `No SAT solver available` and exited
+  1 before the solver pin. After adding the pin,
+  `rm -rf _build/test && MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  and the DEV `mise exec -- mix compile --warnings-as-errors` each
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --no-color test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+  exited 0 for seeds `0`, `17` and `2026`, with 13 passed each and no skips.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --no-color`
+  exited 0 with 57 passed and five existing F04 disposable tests skipped.
+- `python3 .github/scripts/plan_tests.py` exited 0 and included F08.
+  `git diff --check`, `git diff --cached --check` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --staged --redact` exited 0.
+  Gitleaks found no leaks. GitHub Actions on the candidate remains unverified.
+
+### Review fixes after integrating main
+
+The independent review of `e5f6029230ae4bf5276a596881e17baf4c8f7ad2`
+found that Assent 0.3.2 used discovery endpoints before the signed-issuer
+check ran. The test-only HTTP adapter now checks the discovery issuer
+against the configured issuer by exact string comparison before handing
+the response to Assent in either phase. It also requires authorization,
+token and JWKS endpoints. Both phases return 401 with no redirect or
+session for invalid discovery. A callback with valid saved state and
+PKCE never reaches the fake token endpoint when discovery fails.
+[OIDC Discovery §4.3](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationValidation).
+
+An authenticated staff member with an empty local role grant fails both
+privileged probes despite provider role claims. For disablement and role
+changes, a PostgreSQL constraint rejects the audit append. Both management
+calls return an invalid `Ash.Changeset`. The transaction preserves the
+staff row and the existing session's access. These tests cover the existing
+role check and transaction in `EntraStore`.
+
+With only the discovery issuer comparison removed, the request returned
+302 and the callback hit the token endpoint once. Bypassing the adapter
+raised a `BadMapError` on empty metadata. Omitting each required endpoint
+check separately allowed a redirect or an exchange. Letting empty role
+grants pass returned 204 on an admin probe that should return 403.
+Removing the management transaction separately for each action caused
+the persisted state assertion to fail. Each mutated ExUnit run exited 2.
+All mutations were reverted.
+
+The review-fix branch incorporates main
+`a731a06a0d54d61438c6e709e5a3170e6b60b7ed`. The diff for
+`config`, `lib`, `test` and `mix.exs` against that main has SHA-256
+`570c6df3d262c0a668dc3641d878b50b83e6ccf2df78c5a16f8c669fdea60e17`.
+
+Review-fix verification on DevCore TEST, with all mutations reverted:
+
+- `mise exec -- mix format --check-formatted` and
+  `rm -rf _build/test && MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0. The build emitted dependency warnings during the clean compile.
+- `mise exec -- mix deps.get --check-locked` and `mise exec -- mix hex.audit`
+  exited 0. Hex reported no retired packages or advisories.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --no-color test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+  exited 0 on seeds `0`, `17` and `2026`. Each run passed all 19 F08 tests.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --no-color`
+  exited 0 on seed `934318`, with 65 passed and five existing F04
+  disposable-target skips.
+- `python3 .github/scripts/plan_tests.py` exited 0 and included F08.
+  `git diff --check`, `git diff --cached --check` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --staged --redact` exited 0.
+  The staged scan found no leaks. GitHub Actions on the review-fix
+  candidate remains unverified.
+
+### Identity and discovery re-review fixes
+
+The re-review of `e35b85af91b27489447a832a9afbd318e1a2c4e2` found
+that Ash trimmed an invited subject and that Assent used malformed
+discovery metadata. The fixes and five regression tests are in
+`306d0015b7a39c2c98685a82f07b850fa40c82c8`.
+
+- **Exact identity.** The fixture keeps issuer, subject and tenant text
+  as supplied. Ash 3.38.1 documents `trim?` and `allow_empty?` in
+  `deps/ash/lib/ash/type/string.ex`. The tenant keeps the UUID shape
+  without going through Ash's trimming and lowercasing UUID cast. The
+  signed tenant still has to match the configured tenant exactly. A
+  PostgreSQL read returned the subject with its original space and tab.
+  Signing in with the distinct unpadded subject returned 401, issued no
+  session and left the row invited with only its provisioning audit event.
+  The exact padded subject activated successfully on that candidate.
+  The current local subject format is documented below.
+- **Provider metadata.** The adapter validates all three endpoints as
+  absolute HTTPS URLs with a host, a valid port and valid percent escapes.
+  It rejects userinfo and fragments. An advertised authentication-method
+  list must contain only strings and include the configured method.
+  Assent 0.3.2 reads these fields and the issuer in this flow. Its optional
+  userinfo path is unused. The fixture accepts omitted method metadata.
+  Each invalid endpoint or method case returned 401 in both phases with
+  no redirect, session or token exchange.
+
+The new regressions run against DevCore TEST and private provider stubs.
+Before the fixes, the focused run exited 2. It observed 204 for the
+unpadded subject and a callback exception for a numeric method value.
+For each mutation, the command was
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs:<line> --seed 0`.
+Each of the 22 runs below exited 2 with 0 of 1 selected tests passing
+and 23 excluded. The source was restored after each run.
+
+- Line 64 caught subject trimming.
+- Line 76 caught issuer and tenant trimming, removal of the tenant UUID
+  shape check, and empty issuer or subject acceptance.
+- Line 141 caught the removal of each endpoint check, the endpoint type
+  check, HTTPS, the missing and empty host checks, userinfo, fragments,
+  the port range, URI syntax and percent-escape checks.
+- Line 163 caught removal of the method list type, item type and
+  configured-method membership checks.
+- Line 174 caught denial when the optional method field was absent.
+
+The following checks ran with the mutations reverted.
+
+- `devcore-project doctor` exited 1 with `.env.local` missing.
+  `devcore-project plan` and `devcore-project activate` each exited 0.
+  The second `devcore-project doctor` exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix deps.unlock --check-unused`,
+  `mise exec -- mix format --check-formatted` and
+  `mise exec -- mix hex.audit` each exited 0. Hex reported no retired
+  packages or advisories.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+  exited 0 on seeds `0`, `17` and `2026`, each with 24 passed and no skips.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 on seed `113341`, with 70 passed and five existing F04
+  disposable-target skips.
+- `python3 .github/scripts/plan_tests.py` included F08 and exited 0.
+  `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0. Gitleaks found no leaks.
+
+VGAS-9 still needs real tenant, app, consent and callback approval.
+Its smoke test must check actual claims, browser cookie delivery, signing
+keys and revocation with approved test users. A later LiveView integration
+must recheck authorisation for each protected event on an existing socket.
+VGAS-001 must reassess compatible patched stable AshAuthentication and
+adapter pins before staff UI work or live testing. The G036 RC exception
+is feasibility-only.
+
+### Malformed provider responses and subject format
+
+The follow-up addresses the two findings at
+`5a30e1540fe200c25559e4bae6ae63728c94018c` on
+`feat/vgas-6-f08-entra-authz`. The verified code is
+`1b03845d127b8a1cf41498d6f9185b1f50e96676`, after
+`4af4187dd1532ac6463d4865328362193ac47088` and
+`f71eb42ec02e53949d6d16f62b0e74787f2296bc`. The evidence commit changes
+only this section. The comparison base is `origin/main` at
+`a731a06a0d54d61438c6e709e5a3170e6b60b7ed`.
+
+The test-only HTTP adapter validates successful token and key-set
+responses before Assent 0.3.2 reads them. The fixture accepts compact
+RS256 JWS with a key ID and public RSA JWKs. It caps compact tokens at
+32,768 bytes and individual text fields at 4,096 bytes. Assent still
+checks signature, issuer, audience, expiry and nonce. Errors from
+Assent's callback or the JOSE payload parser return a fixed category
+and log only `entra_oidc_callback_exception`. The Ash policy and
+activation run outside the rescue. A deliberately raising Req adapter
+exercised the rescue at the endpoint. A separate test exercised the
+JOSE parse failure.
+
+The malformed-response matrix made 230 callback requests through
+private Req.Test stubs. Each case exercised the shape validator and
+returned 401 with `Sign-in denied`, no redirect, an empty session and
+zero persisted activations. The staff row stayed invited and its only
+audit event was provisioning.
+
+- 95 token and header cases covered the token object, `id_token`,
+  `access_token`, `token_type`, `refresh_token`, `expires_in`, `scope`,
+  the protected header object, `alg`, `kid`, `typ`, `cty`, `b64` and
+  `crit`. They also covered missing required members, extra or missing
+  segments, invalid or empty signature encoding, an oversized compact
+  JWS, an unsupported algorithm and an unencoded payload.
+- 71 signed-claim cases covered the payload object, `iss`, `sub`,
+  `aud`, `azp`, `exp`, `nbf`, `iat`, `nonce` and `tid`. They also
+  covered missing required claims and malformed audience arrays.
+- 64 key-set cases covered the JWKS object, `keys` and each key's
+  `kty`, `kid`, `use`, `alg`, `n`, `e` and private `d` member.
+  They also covered missing members, an empty set, invalid base64url,
+  EC keys and a malformed key after a valid matching key.
+
+The matrix applies null, a number, a list, an object, an empty string
+and a 4,097-byte string to each listed field. The suite also exercises
+valid optional values, `alg: none` denial, exact issuer and tenant,
+discovery and client-authentication methods, empty local role grants,
+audit rollback, activation concurrency and session renewal.
+
+Invites and signed callbacks require 1–255 ASCII bytes. The local rule
+also rejects ASCII controls and leading or trailing spaces. The nine
+negative subject cases include a padded tab, embedded NUL and DEL.
+Ash returned a subject validation error on invite, and the callback
+returned the same generic 401. A valid 255-byte subject round-tripped
+byte for byte and activated. Its lowercase variant did not match.
+Confirm the conservative format and local response bounds against the
+approved live registration in VGAS-9.
+[OIDC Core §2](https://openid.net/specs/openid-connect-core-1_0.html#IDToken).
+
+The first focused run against the old implementation, with the new
+endpoint regressions, exited 2. Each subsequent mutation removed one
+guard at a time. The command was
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs:<line> --seed 0`.
+All 53 runs at `f71eb42` exited 2 with one selected test failing and
+29 excluded.
+
+- Line 85 caught eight subject mutations covering the invite and
+  callback checks, nonempty and length checks, ASCII restrictions,
+  controls, boundary spaces and exact Ash casting.
+- Line 268 caught 21 token and header mutations covering adapter
+  enforcement, document and field shapes, compact JWS limits and
+  signature encoding, protected header members and shared text checks.
+- Line 293 caught 11 claim mutations covering the object, each
+  claim's shape and the audience list and member checks. Line 85
+  independently caught the subject predicate.
+- Line 310 caught 12 JWKS mutations covering adapter enforcement, set
+  shape, validation of every key, RSA key type, key members and exclusion
+  of private key data.
+- Line 365 caught removal of the callback rescue. After the rescue
+  was narrowed to the two parser calls in `1b03845`, removing it again
+  made both the raising adapter at line 366 and the JOSE test at
+  line 379 exit 2. Each run selected one test and excluded 30.
+
+All mutations were reverted before verification.
+
+- `devcore-project doctor` exited 1 with `.env.local` missing.
+  `devcore-project plan` and `devcore-project activate` exited 0.
+  The second `devcore-project doctor` exited 0.
+- `mise exec -- mix deps.get --check-locked`,
+  `mise exec -- mix deps.unlock --check-unused` and
+  `mise exec -- mix format --check-formatted` exited 0.
+  `mise exec -- mix hex.audit` ran separately and exited 0 with no
+  retired packages or advisories.
+- `devcore-project run test -- env -u OPENAI_API_KEY env MIX_ENV=test mise exec -- mix compile --warnings-as-errors`
+  exited 0.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai/entra_feasibility_test.exs --seed <seed>`
+  exited 0 on seeds `0`, `17` and `2026`, with 31 passed and no skips
+  on each run.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test`
+  exited 0 on seed `983803`, with 77 passed and five existing F04
+  disposable-target skips.
+- `python3 .github/scripts/plan_tests.py` exited 0 and routed F08 to
+  shard 4. `git diff --check origin/main...HEAD` and
+  `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='origin/main..HEAD'`
+  exited 0. Gitleaks reported no leaks.
+
+Local F08 passed using synthetic identities and DevCore TEST. Live
+Entra proof remains pending in VGAS-9, so F08 is still partial overall.
+Independent review and CI for the published candidate remain pending.
+
+### Independent review of 71d3069 and low-finding fixes
+
+An independent Claude Opus 5.5 review of `71d3069` approved the code.
+It found no fail-open path, crash path or authentication bypass, and
+each of the 21 guard removals it tried made a committed test fail. It
+raised three low findings, fixed in `cd78a33`:
+
+- The callback rescue caught `ExUnit.AssertionError` raised by the
+  provider stub, so a broken PKCE or redirect assertion could pass as an
+  expected 401. The rescue now re-raises fixture assertions, and a
+  regression confirms the original assertion reaches the test.
+- RSA keys had no size or exponent bounds. The adapter now requires a
+  2048 to 4096 bit modulus with its top bit set and exponent `AQAB`.
+  Regressions deny a modulus without its top bit, 1024-bit and 4104-bit
+  moduli, exponent 3, an oversized exponent and a token signed by a
+  published 1024-bit key.
+- Access and refresh tokens shared the 4 KiB text bound. They now use the
+  32 KiB compact-token bound, and a regression accepts a 32 KiB access
+  token with a 5,000-byte refresh token.
+
+Removing the re-raise, the modulus bounds, the exponent rule or the
+access-token bound each exited 2 with the targeted test failing. With
+the fixes restored, the F08 file passed 34 tests on seeds `0`, `17` and
+`2026`. The full suite passed 80 with five existing F04 skips on seed
+`543717`. Locked and unused dependency checks, formatting, `hex.audit`,
+warnings-as-errors compilation, `plan_tests.py`, `git diff --check` and
+gitleaks (10 commits, no leaks) exited 0.
+
+The review's informational notes stay open for VGAS-9: duplicate JSON
+member names resolve consistently across Jason, Elixir `JSON` and JOSE;
+there is no maximum token lifetime or future `iat` rule; and the signed
+issuer and tenant comparisons are redundant with Assent and the database
+filter, so no test isolates them.
+
 ## F06 | VGAS-5 signed Chatwoot ingress and fixed delivery
 
 Evidence from `feat/vgas-5-f06-chatwoot-ingress`. The first follow-up started at
