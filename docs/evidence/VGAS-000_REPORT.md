@@ -187,3 +187,35 @@ The prior stable dependency trial remains blocked by the Assent advisory.
 An explicit G036 exception or a patched stable chain is still needed.
 OpenAI model listing awaits confirmation of the key permission change.
 No VGAS-3 inference or reservation work started.
+
+## F01 authorized execution
+
+**Local F01 PASS under the temporary G036 exception.** The owner approved
+the disposable target and retained AshAuthentication 5.0.0-rc.18 with
+AshAuthenticationPhoenix 3.0.0-rc.12 for VGAS-000 only. The stable trial
+would select Assent 0.2.13 with critical EEF-CVE-2026-117656. The retained
+chain uses Assent 0.3.2. Reassess stable pins before VGAS-001 and live
+Entra. This exception grants no production authority.
+
+- Rechecked the image ID and free port before binding. The running image
+  matched `sha256:c41ec08b3d88535cf84e705cced68f199f40410c60218be157f3435a1544a929`.
+  PostgreSQL reported 18.7, version number 180007. Vector was available
+  as 0.8.7 and installed as 0.8.7 in the disposable database.
+- The empty `vgas_test` database had zero public tables before migration.
+  The login, database and owner were all `vgas_test`. Superuser, CREATEDB
+  and CREATEROLE were false. `MIX_ENV=test mise exec -- mix ecto.migrate`
+  applied migration `20261125141215`. Extension installation was a
+  separate disposable-admin operation matching the CI setup.
+- A synthetic `Postgrex.Types.define/3` probe used `Pgvector.extensions/0`
+  to insert and decode two parameterized vectors as the application role.
+  The cosine-distance query returned 0.0 and 1.0 in the expected order.
+- `MIX_ENV=test mise exec -- mix test` passed all 17 tests against the
+  disposable target. `mise exec -- mix deps.get --check-locked` and
+  `mise exec -- mix hex.audit` exited 0. The audit reported no advisories.
+  The lockfile SHA-256 is
+  `d95546bb5684fdb06ba495e5f9b55b294113a8b96132ab8da64a834e8be935ec`.
+- The first probe lacked started Postgrex dependencies. The rerun started
+  Postgrex before opening the connection and repeated migration on a new
+  empty volume. Cleanup waited for Docker's auto-removal to finish before
+  removing the volume. The run-owned container, volume, credential files
+  and loopback listener were absent at exit. Shared DevCore was unchanged.
