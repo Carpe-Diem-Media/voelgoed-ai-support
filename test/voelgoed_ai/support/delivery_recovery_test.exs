@@ -677,6 +677,111 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert [_] = SupportDBCase.writes(ctx)
   end
 
+  for denial <- [:policy, :circuit] do
+    test "the owning worker cancels a proven no-send after #{denial} denial", ctx do
+      id = SupportDBCase.prepare_reply(ctx)
+      {task, worker} = pause_authorized(ctx, id)
+
+      assert %{rows: [["sending", nil, 1, generation, %NaiveDateTime{} = marker]]} =
+               dispatch_history(ctx)
+
+      case unquote(denial) do
+        :policy ->
+          SupportDBCase.disable_automation(ctx)
+
+        :circuit ->
+          alias VoelgoedAi.Support.{BindingCircuit, Ownership}
+
+          assert {:ok, :ok} =
+                   Repo.transact(fn ->
+                     Ownership.locked_session(SupportDBCase.session_id(ctx), fn config, _, now ->
+                       {:ok, BindingCircuit.record(config.binding, 0, now, {:error, :forbidden})}
+                     end)
+                   end)
+      end
+
+      assert :ok = resume_authorized(task, worker)
+      assert :ok = Delivery.deliver(id)
+      assert :ok = Recovery.delivery_deadline(id)
+
+      assert %{rows: [["cancelled", "dispatch_denied", 1, ^generation, ^marker]]} =
+               dispatch_history(ctx)
+
+      assert [] = SupportDBCase.audit_rows(:delivery_target_id, id)
+      assert [] = SupportDBCase.writes(ctx)
+    end
+  end
+
+  test "a stale authorized worker cannot cancel at lease equality", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    {task, worker} = pause_authorized(ctx, id)
+    SupportDBCase.advance_clock(ctx, 5)
+    SupportDBCase.disable_automation(ctx)
+    assert :ok = resume_authorized(task, worker)
+    assert :ok = Recovery.delivery_deadline(id)
+    assert %{rows: [["unknown", nil, 1, _, %NaiveDateTime{}]]} = dispatch_history(ctx)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "a replaced authorized fence cannot be cancelled by the old worker", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    {task, worker} = pause_authorized(ctx, id)
+    # Recovery never replaces a consumed claim. Inject a new fence to test
+    # the old worker's check independently of either lease or intent state.
+    assert %{rows: [[generation]]} =
+             SQL.query!(
+               Repo,
+               "UPDATE outbound_deliveries SET claim_generation = claim_generation + 1 WHERE id = $1 RETURNING claim_generation",
+               [Ecto.UUID.dump!(id)]
+             )
+
+    SupportDBCase.disable_automation(ctx)
+    assert :ok = resume_authorized(task, worker)
+
+    assert %{rows: [["sending", nil, 1, ^generation, %NaiveDateTime{} = marker]]} =
+             dispatch_history(ctx)
+
+    SupportDBCase.advance_clock(ctx, 5)
+    assert :ok = Recovery.delivery_deadline(id)
+    assert %{rows: [["unknown", nil, 1, ^generation, ^marker]]} = dispatch_history(ctx)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "an already UNKNOWN authorization is never cancelled by the original worker", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    {task, worker} = pause_authorized(ctx, id)
+    SupportDBCase.advance_clock(ctx, 5)
+    assert :ok = Recovery.delivery_deadline(id)
+
+    assert %{rows: [["unknown", nil, 1, generation, %NaiveDateTime{} = marker]]} =
+             dispatch_history(ctx)
+
+    SupportDBCase.disable_automation(ctx)
+    assert :ok = resume_authorized(task, worker)
+    assert %{rows: [["unknown", nil, 1, ^generation, ^marker]]} = dispatch_history(ctx)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  defp pause_authorized(ctx, id) do
+    parent = self()
+    Agent.update(ctx.fake, &Map.put(&1, :authorization_barrier, parent))
+    task = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:delivery_authorized, worker}, 1_000
+    {task, worker}
+  end
+
+  defp resume_authorized(task, worker) do
+    send(worker, :resume_delivery_authorization)
+    Task.await(task, 5_000)
+  end
+
+  defp dispatch_history(ctx) do
+    SupportDBCase.delivery_rows(
+      ctx,
+      "state, reason_code, attempt_count, claim_generation, dispatch_authorized_at"
+    )
+  end
+
   test "a worker lost after authorization and before POST stays unknown", ctx do
     id = SupportDBCase.prepare_reply(ctx)
     parent = self()
@@ -1012,6 +1117,119 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert [] = SupportDBCase.writes(ctx)
   end
 
+  for phase <- [:pending, :claimed, :authorized] do
+    test "signed takeover fences a #{phase} handoff and survives reopen", ctx do
+      id = prepare_handoff(ctx)
+
+      {resume, expected} =
+        case unquote(phase) do
+          :pending ->
+            {fn -> :ok end, ["cancelled", "human_takeover", nil, 0]}
+
+          :claimed ->
+            SupportDBCase.block_after_claim(ctx, self())
+            task = Task.async(fn -> Delivery.deliver(id) end)
+            assert_receive {:delivery_claimed, worker}, 1_000
+
+            resume = fn ->
+              send(worker, :resume_delivery_claim)
+              Task.await(task, 5_000)
+            end
+
+            {resume, ["cancelled", "human_takeover", nil, 0]}
+
+          :authorized ->
+            {task, worker} = pause_authorized(ctx, id)
+            {fn -> resume_authorized(task, worker) end, ["unknown", nil, "human_takeover", 1]}
+        end
+
+      assert Agent.get(ctx.fake, & &1.observation.assignee) == :bot
+      assert signed_takeover(ctx) == 204
+      assert %{rows: [["human_active", true]]} = session_state(ctx, "state, human_inhibit")
+
+      assert %{rows: [^expected]} =
+               handoff_rows(ctx, "state, reason_code, uncertainty_reason, attempt_count")
+
+      assert :ok = resume.()
+      assert [] = SupportDBCase.writes(ctx)
+      assert :ok = Delivery.deliver(id)
+      assert :ok = Recovery.reconcile(id)
+
+      assert %{rows: [^expected]} =
+               handoff_rows(ctx, "state, reason_code, uncertainty_reason, attempt_count")
+
+      assert signed_takeover(ctx) == 204
+      assert_handoff_sticky_after_reopen(ctx, id, Enum.take(expected, 2))
+      assert signed_takeover(ctx) == 204
+      assert [] = SupportDBCase.writes(ctx)
+    end
+  end
+
+  test "a qualified existing handoff goal records already_human and survives reopen", ctx do
+    id = prepare_handoff(ctx)
+
+    Agent.update(
+      ctx.fake,
+      &%{&1 | observation: %{&1.observation | status: :open, assignee: :human}}
+    )
+
+    assert :ok = Delivery.deliver(id)
+
+    assert %{rows: [["sent", "already_human", 0, nil, %NaiveDateTime{}]]} =
+             handoff_rows(
+               ctx,
+               "state, reason_code, attempt_count, dispatch_authorized_at, confirmed_at"
+             )
+
+    assert %{rows: [["human_active", true]]} = session_state(ctx, "state, human_inhibit")
+    assert :ok = Delivery.deliver(id)
+    assert_handoff_sticky_after_reopen(ctx, id, ["sent", "already_human"])
+  end
+
+  defp signed_takeover(ctx) do
+    SupportDBCase.signed_request(ctx, fn payload ->
+      Map.merge(payload, %{
+        "id" => ctx.event.message_id + 10,
+        "message_type" => "outgoing",
+        "sender" => %{"type" => "user", "id" => 82}
+      })
+    end).status
+  end
+
+  defp assert_handoff_sticky_after_reopen(ctx, id, result) do
+    observe_resolution(ctx)
+
+    Agent.update(
+      ctx.fake,
+      &%{&1 | observation: %{&1.observation | status: :pending, assignee: :bot}}
+    )
+
+    assert ["triage", "scope_denied"] = process_next_input(ctx, 20)
+
+    assert %{rows: [[1, "closed", true], [2, "unverified", true]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT generation, state, human_inhibit FROM support_sessions
+               WHERE conversation_id = $1 ORDER BY generation
+               """,
+               [ctx.event.conversation_id]
+             )
+
+    assert :ok = Delivery.deliver(id)
+
+    assert %{rows: [^result]} =
+             SQL.query!(
+               Repo,
+               "SELECT state, reason_code FROM outbound_deliveries WHERE id = $1",
+               [
+                 Ecto.UUID.dump!(id)
+               ]
+             )
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   test "a resolved observation fences an authorized delivery before POST", ctx do
     id = SupportDBCase.prepare_reply(ctx)
     parent = self()
@@ -1069,8 +1287,30 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
   test "sweep fences an expired worker even while its write callback is blocked", ctx do
     id = SupportDBCase.prepare_reply(ctx)
     SupportDBCase.block_next_write(ctx, self())
-    task = Task.async(fn -> Delivery.deliver(id) end)
-    assert_receive {:chatwoot_write, worker}, 1_000
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        Repo.checkout(fn ->
+          assert %{rows: [[backend]]} = SQL.query!(Repo, "SELECT pg_backend_pid()")
+          send(parent, {:wire_backend, self(), backend})
+          Delivery.deliver(id)
+        end)
+      end)
+
+    assert_receive {:wire_backend, worker, backend}, 1_000
+    assert_receive {:chatwoot_write, ^worker}, 1_000
+
+    assert %{rows: [["idle", nil]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT state, xact_start FROM pg_stat_activity
+               WHERE pid = $1 AND pid <> pg_backend_pid()
+               """,
+               [backend]
+             )
+
     assert %{rows: [["sending", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
 
     SupportDBCase.advance_clock(ctx, 6)

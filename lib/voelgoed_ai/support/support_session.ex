@@ -189,7 +189,10 @@ defmodule VoelgoedAi.Support.SupportSession do
       require_atomic?(false)
       accept([:ownership_epoch, :observed_status, :observed_assignee, :observed_at])
 
-      validate({VoelgoedAi.Support.FromState, states: [:unverified, :bot_active]})
+      validate(
+        {VoelgoedAi.Support.FromState, states: [:unverified, :bot_active, :handoff_pending]}
+      )
+
       change(set_attribute(:state, :human_active))
       change(set_attribute(:human_inhibit, true))
     end

@@ -333,7 +333,21 @@ defmodule VoelgoedAi.Support.WorkflowTest do
                    RunProcessing.process_event(event_id)
                  end)
 
-               SupportDBCase.advance_clock(ctx, 46)
+               # The parent holds only the session row. A third connection
+               # sees the binding lock owned by the worker waiting on it.
+               assert {:error, %Postgrex.Error{postgres: %{pg_code: "55P03"}}} =
+                        Task.async(fn ->
+                          SQL.query(
+                            Repo,
+                            "SELECT id FROM inbox_bindings WHERE id = $1 FOR UPDATE NOWAIT",
+                            [
+                              Ecto.UUID.dump!(ctx.binding_id)
+                            ]
+                          )
+                        end)
+                        |> Task.await(5_000)
+
+               SupportDBCase.advance_clock(ctx, 45)
                {:ok, waiter}
              end)
 
@@ -351,8 +365,319 @@ defmodule VoelgoedAi.Support.WorkflowTest do
     assert [["support_worker", "inbound_event", "missed_deadline", "deadline"]] =
              SupportDBCase.audit_rows(:event_target_id, event_id)
 
+    assert %{rows: [[1]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT count(*) FROM oban_jobs j
+               JOIN outbound_deliveries d ON d.id::text = j.args->>'delivery_id'
+               WHERE d.session_id = $1 AND d.purpose = 'handoff_status' AND j.worker = $2
+               """,
+               [Ecto.UUID.dump!(SupportDBCase.session_id(ctx)), inspect(Deliver)]
+             )
+
+    assert :ok = Recovery.sweep()
+
+    assert %{rows: [[id, "pending", processed_at, deadline]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT d.id::text, d.state, e.processed_at, d.deadline_at
+               FROM outbound_deliveries d JOIN inbound_events e ON e.session_id = d.session_id
+               WHERE e.id = $1 AND d.purpose = 'handoff_status'
+               """,
+               [Ecto.UUID.dump!(event_id)]
+             )
+
+    assert NaiveDateTime.diff(deadline, processed_at, :second) == 300
+    assert processed_at == DateTime.to_naive(DateTime.add(ctx.event.received_at, 45))
+    assert [["cancelled", "late_input"]] = overdue_runs(ctx)
     assert [] = SupportDBCase.writes(ctx)
-    assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "purpose")
+
+    # The route runs with its independent deadline and fetches current state.
+    reads = Agent.get(ctx.fake, & &1.conversation_reads)
+    assert :ok = Delivery.deliver(id)
+    assert :ok = Delivery.deliver(id)
+    assert Agent.get(ctx.fake, & &1.conversation_reads) > reads
+    assert [{:handoff, _, _}] = SupportDBCase.writes(ctx)
+  end
+
+  for failure <- [:audit, :intent, :enqueue] do
+    test "overdue handoff rolls back when #{failure} fails", ctx do
+      reply = SupportDBCase.prepare_reply(ctx)
+      receipt = overdue_input(ctx)
+
+      reject_overdue_write(unquote(failure), fn ->
+        case unquote(failure) do
+          :enqueue ->
+            assert_raise Ash.Error.Unknown, ~r/reject_overdue_fixture/, fn ->
+              RunProcessing.process_event(receipt)
+            end
+
+          _ ->
+            assert {:error, :storage_failure} = RunProcessing.process_event(receipt)
+        end
+      end)
+
+      assert %{rows: [["pending", nil]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT disposition, session_id FROM inbound_events WHERE id = $1",
+                 [
+                   Ecto.UUID.dump!(receipt)
+                 ]
+               )
+
+      assert [] = SupportDBCase.audit_rows(:event_target_id, receipt)
+
+      assert %{rows: [["bot_active", false]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT state, human_inhibit FROM support_sessions WHERE id = $1",
+                 [
+                   Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+                 ]
+               )
+
+      assert %{rows: [["public_reply", "pending"]]} =
+               SupportDBCase.delivery_rows(ctx, "purpose, state")
+
+      assert %{rows: [[0]]} =
+               SQL.query!(
+                 Repo,
+                 """
+                 SELECT count(*) FROM oban_jobs
+                 WHERE args ? 'delivery_id' AND args->>'delivery_id' <> $1
+                 """,
+                 [reply]
+               )
+
+      assert :ok = RunProcessing.process_event(receipt)
+      assert :ok = RunProcessing.process_event(receipt)
+      assert :ok = Recovery.sweep()
+      assert :ok = Delivery.deliver(reply)
+
+      assert SupportDBCase.delivery_rows(ctx, "purpose, state").rows |> Enum.sort() ==
+               [["handoff_status", "pending"], ["public_reply", "cancelled"]]
+
+      assert [["support_worker", "inbound_event", "missed_deadline", "deadline"]] =
+               SupportDBCase.audit_rows(:event_target_id, receipt)
+
+      assert [] = SupportDBCase.writes(ctx)
+    end
+  end
+
+  test "an overdue shadow route records an inhibit and never posts a reply or status", ctx do
+    reply = SupportDBCase.prepare_reply(ctx)
+
+    assert {:ok, _} =
+             VoelgoedAi.SupportFixtures.invoke(
+               InboxBinding,
+               :change_mode,
+               %{id: ctx.binding_id, operating_mode: :shadow},
+               ctx.admin
+             )
+
+    receipt = overdue_input(ctx)
+    assert :ok = RunProcessing.process_event(receipt)
+
+    assert [["support_worker", "inbound_event", "missed_deadline", "deadline"]] =
+             SupportDBCase.audit_rows(:event_target_id, receipt)
+
+    assert %{rows: [["handoff_pending", true]]} =
+             SQL.query!(Repo, "SELECT state, human_inhibit FROM support_sessions WHERE id = $1", [
+               Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+             ])
+
+    id = overdue_handoff_id(ctx)
+    assert :ok = Delivery.deliver(reply)
+    assert :ok = Delivery.deliver(id)
+    assert [] = SupportDBCase.writes(ctx)
+
+    assert SupportDBCase.delivery_rows(ctx, "purpose, state, attempt_count").rows |> Enum.sort() ==
+             [["handoff_status", "cancelled", 0], ["public_reply", "cancelled", 0]]
+  end
+
+  for {change, result} <- [
+        {%{status: :resolved}, ["cancelled", "resolved"]},
+        {%{status: :open, assignee: :human}, ["sent", "already_human"]},
+        {%{status: :pending, assignee: :human}, ["cancelled", "scope_denied"]},
+        {%{team: 987}, ["cancelled", "scope_denied"]},
+        {%{contact: 6}, ["cancelled", "unavailable"]}
+      ] do
+    test "an overdue route checks fresh scope and routing with #{inspect(change)}", ctx do
+      reply = SupportDBCase.prepare_reply(ctx)
+      receipt = overdue_input(ctx)
+      assert :ok = RunProcessing.process_event(receipt)
+      id = overdue_handoff_id(ctx)
+
+      Agent.update(ctx.fake, fn fake ->
+        %{fake | observation: struct!(fake.observation, unquote(Macro.escape(change)))}
+      end)
+
+      assert :ok = Delivery.deliver(id)
+      assert :ok = Delivery.deliver(reply)
+
+      assert %{rows: [[state, reason, 0]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT state, reason_code, attempt_count FROM outbound_deliveries WHERE id = $1",
+                 [Ecto.UUID.dump!(id)]
+               )
+
+      assert [state, reason] == unquote(result)
+
+      assert [["support_worker", "inbound_event", "missed_deadline", "deadline"]] =
+               SupportDBCase.audit_rows(:event_target_id, receipt)
+
+      assert [] = SupportDBCase.writes(ctx)
+    end
+  end
+
+  test "an overdue first receipt only records the existing triage audit", ctx do
+    assert {:ok, receipt} = Ingress.accept(ctx.event)
+    SupportDBCase.advance_clock(ctx, 45)
+    assert :ok = RunProcessing.process_event(receipt)
+    assert :ok = RunProcessing.process_event(receipt)
+
+    assert [["support_worker", "inbound_event", "missed_deadline", "deadline"]] =
+             SupportDBCase.audit_rows(:event_target_id, receipt)
+
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "state")
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  for status <- [:human_active, :closed] do
+    test "overdue input only audits an existing #{status} session", ctx do
+      reply = SupportDBCase.prepare_reply(ctx)
+
+      case unquote(status) do
+        :human_active ->
+          human = %{ctx.event | kind: :human_outbound, message_id: ctx.event.message_id + 8}
+          assert {:ok, _} = Ingress.accept(human)
+
+        :closed ->
+          Agent.update(ctx.fake, &put_in(&1.observation.status, :resolved))
+
+          assert SupportDBCase.signed_request(ctx, &Map.put(&1, "event", "conversation_updated")).status ==
+                   204
+
+          assert %{rows: [[event]]} =
+                   SQL.query!(
+                     Repo,
+                     """
+                     SELECT id::text FROM inbound_events
+                     WHERE conversation_id = $1 AND message_id IS NULL
+                     """,
+                     [ctx.event.conversation_id]
+                   )
+
+          assert :ok = RunProcessing.process_event(event)
+      end
+
+      receipt = overdue_input(ctx)
+      assert :ok = RunProcessing.process_event(receipt)
+      assert :ok = Delivery.deliver(reply)
+
+      assert %{rows: [[0]]} =
+               SQL.query!(
+                 Repo,
+                 """
+                 SELECT count(*) FROM outbound_deliveries d
+                 JOIN support_sessions s ON s.id = d.session_id
+                 WHERE s.conversation_id = $1 AND d.purpose = 'handoff_status'
+                 """,
+                 [ctx.event.conversation_id]
+               )
+
+      assert [["support_worker", "inbound_event", "missed_deadline", "deadline"]] =
+               SupportDBCase.audit_rows(:event_target_id, receipt)
+
+      assert [] = SupportDBCase.writes(ctx)
+    end
+  end
+
+  test "a new receipt at the batch deadline routes without extending the old reply", ctx do
+    reply = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.advance_clock(ctx, 43)
+    now = VoelgoedAi.Support.ChatwootAdapter.now()
+    message = ctx.event.message_id + 1
+    SupportDBCase.append_public_input(ctx, message)
+    assert {:ok, receipt} = Ingress.accept(%{ctx.event | message_id: message, received_at: now})
+    assert :ok = RunProcessing.process_event(receipt)
+    id = overdue_handoff_id(ctx)
+    assert :ok = RunProcessing.process_event(receipt)
+    assert :ok = Delivery.deliver(reply)
+    assert :ok = Delivery.deliver(id)
+    assert [{:handoff, _, _}] = SupportDBCase.writes(ctx)
+
+    assert %{rows: [[deadline, "cancelled", "late_input"]]} =
+             SQL.query!(
+               Repo,
+               "SELECT deadline_at, state, reason_code FROM outbound_deliveries WHERE id = $1",
+               [
+                 Ecto.UUID.dump!(reply)
+               ]
+             )
+
+    assert deadline == DateTime.to_naive(now)
+  end
+
+  defp overdue_input(ctx) do
+    now = VoelgoedAi.Support.ChatwootAdapter.now()
+    message = ctx.event.message_id + 1
+    SupportDBCase.append_public_input(ctx, message)
+    assert {:ok, receipt} = Ingress.accept(%{ctx.event | message_id: message, received_at: now})
+    SupportDBCase.advance_clock(ctx, 45)
+    receipt
+  end
+
+  defp overdue_handoff_id(ctx) do
+    session = Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+
+    assert %{rows: [[id, "pending"]]} =
+             SQL.query!(
+               Repo,
+               "SELECT id::text, state FROM outbound_deliveries WHERE session_id = $1 AND purpose = 'handoff_status'",
+               [session]
+             )
+
+    id
+  end
+
+  defp overdue_runs(ctx) do
+    SQL.query!(Repo, "SELECT state, reason_code FROM support_runs WHERE session_id = $1", [
+      Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+    ]).rows
+  end
+
+  defp reject_overdue_write(:audit, fun) do
+    Process.put({VoelgoedAi.Support.SystemAudit, :reject_audit}, :missed_deadline)
+
+    try do
+      fun.()
+    after
+      Process.delete({VoelgoedAi.Support.SystemAudit, :reject_audit})
+    end
+  end
+
+  defp reject_overdue_write(failure, fun) do
+    {table, check} =
+      case failure do
+        :intent -> {"outbound_deliveries", "purpose <> 'handoff_status'"}
+        :enqueue -> {"oban_jobs", "NOT (args ? 'delivery_id')"}
+      end
+
+    SQL.query!(
+      Repo,
+      "ALTER TABLE #{table} ADD CONSTRAINT reject_overdue_fixture CHECK (#{check}) NOT VALID"
+    )
+
+    try do
+      fun.()
+    after
+      SQL.query!(Repo, "ALTER TABLE #{table} DROP CONSTRAINT reject_overdue_fixture")
+    end
   end
 
   test "a run deadline records one audit fact across recovery retries", ctx do

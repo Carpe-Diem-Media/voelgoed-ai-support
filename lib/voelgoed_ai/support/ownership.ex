@@ -188,7 +188,9 @@ defmodule VoelgoedAi.Support.Ownership do
 
   @doc false
   def human_takeover(%{state: state} = session, attrs, now)
-      when state in [:unverified, :bot_active] do
+      when state in [:unverified, :bot_active, :handoff_pending] do
+    # The signed takeover fences a staged handoff like any other unsent work.
+    # A consumed dispatch remains uncertain until independently reconciled.
     with :ok <- fence(session, now, :human_takeover),
          {:ok, updated} <-
            store_update(
@@ -232,18 +234,44 @@ defmodule VoelgoedAi.Support.Ownership do
   @doc false
   def request_locked(config, %{state: :bot_active} = session, now) do
     if write_enabled?(config) do
-      with :ok <- fence(session, now, :explicit_handoff),
-           {:ok, session} <-
-             store_update(session, :request_handoff, next_epoch(session)),
-           {:ok, _} <- prepare(config, session, nil, :handoff_status, DateTime.add(now, 300)) do
-        {:ok, session}
-      end
+      stage_handoff(config, session, now, :explicit_handoff)
     else
       {:error, :disabled}
     end
   end
 
   def request_locked(_, _, _), do: {:error, :invalid_transition}
+
+  @doc false
+  def route_overdue_locked(
+        config,
+        %{
+          state: :bot_active,
+          human_inhibit: false,
+          observed_status: :pending,
+          observed_assignee: :bot
+        } = session,
+        now
+      ) do
+    if write_enabled?(config) or
+         (config.binding.operating_mode == :shadow and permitted?(config)) do
+      # Shadow records the intent and inhibit. Delivery still checks mode and
+      # fresh remote ownership before permitting a status write.
+      stage_handoff(config, session, now, :late_input)
+    else
+      {:ok, session}
+    end
+  end
+
+  def route_overdue_locked(_, session, _), do: {:ok, session}
+
+  defp stage_handoff(config, session, now, reason) do
+    with :ok <- fence(session, now, reason),
+         {:ok, session} <- store_update(session, :request_handoff, next_epoch(session)),
+         {:ok, _} <- prepare(config, session, nil, :handoff_status, DateTime.add(now, 300)) do
+      {:ok, session}
+    end
+  end
 
   @doc false
   def confirm_locked(%{state: :handoff_pending} = session),

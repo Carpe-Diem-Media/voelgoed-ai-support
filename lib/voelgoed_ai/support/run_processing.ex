@@ -53,7 +53,9 @@ defmodule VoelgoedAi.Support.RunProcessing do
   defp decide_event(config, session, event, now, deadline, observation, history) do
     cond do
       DateTime.compare(now, deadline) != :lt ->
-        disposition(event, session, :triage, :deadline, now)
+        with {:ok, session} <- route_overdue(config, session, event, now, observation) do
+          disposition(event, session, :triage, :deadline, now)
+        end
 
       session.contact_id != event.contact_id ->
         disposition(event, session, :triage, :scope_denied, now)
@@ -70,6 +72,25 @@ defmodule VoelgoedAi.Support.RunProcessing do
         end
     end
   end
+
+  # The receipt's GET may have exhausted its budget. Use the last qualified
+  # local state to stage the route. Delivery gets a separate budget and GET.
+  defp route_overdue(config, session, %{kind: :input, contact_id: contact}, now, observation)
+       when contact == session.contact_id do
+    case observation do
+      {:ok, %{status: :pending, assignee: :bot, team: team}}
+      when team == config.binding.handoff_team_id ->
+        Ownership.route_overdue_locked(config, session, now)
+
+      {:error, reason} when reason != :scope_denied ->
+        Ownership.route_overdue_locked(config, session, now)
+
+      _ ->
+        {:ok, session}
+    end
+  end
+
+  defp route_overdue(_, session, _, _, _), do: {:ok, session}
 
   defp qualify_input(_, session, %{kind: kind} = event, now, _, _, _) when kind != :input,
     do: disposition(event, session, :observed, :accepted, now)
@@ -108,7 +129,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     else
       {:error, :late_input} ->
-        with :ok <- discard_incomplete(batch, delivery, now) do
+        with :ok <- discard_incomplete(batch, delivery, now),
+             {:ok, session} <- route_expired_batch(batch, config, session, now) do
           disposition(event, session, :triage, :late_input, now)
         end
 
@@ -118,6 +140,12 @@ defmodule VoelgoedAi.Support.RunProcessing do
       error ->
         error
     end
+  end
+
+  defp route_expired_batch(batch, config, session, now) do
+    if batch && not DateTime.before?(now, batch.deadline_at),
+      do: Ownership.route_overdue_locked(config, session, now),
+      else: {:ok, session}
   end
 
   defp discard_incomplete(run, delivery, now) do
