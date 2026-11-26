@@ -294,6 +294,25 @@ defmodule VoelgoedAi.Knowledge.PublicationTest do
     assert [["publish_failed", nil, nil]] = publication_state(next.id)
   end
 
+  test "noncanonical stored content fails even when normalization recreates the reviewed hash",
+       ctx do
+    {_, revision} = approved(ctx)
+    ready(request_index(ctx, revision))
+
+    SQL.query!(
+      Repo,
+      """
+      UPDATE article_revisions SET content = jsonb_set(content, '{localized_content}',
+        jsonb_build_array(content->'localized_content'->1, content->'localized_content'->0))
+      WHERE id = $1
+      """,
+      [db_id(revision.id)]
+    )
+
+    assert :ok = finalise(revision.id, 1)
+    assert [["publish_failed", nil, nil]] = publication_state(revision.id)
+  end
+
   test "an expired READY request fails and expiry fences a pending reindex while due", ctx do
     {_, stranded} = approved(ctx)
     now = DateTime.utc_now()

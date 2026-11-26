@@ -61,7 +61,7 @@ defmodule VoelgoedAi.Knowledge.Publication do
     with true <- revision.approved_by_id != nil and revision.approved_at != nil,
          true <- revision.content_hash == revision.review_hash,
          {:ok, content} <- Content.parse(revision.content),
-         true <- revision.content_hash == Content.hash(content) do
+         true <- content == revision.content and revision.content_hash == Content.hash(content) do
       Embedding.eligible_content(content, now)
     else
       _ -> {:error, :stale_request}
@@ -260,7 +260,7 @@ defmodule VoelgoedAi.Knowledge.Publication do
       true ->
         case approved_content(revision, now) do
           {:ok, expires} ->
-            if Enum.all?(rows, &(&1.state == :ready and not is_nil(&1.vector))),
+            if ready_vectors?(rows),
               do: {:ready, expires},
               else: :pending
 
@@ -280,6 +280,15 @@ defmodule VoelgoedAi.Knowledge.Publication do
             &1.state in [:queued, :running, :ready])
       )
   end
+
+  defp complete_generation?(revision, rows, generation) do
+    variants = Enum.filter(rows, &(&1.generation == generation))
+
+    exact_index?(revision, variants, revision.active_index_profile_id) and
+      ready_vectors?(variants)
+  end
+
+  defp ready_vectors?(rows), do: Enum.all?(rows, &(&1.state == :ready and not is_nil(&1.vector)))
 
   defp fail(revision, rows, reason) do
     attrs =
@@ -336,7 +345,11 @@ defmodule VoelgoedAi.Knowledge.Publication do
   end
 
   defp switch_index(revision, generation, rows, event, reason) do
-    retained = revision.active_index_generation
+    active = revision.active_index_generation
+
+    retained =
+      if complete_generation?(revision, rows, active), do: active, else: nil
+
     obsolete = Enum.reject(rows, &(&1.generation in [generation, retained]))
 
     attrs = %{
@@ -368,7 +381,7 @@ defmodule VoelgoedAi.Knowledge.Publication do
                  revision.status == :published and
                    revision.retained_index_generation == generation,
                {:ok, rows} <- lock_embeddings([id]),
-               true <- retained_ready?(revision, rows, generation) do
+               true <- complete_generation?(revision, rows, generation) do
             change(revision, %{
               index_evaluation: %{
                 generation: generation,
@@ -414,7 +427,7 @@ defmodule VoelgoedAi.Knowledge.Publication do
                {:ok, _} <- approved_content(revision, now),
                true <- evaluated?(revision, generation, now),
                {:ok, rows} <- lock_embeddings([revision.id]),
-               true <- retained_ready?(revision, rows, generation) do
+               true <- complete_generation?(revision, rows, generation) do
             switch_index(revision, generation, rows, :rollback_index, :evaluated)
           else
             false -> {:ok, :stale}
@@ -445,13 +458,6 @@ defmodule VoelgoedAi.Knowledge.Publication do
     end
 
     defp evaluation_due?(_, _), do: false
-
-    defp retained_ready?(revision, rows, generation) do
-      retained = Enum.filter(rows, &(&1.generation == generation))
-
-      exact_index?(revision, retained, revision.active_index_profile_id) and
-        Enum.all?(retained, &(&1.state == :ready and not is_nil(&1.vector)))
-    end
 
     defp field(map, name), do: Map.get(map, name, Map.get(map, Atom.to_string(name)))
   else
