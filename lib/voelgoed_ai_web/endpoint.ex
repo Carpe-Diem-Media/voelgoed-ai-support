@@ -2,6 +2,8 @@ defmodule VoelgoedAiWeb.Endpoint do
   @moduledoc false
   use Phoenix.Endpoint, otp_app: :voelgoed_ai
 
+  alias VoelgoedAiWeb.KnowledgeLive.CrashLog
+
   socket("/staff/live", VoelgoedAiWeb.StaffLiveSocket,
     websocket: [
       check_origin: :conn,
@@ -48,17 +50,28 @@ defmodule VoelgoedAiWeb.Endpoint do
   plug(VoelgoedAiWeb.ChatwootWebhook)
   plug(VoelgoedAiWeb.Router)
 
-  # Phoenix dispatches sockets before the application's plugs. Reject an
-  # unavailable origin before it can reach cookie decryption.
-  def call(%{path_info: ["staff", "live" | _]} = conn, opts) do
-    conn = VoelgoedAiWeb.StaffSession.knowledge_headers(conn, opts)
+  def call(%{path_info: ["staff" | _]} = conn, opts) do
+    CrashLog.with_staff_http(fn ->
+      # Phoenix dispatches sockets before the application's plugs. Reject an
+      # unavailable origin before it can reach cookie decryption.
+      case conn do
+        %{path_info: ["staff", "live" | _]} ->
+          conn = VoelgoedAiWeb.StaffSession.knowledge_headers(conn, opts)
 
-    if VoelgoedAiWeb.StaffSession.knowledge_origin?(conn),
-      do: super(conn, opts),
-      else: conn |> Plug.Conn.send_resp(403, "") |> Plug.Conn.halt()
+          if VoelgoedAiWeb.StaffSession.knowledge_origin?(conn),
+            do: super(conn, opts),
+            else: conn |> Plug.Conn.send_resp(403, "") |> Plug.Conn.halt()
+
+        _ ->
+          super(conn, opts)
+      end
+    end)
   end
 
-  def call(conn, opts), do: super(conn, opts)
+  def call(conn, opts) do
+    CrashLog.clear_staff_http()
+    super(conn, opts)
+  end
 
   defp staff_asset_gate(%{path_info: ["staff", "assets" | _]} = conn, opts) do
     conn

@@ -27,21 +27,18 @@ defmodule VoelgoedAiWeb.Router do
     post("/sign-out", StaffAuthController, :sign_out, log: false)
   end
 
-  scope "/staff/knowledge", VoelgoedAiWeb do
+  scope "/staff/knowledge", VoelgoedAiWeb, log: false do
     pipe_through([:staff_knowledge, :staff_session])
 
-    get("/denied", KnowledgeLive.DenialController, :show, log: false)
+    get("/denied", KnowledgeLive.DenialController, :show)
 
     live_session :staff_knowledge,
       root_layout: {VoelgoedAiWeb.KnowledgeLive.Components, :root},
       on_mount: VoelgoedAiWeb.KnowledgeLive.Auth do
-      live("/", KnowledgeLive.Index, :index, metadata: %{log: false})
-      live("/collections/:id", KnowledgeLive.Index, :collection, metadata: %{log: false})
-      live("/articles/:id", KnowledgeLive.Article, :show, metadata: %{log: false})
-
-      live("/articles/:id/revisions/:revision_id", KnowledgeLive.Revision, :show,
-        metadata: %{log: false}
-      )
+      live("/", KnowledgeLive.Index, :index)
+      live("/collections/:id", KnowledgeLive.Index, :collection)
+      live("/articles/:id", KnowledgeLive.Article, :show)
+      live("/articles/:id/revisions/:revision_id", KnowledgeLive.Revision, :show)
     end
   end
 end

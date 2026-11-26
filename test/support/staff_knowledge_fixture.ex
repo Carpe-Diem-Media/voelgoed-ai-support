@@ -57,13 +57,15 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
     socket
   end
 
-  def start_listener(:https) do
+  def start_listener(transport, plug \\ Endpoint)
+
+  def start_listener(:https, plug) do
     key = X509.PrivateKey.new_rsa(2048)
     cert = X509.Certificate.self_signed(key, "/CN=" <> @host)
 
     ExUnit.Callbacks.start_supervised!(
       {Bandit,
-       plug: Endpoint,
+       plug: plug,
        ip: {127, 0, 0, 1},
        port: @port,
        scheme: :https,
@@ -77,9 +79,9 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
     )
   end
 
-  def start_listener(:http) do
+  def start_listener(:http, plug) do
     ExUnit.Callbacks.start_supervised!(
-      {Bandit, plug: Endpoint, ip: {127, 0, 0, 1}, port: @port, startup_log: false}
+      {Bandit, plug: plug, ip: {127, 0, 0, 1}, port: @port, startup_log: false}
     )
   end
 
@@ -88,6 +90,49 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
   end
 
   def upgrade(transport, cookie, csrf, origin, header_overrides \\ []) do
+    {path, headers} = upgrade_request(cookie, csrf, origin)
+    request_status(transport, path, Map.merge(headers, Map.new(header_overrides)))
+  end
+
+  def tls_join(cookie, csrf, topic, payload) do
+    {:ssl, socket} = connect(:https)
+
+    try do
+      {path, headers} = upgrade_request(cookie, csrf, @origin)
+      :ok = :ssl.setopts(socket, packet: :http_bin)
+      :ok = :ssl.send(socket, request(path, headers))
+      {:ok, {:http_response, _, 101, _}} = :ssl.recv(socket, 0, 5_000)
+      :ok = receive_upgrade_headers(socket)
+      :ok = :ssl.setopts(socket, packet: :raw)
+
+      join = Jason.encode!(["1", "1", topic, "phx_join", payload])
+      {:ok, frame} = WebSockex.Frame.encode_frame({:text, join})
+      :ok = :ssl.send(socket, frame)
+      receive_text_frame(socket, "") |> Jason.decode!()
+    after
+      :ssl.close(socket)
+    end
+  end
+
+  defp receive_upgrade_headers(socket) do
+    case :ssl.recv(socket, 0, 5_000) do
+      {:ok, :http_eoh} -> :ok
+      {:ok, {:http_header, _, _, _, _}} -> receive_upgrade_headers(socket)
+    end
+  end
+
+  defp receive_text_frame(socket, buffer) do
+    case WebSockex.Frame.parse_frame(buffer) do
+      {:ok, {:text, text}, _rest} ->
+        text
+
+      :incomplete ->
+        {:ok, more} = :ssl.recv(socket, 0, 5_000)
+        receive_text_frame(socket, buffer <> more)
+    end
+  end
+
+  defp upgrade_request(cookie, csrf, origin) do
     path = "/staff/live/websocket?vsn=2.0.0"
     path = if csrf, do: path <> "&_csrf_token=" <> URI.encode_www_form(csrf), else: path
 
@@ -101,25 +146,27 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
       "Origin" => origin
     }
 
-    request_status(transport, path, Map.merge(headers, Map.new(header_overrides)))
+    {path, headers}
   end
 
   defp request_status(transport, path, headers) do
     {module, socket} = connect(transport)
 
-    request = [
+    :ok = module.send(socket, request(path, headers))
+    {:ok, status} = module.recv(socket, 0, 5_000)
+    module.close(socket)
+    [_, code | _] = String.split(status, " ", parts: 3)
+    String.to_integer(code)
+  end
+
+  defp request(path, headers) do
+    [
       "GET ",
       path,
       " HTTP/1.1\r\n",
       for({name, value} <- headers, value, do: [name, ": ", value, "\r\n"]),
       "\r\n"
     ]
-
-    :ok = module.send(socket, request)
-    {:ok, status} = module.recv(socket, 0, 5_000)
-    module.close(socket)
-    [_, code | _] = String.split(status, " ", parts: 3)
-    String.to_integer(code)
   end
 
   defp connect(:https) do

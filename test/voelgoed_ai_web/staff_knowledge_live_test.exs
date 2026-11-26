@@ -236,6 +236,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
       ~s(HANDLE EVENT "refresh" in VoelgoedAiWeb.KnowledgeLive.),
       "Replied in "
     ])
+
+    assert_absent(log, "staff router dispatch log", ["Processing with "])
   end
 
   test "a revision URL must name its actual article and disclose no hidden content", ctx do
@@ -351,6 +353,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
                  %{"embedding_id" => id},
                  repo: VoelgoedAi.Repo
                )
+
+      assert [["ready", 1536]] = vector_rows(id), "Retry embedding did not reach ready"
     end
 
     finish_index(approved.id, 2)
