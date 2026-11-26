@@ -210,6 +210,17 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       run(Editorial)
     end
 
+    action :list_revisions, :map do
+      description(
+        "List permitted revisions in ascending ID order. Pass the returned cursor to continue."
+      )
+
+      argument(:article_id, :uuid, allow_nil?: false)
+      argument(:after_id, :uuid)
+      argument(:limit, :integer, allow_nil?: false, default: 50, constraints: [min: 1, max: 50])
+      run(Editorial)
+    end
+
     action :read_revision, :map do
       argument(:id, :uuid, allow_nil?: false)
       run(Editorial)
@@ -429,6 +440,8 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       run(Editorial)
     end
 
+    read(:editorial_page)
+
     read :storage_row do
       argument(:id, :uuid, allow_nil?: false)
       filter(expr(id == ^arg(:id)))
@@ -503,6 +516,7 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
     policy action([
              :create_draft,
              :read_revision,
+             :list_revisions,
              :edit_draft,
              :submit_review,
              :request_changes,
@@ -527,6 +541,10 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
 
     policy action([:publish_ready, :expire, :rollback_index]) do
       authorize_if(Publication)
+    end
+
+    policy action(:editorial_page) do
+      authorize_if(Storage)
     end
 
     policy action([:storage_row, :pending_finalisation, :due_expiries]) do

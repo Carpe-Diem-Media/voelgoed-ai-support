@@ -22,6 +22,8 @@ config :voelgoed_ai, Oban,
 
 config :voelgoed_ai, VoelgoedAiWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
+  pubsub_server: VoelgoedAi.PubSub,
+  live_view: [signing_salt: "vgas-staff-live-v1"],
   render_errors: [formats: [json: VoelgoedAiWeb.ErrorJSON], layout: false]
 
 config :phoenix, :json_library, Jason

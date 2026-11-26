@@ -19,6 +19,7 @@ defmodule VoelgoedAi.Application do
       VoelgoedAi.Repo,
       {Oban, Application.fetch_env!(:voelgoed_ai, Oban)},
       VoelgoedAi.Accounts.EntraPendingStates,
+      {Phoenix.PubSub, name: VoelgoedAi.PubSub},
       VoelgoedAiWeb.Endpoint
     ]
 
