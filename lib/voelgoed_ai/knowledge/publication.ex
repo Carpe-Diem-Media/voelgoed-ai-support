@@ -400,7 +400,8 @@ defmodule VoelgoedAi.Knowledge.Publication do
     end
 
     defp rollback(id) do
-      with {:ok, %AuditEvent{} = request} <- one(AuditEvent, :rollback_request, %{id: id}) do
+      with {:ok, request} when is_struct(request, AuditEvent) <-
+             one(AuditEvent, :rollback_request, %{id: id}) do
         with_context(request.article_revision_target_id, fn collection,
                                                             article,
                                                             revision,
@@ -473,17 +474,21 @@ defmodule VoelgoedAi.Knowledge.Publication do
     :exit, _ -> {:error, "publication storage failed"}
   end
 
+  # Resource types are checked with is_struct/2 guards, not %Resource{}
+  # patterns. ArticleRevision calls this module's policy check init/1 while it
+  # compiles, so a struct pattern here would make each module wait on the other
+  # and fail the build whenever the compiler happens to schedule them together.
   defp with_context(id, fun) do
     with {:ok, _} <- Configuration.lock_control(),
-         {:ok, %ArticleRevision{} = candidate} <- get(ArticleRevision, id),
-         {:ok, %Article{} = route} <- get(Article, candidate.article_id),
-         {:ok, %KnowledgeCollection{} = collection} <-
+         {:ok, candidate} when is_struct(candidate, ArticleRevision) <- get(ArticleRevision, id),
+         {:ok, route} when is_struct(route, Article) <- get(Article, candidate.article_id),
+         {:ok, collection} when is_struct(collection, KnowledgeCollection) <-
            get(KnowledgeCollection, route.collection_id, :for_update),
-         {:ok, %Article{} = article} <- get(Article, route.id, :for_update),
+         {:ok, article} when is_struct(article, Article) <- get(Article, route.id, :for_update),
          true <- article.collection_id == collection.id,
          {:ok, revisions} <- lock_revisions([id, article.current_revision_id]),
-         %ArticleRevision{article_id: article_id} = revision <- revisions[id],
-         true <- article_id == article.id do
+         revision when is_struct(revision, ArticleRevision) <- revisions[id],
+         true <- revision.article_id == article.id do
       previous = if id != article.current_revision_id, do: revisions[article.current_revision_id]
       fun.(collection, article, revision, previous)
     else
@@ -501,7 +506,7 @@ defmodule VoelgoedAi.Knowledge.Publication do
     |> Enum.sort()
     |> Enum.reduce_while({:ok, %{}}, fn id, {:ok, rows} ->
       case get(ArticleRevision, id, :for_update) do
-        {:ok, %ArticleRevision{} = row} -> {:cont, {:ok, Map.put(rows, id, row)}}
+        {:ok, row} when is_struct(row, ArticleRevision) -> {:cont, {:ok, Map.put(rows, id, row)}}
         {:ok, nil} -> {:halt, {:error, :inconsistent_pointer}}
         error -> {:halt, error}
       end

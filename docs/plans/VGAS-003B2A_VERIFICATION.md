@@ -164,6 +164,21 @@ keeps those articles unpublishable. Ranking measurements and the
 admission-before-spend composition belong to B2b. Independent exact-head
 review and hosted CI are pending the orchestrator's PR handoff.
 
+## CI compile fix
+
+CI run 45791225936 on `951dae7` failed at `mix compile --warnings-as-errors`. The error was `Publication.init/1` being undefined while `article_revision.ex` compiled.
+
+**Cause.** `ArticleRevision` calls `Publication.init/1` at compile time for its policy check. `Publication` used `%ArticleRevision{}`, `%Article{}`, `%KnowledgeCollection{}` and `%AuditEvent{}` patterns, so it had to wait for those modules to finish compiling. Whether the build failed depended on compiler scheduling.
+
+**Reproduction.** `ELIXIR_ERL_OPTIONS="+S 1" MIX_ENV=test mix compile --warnings-as-errors --force` failed on 5 of 5 runs at 1, 2 and 4 schedulers.
+
+**Fix.** `Publication` now checks resource types with `is_struct/2` guards. The match results are the same.
+
+**After the fix:**
+- That compile exits 0 at 1, 1, 2 and 4 schedulers.
+- A DEV compile at 1 scheduler exits 0.
+- On the disposable pgvector database, `mix test --seed 0` and `--seed 77` each pass 413 tests, with 5 skipped and 1 excluded. `publication_test.exs` passes 12 tests.
+
 ## Completion assessment
 
 Scope is VGAS-003 B2a, implementation. This is the author's assessment.
