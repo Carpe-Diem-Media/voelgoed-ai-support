@@ -3,7 +3,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
 
   import VoelgoedAi.KnowledgeFixtures
   import ExUnit.CaptureLog, only: [capture_log: 1]
-  import VoelgoedAi.SupportFixtures, only: [invoke: 4, blocked_task: 1]
+  import VoelgoedAi.SupportFixtures, only: [invoke: 4, blocked_task: 1, assert_blocked_by: 2]
 
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.{Knowledge, Repo, SupportDBCase}
@@ -524,6 +524,191 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     refute_received :wire
   end
 
+  test "dispatch waits for the attempt lock while its competing search waits for control" do
+    ctx = setup_search()
+    owner = self()
+    barrier = make_ref()
+    {:ok, clock} = Agent.start_link(fn -> ctx.now end)
+
+    fixture(%{
+      clock: fn -> Agent.get(clock, & &1) end,
+      after_claim: fn attempt ->
+        send(owner, {:query_claimed, self(), attempt.id, attempt.deadline_at})
+
+        receive do
+          {:dispatch_query, ^barrier} -> :ok
+        after
+          8_000 -> exit(:dispatch_fixture_timeout)
+        end
+      end,
+      after_dispatch: fn attempt -> send(owner, {:authorized_query, attempt.id}) end,
+      wire: parking_wire(owner, barrier, &EmbeddingTransport.fixture_wire/1)
+    })
+
+    first = on_connection(fn -> search(ctx.claim) end)
+    first_pid = first.pid
+    assert_receive {:fixture_backend, ^first_pid, first_backend}, 5_000
+    assert_receive {:query_claimed, ^first_pid, attempt_id, cutoff}, 5_000
+
+    assert {:ok, second} =
+             Repo.transact(fn ->
+               %{rows: [[holder]]} = SQL.query!(Repo, "SELECT pg_backend_pid()")
+               assert holder != first_backend
+               assert {:ok, %{num_rows: 1}} = lock_query(attempt_id, "")
+
+               send(first_pid, {:dispatch_query, barrier})
+               assert_blocked_by(first_backend, holder)
+
+               second = on_connection(fn -> search(ctx.claim) end)
+               second_pid = second.pid
+               assert_receive {:fixture_backend, ^second_pid, second_backend}, 5_000
+               refute second_backend in [holder, first_backend]
+               assert_blocked_by(second_backend, first_backend)
+
+               probe =
+                 Task.async(fn ->
+                   assert {:error, %Postgrex.Error{postgres: %{pg_code: "55P03"}}} =
+                            lock_query(attempt_id, " NOWAIT")
+                 end)
+
+               Task.await(probe, 2_000)
+               refute_received {:authorized_query, _}
+               {:ok, second}
+             end)
+
+    assert_receive {:authorized_query, ^attempt_id}, 5_000
+    assert_receive {:embedding_parked, ^barrier, adapter, false}, 5_000
+
+    try do
+      assert {:ok, %{status: :unavailable, evidence: []}} = Task.await(second, 5_000)
+
+      assert [[^attempt_id, fence, 1, dispatched_at]] = query_fence(ctx)
+      assert is_binary(fence)
+      refute is_nil(dispatched_at)
+      Agent.update(clock, fn _ -> DateTime.add(cutoff, -1, :microsecond) end)
+      assert :ok = Embedding.sweep()
+      assert query_rows(ctx) == [["running", true, "reserved", nil]]
+
+      Agent.update(clock, fn _ -> cutoff end)
+
+      # A clock correction can put an attempt selected by the scan back
+      # before its deadline. Recovery must recheck after acquiring the lock.
+      assert {:ok, recovery} =
+               Repo.transact(fn ->
+                 %{rows: [[holder]]} = SQL.query!(Repo, "SELECT pg_backend_pid()")
+                 assert {:ok, %{num_rows: 1}} = lock_query(attempt_id, "")
+
+                 recovery = on_connection(&Embedding.sweep/0)
+                 pid = recovery.pid
+                 assert_receive {:fixture_backend, ^pid, backend}, 5_000
+                 assert_blocked_by(backend, holder)
+
+                 Agent.update(clock, fn _ -> DateTime.add(cutoff, -1, :microsecond) end)
+                 {:ok, recovery}
+               end)
+
+      assert :ok = Task.await(recovery, 5_000)
+      assert query_rows(ctx) == [["running", true, "reserved", nil]]
+
+      Agent.update(clock, fn _ -> cutoff end)
+      assert :ok = Embedding.sweep()
+
+      assert query_accounting(ctx) ==
+               [["unknown", "deadline", "unknown", "deadline", 81_920, nil, nil, nil]]
+
+      assert [[^attempt_id, ^fence, 1, ^dispatched_at]] = query_fence(ctx)
+
+      SQL.query!(Repo, "UPDATE support_runs SET claim_generation = 2 WHERE id = $1", [
+        uuid(ctx.claim.run_id)
+      ])
+
+      assert {:ok, %{status: :unavailable, evidence: []}} =
+               search(%{ctx.claim | claim_generation: 2})
+
+      assert [[^attempt_id, ^fence, 1, ^dispatched_at]] = query_fence(ctx)
+    after
+      send(adapter, {:complete_embedding, barrier})
+    end
+
+    assert {:ok, %{status: :unavailable, evidence: []}} = Task.await(first, 5_000)
+    assert query_rows(ctx) == [["succeeded", true, "settled", 8]]
+    refute_received {:authorized_query, _}
+    refute_received {:embedding_parked, ^barrier, _, _}
+  end
+
+  test "expiry of a parked unconsumed query claim releases it and denies dispatch" do
+    ctx = setup_search()
+    owner = self()
+    {:ok, clock} = Agent.start_link(fn -> ctx.now end)
+
+    fixture(%{
+      clock: fn -> Agent.get(clock, & &1) end,
+      after_claim: fn attempt ->
+        send(owner, {:unconsumed_claim, self(), attempt.deadline_at})
+
+        receive do
+          :resume_unconsumed_claim -> :ok
+        after
+          5_000 -> exit(:dispatch_fixture_timeout)
+        end
+      end,
+      wire: fn request ->
+        send(owner, :unexpected_wire)
+        EmbeddingTransport.fixture_wire(request)
+      end
+    })
+
+    worker = Task.async(fn -> search(ctx.claim) end)
+    assert_receive {:unconsumed_claim, pid, cutoff}, 5_000
+
+    try do
+      Agent.update(clock, fn _ -> DateTime.add(cutoff, -1, :microsecond) end)
+      assert :ok = Embedding.sweep()
+      assert query_rows(ctx) == [["running", false, "reserved", nil]]
+
+      Agent.update(clock, fn _ -> cutoff end)
+      assert :ok = Embedding.sweep()
+
+      assert query_accounting(ctx) ==
+               [["rejected", "deadline", "released", "deadline", 81_920, nil, nil, nil]]
+
+      assert_current_support_claim(ctx)
+    after
+      send(pid, :resume_unconsumed_claim)
+    end
+
+    assert {:ok, %{status: :unavailable, evidence: []}} = Task.await(worker, 5_000)
+    assert query_rows(ctx) == [["rejected", false, "released", nil]]
+    refute_received :unexpected_wire
+  end
+
+  defp on_connection(operation) do
+    parent = self()
+
+    Task.async(fn ->
+      Repo.checkout(fn ->
+        %{rows: [[backend]]} = SQL.query!(Repo, "SELECT pg_backend_pid()")
+        send(parent, {:fixture_backend, self(), backend})
+        operation.()
+      end)
+    end)
+  end
+
+  defp lock_query(id, lock) do
+    SQL.query(Repo, "SELECT id FROM inference_runs WHERE id = $1 FOR UPDATE#{lock}", [uuid(id)])
+  end
+
+  defp query_fence(ctx) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT id::text, dispatch_fence::text, claim_generation, dispatched_at
+      FROM inference_runs WHERE support_run_id = $1
+      """,
+      [uuid(ctx.claim.run_id)]
+    ).rows
+  end
+
   for field <- [:lease_expires_at, :deadline_at], boundary <- [:rank, :validate] do
     @cutoff_field field
     @boundary boundary
@@ -703,24 +888,36 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     parent = self()
 
     observe = fn _, _, {:ok, _} ->
-      writer = blocked_task(fn -> change_evidence(ctx, :revocation) end)
+      try do
+        writer = blocked_task(fn -> change_evidence(ctx, :revocation) end)
 
-      probe =
-        Task.async(fn ->
-          assert {:error, %Postgrex.Error{postgres: %{pg_code: "55P03"}}} =
-                   SQL.query(Repo, "SELECT id FROM automation_controls FOR UPDATE NOWAIT")
-        end)
+        probe =
+          Task.async(fn ->
+            SQL.query(Repo, "SELECT id FROM automation_controls FOR UPDATE NOWAIT")
+          end)
 
-      Task.await(probe, 2_000)
-      send(parent, {:blocked_editor, writer})
+        assert {:error, %Postgrex.Error{postgres: %{pg_code: "55P03"}}} =
+                 Task.await(probe, 2_000)
+
+        send(parent, {:blocked_editor, writer})
+      catch
+        kind, error -> send(parent, {:callback_failed, kind, error, __STACKTRACE__})
+      end
     end
 
     Retrieval.with_fixture(ctx.claim, fn search, validate ->
-      assert {:ok, %{status: :evidence, evidence: items}} =
-               Retrieval.with_rank_measurement(observe, fn ->
-                 Knowledge.search_published("FAQ", actor: search)
-               end)
+      result =
+        Retrieval.with_rank_measurement(observe, fn ->
+          Knowledge.search_published("FAQ", actor: search)
+        end)
 
+      receive do
+        {:callback_failed, kind, error, stacktrace} -> :erlang.raise(kind, error, stacktrace)
+      after
+        0 -> :ok
+      end
+
+      assert {:ok, %{status: :evidence, evidence: items}} = result
       assert_received {:blocked_editor, writer}
       assert MapSet.new(items, & &1.revision_id) == MapSet.new([ctx.revision.id, decoy])
       assert :ok = Task.await(writer, 5_000)
@@ -745,25 +942,28 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     {ctx, clone_published(ctx, 1, %{})}
   end
 
+  defp parking_wire(parent, barrier, respond) do
+    fn req ->
+      send(parent, {:embedding_parked, barrier, self(), Repo.in_transaction?()})
+
+      receive do
+        {:complete_embedding, ^barrier} -> respond.(req)
+      after
+        8_000 -> exit(:embedding_fixture_timeout)
+      end
+    end
+  end
+
   defp assert_rank_after_change(ctx, decoy, change) do
-    parent = self()
     barrier = make_ref()
 
     fixture(%{
       clock: fn -> ctx.now end,
-      wire: fn req ->
-        send(parent, {:embedding_parked, barrier, self()})
-
-        receive do
-          {:complete_embedding, ^barrier} -> EmbeddingTransport.fixture_wire(req)
-        after
-          5_000 -> exit(:embedding_fixture_timeout)
-        end
-      end
+      wire: parking_wire(self(), barrier, &EmbeddingTransport.fixture_wire/1)
     })
 
     searcher = Task.async(fn -> search(ctx.claim) end)
-    assert_receive {:embedding_parked, ^barrier, adapter}, 5_000
+    assert_receive {:embedding_parked, ^barrier, adapter, false}, 5_000
 
     try do
       change_evidence(ctx, change)
@@ -915,6 +1115,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
   for {name, result, expected} <- [
         {:unavailable, 503, ["unknown", true, "unknown", nil]},
         {:timeout, :timeout, ["unknown", true, "unknown", nil]},
+        {:malformed_json, :malformed_json, ["unknown", true, "unknown", nil]},
         {:missing_usage, :missing_usage, ["unknown", true, "unknown", nil]},
         {:invalid_vector, :invalid_vector, ["failed", true, "settled", 8]},
         {:overflow, :overflow, ["unknown", true, "unknown", nil]},
@@ -923,21 +1124,32 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     @result result
     @expected expected
 
+    @tag transport_fault: name == :malformed_json
+    @tag retry_fault: name in [:unavailable, :timeout]
     test "#{name} invokes at most once and provides no lexical fallback" do
       ctx = setup_search()
       parent = self()
 
       fixture(%{
         wire: fn req ->
-          send(parent, {:wire, req.options.max_retries, req.options.redirect})
+          send(parent, {:wire, req.options[:max_retries], req.options.redirect})
           wire_result(req, @result)
         end
       })
 
       assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
-      assert_received {:wire, 0, false}
+      assert_received {:wire, limit, false}
       refute_received {:wire, _, _}
+      assert limit == 0
       assert query_rows(ctx) == [@expected]
+
+      case @expected do
+        ["unknown", true, "unknown", nil] ->
+          assert [["unknown", _, "unknown", _, 81_920, nil, nil, _]] = query_accounting(ctx)
+
+        [_, true, "settled", amount] ->
+          assert [[_, _, "settled", _, 81_920, "settlement", ^amount, _]] = query_accounting(ctx)
+      end
     end
   end
 
@@ -998,6 +1210,134 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     end
 
     assert query_rows(ctx) == [["abandoned", true, "conservatively_settled", 81_920]]
+  end
+
+  for state <- [:running, :unknown] do
+    @settlement_state state
+    @tag :split_clock
+    test "split-clock query settlement from #{state} charges once with only RUNNING allowed to rank" do
+      ctx = setup_search()
+      owner = self()
+      barrier = make_ref()
+      {:ok, clock} = Agent.start_link(fn -> ctx.now end)
+      origin_rows = query_spend(ctx.now)
+
+      fixture(%{
+        clock: fn -> Agent.get(clock, & &1) end,
+        wire: parking_wire(owner, barrier, &wire_result(&1, :correlated_usage))
+      })
+
+      worker =
+        Task.async(fn ->
+          Retrieval.with_rank_measurement(fn _, _, _ -> send(owner, :query_ranked) end, fn ->
+            search(ctx.claim)
+          end)
+        end)
+
+      assert_receive {:embedding_parked, ^barrier, adapter, false}, 5_000
+
+      try do
+        assert query_rows(ctx) == [["running", true, "reserved", nil]]
+
+        if @settlement_state == :unknown do
+          late = DateTime.add(ctx.now, 35, :day)
+          Agent.update(clock, fn _ -> late end)
+          assert :ok = Embedding.sweep()
+          assert :ok = Embedding.sweep()
+
+          assert query_accounting(ctx) ==
+                   [["unknown", "deadline", "unknown", "deadline", 81_920, nil, nil, nil]]
+
+          assert query_spend(ctx.now) == origin_rows
+          assert query_spend(late) == []
+        end
+
+        assert_current_support_claim(ctx)
+      after
+        send(adapter, {:complete_embedding, barrier})
+      end
+
+      case @settlement_state do
+        :running ->
+          assert {:ok, %{status: :evidence, evidence: [%{revision_id: id}]}} =
+                   Task.await(worker, 5_000)
+
+          assert id == ctx.revision.id
+          assert_received :query_ranked
+
+        :unknown ->
+          assert {:ok, %{status: :unavailable, evidence: []}} = Task.await(worker, 5_000)
+          refute_received :query_ranked
+      end
+
+      assert :ok = Embedding.sweep()
+      assert query_rows(ctx) == [["succeeded", true, "settled", 18]]
+
+      assert query_accounting(ctx) ==
+               [
+                 [
+                   "succeeded",
+                   nil,
+                   "settled",
+                   nil,
+                   81_920,
+                   "settlement",
+                   18,
+                   "req_query_settlement"
+                 ]
+               ]
+
+      assert query_spend(ctx.now) ==
+               Enum.map(origin_rows, fn [kind, start, spent] ->
+                 [kind, start, spent + 18]
+               end)
+
+      assert query_spend(DateTime.add(ctx.now, 35, :day)) == []
+      refute_received {:embedding_parked, ^barrier, _, _}
+    end
+  end
+
+  defp assert_current_support_claim(ctx) do
+    assert {:ok, :valid} =
+             RunProcessing.with_run(ctx.claim.run_id, fn config, session, run, now ->
+               assert Ownership.write_enabled?(config)
+               assert RunProcessing.valid_run?(config, session, run)
+               assert run.state == :running
+               assert run.claim_generation == ctx.claim.claim_generation
+               assert now == ctx.now
+               assert DateTime.compare(now, run.lease_expires_at) == :lt
+               assert DateTime.compare(now, run.deadline_at) == :lt
+               {:ok, :valid}
+             end)
+  end
+
+  defp query_accounting(ctx) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT i.state, i.reason_code, r.state, r.reason_code, r.reserved_nano_usd,
+             l.entry_key, l.amount_nano_usd, i.provider_request_id
+      FROM inference_runs i JOIN usage_reservations r ON r.inference_run_id = i.id
+      LEFT JOIN usage_ledger_entries l ON l.reservation_id = r.id
+      WHERE i.support_run_id = $1
+      """,
+      [uuid(ctx.claim.run_id)]
+    ).rows
+  end
+
+  defp query_spend(time) do
+    day = DateTime.to_date(time)
+
+    SQL.query!(
+      Repo,
+      """
+      SELECT kind, window_start, settled_nano_usd FROM spend_windows
+      WHERE scope = 'global' AND ((kind = 'day' AND window_start = $1)
+        OR (kind = 'month' AND window_start = $2))
+      ORDER BY kind
+      """,
+      [day, Date.beginning_of_month(day)]
+    ).rows
   end
 
   test "late correlated usage settles the original window after recovery and yields no evidence" do
@@ -1428,7 +1768,12 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
   end
 
   defp wire_result(req, status) when is_integer(status),
-    do: {req, Req.Response.new(status: status)}
+    do: {req, Req.Response.new(status: status, headers: [{"retry-after", "0"}])}
+
+  defp wire_result(req, :malformed_json),
+    do:
+      {req,
+       Req.Response.new(status: 200, headers: [{"content-type", "application/json"}], body: "{")}
 
   defp wire_result(req, :timeout), do: {req, %Req.TransportError{reason: :timeout}}
 
@@ -1437,6 +1782,11 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
 
     body =
       case change do
+        :correlated_usage ->
+          response.body
+          |> put_in(["data", Access.at(0), "embedding"], [0.8, 0.6 | List.duplicate(0.0, 1534)])
+          |> Map.put("usage", %{"total_tokens" => 7, "prompt_tokens" => 7})
+
         :invalid_vector ->
           put_in(response.body, ["data", Access.at(0), "embedding"], [0.0])
 
@@ -1453,7 +1803,13 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
           Map.put(response.body, "usage", %{"total_tokens" => 40_000, "prompt_tokens" => 40_000})
       end
 
-    {req, %{response | body: body}}
+    response = %{response | body: body}
+
+    if change == :correlated_usage do
+      {req, Req.Response.put_header(response, "x-request-id", "req_query_settlement")}
+    else
+      {req, response}
+    end
   end
 
   defp uuid(id), do: Ecto.UUID.dump!(id)

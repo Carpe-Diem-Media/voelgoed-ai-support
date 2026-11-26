@@ -134,12 +134,17 @@ defmodule VoelgoedAi.SupportFixtures do
 
     pid = task.pid
     assert_receive {:backend, ^pid, backend}, 5_000
-    assert_waiting(backend, System.monotonic_time(:millisecond) + 4_000)
+    %{rows: [[blocker]]} = SQL.query!(Repo, "SELECT pg_backend_pid()")
+    assert_blocked_by(backend, blocker)
     task
   end
 
-  defp assert_waiting(backend, deadline) do
-    case SQL.query!(Repo, "SELECT pg_backend_pid() = ANY(pg_blocking_pids($1))", [backend]) do
+  def assert_blocked_by(backend, blocker) do
+    assert_waiting(backend, blocker, System.monotonic_time(:millisecond) + 4_000)
+  end
+
+  defp assert_waiting(backend, blocker, deadline) do
+    case SQL.query!(Repo, "SELECT $2::integer = ANY(pg_blocking_pids($1))", [backend, blocker]) do
       %{rows: [[true]]} ->
         :ok
 
@@ -148,7 +153,7 @@ defmodule VoelgoedAi.SupportFixtures do
                "PostgreSQL lock wait was not observed"
 
         Process.sleep(10)
-        assert_waiting(backend, deadline)
+        assert_waiting(backend, blocker, deadline)
     end
   end
 end

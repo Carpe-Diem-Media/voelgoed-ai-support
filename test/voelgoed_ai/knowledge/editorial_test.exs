@@ -234,18 +234,20 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
   @tag :requires_pgvector
   @tag :embedding_index
-  test "503 and timeout each hit the actual adapter once and keep the cost held", ctx do
+  test "article wire failures enter the adapter once and settle only correlated usage", ctx do
     {_collection, revision} = approved(ctx)
     parent = self()
 
-    for {fault, action} <- [
-          {:service_unavailable, :request_publish},
-          {:timeout, :retry_publication}
+    for {fault, action, state, reservation, amount} <- [
+          {:service_unavailable, :request_publish, "unknown", "unknown", nil},
+          {:timeout, :retry_publication, "unknown", "unknown", nil},
+          {:malformed_json, :retry_publication, "unknown", "unknown", nil},
+          {:invalid_vector, :retry_publication, "failed", "settled", 8}
         ] do
       [id, sibling] = request_index(ctx, revision, action)
 
       wire = fn request ->
-        send(parent, {:wire_fault, fault})
+        send(parent, {:wire_fault, fault, request.options[:max_retries]})
 
         case fault do
           :service_unavailable ->
@@ -258,18 +260,42 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
           :timeout ->
             {request, %Req.TransportError{reason: :timeout}}
+
+          :malformed_json ->
+            {request,
+             Req.Response.new(
+               status: 200,
+               headers: [{"content-type", "application/json"}],
+               body: "{"
+             )}
+
+          :invalid_vector ->
+            {request, reply} = response(request, 3, :zero)
+
+            {request,
+             reply
+             |> Req.Response.put_header("content-type", "application/json")
+             |> Map.put(:body, Jason.encode!(reply.body))}
         end
       end
 
       fixture(%{wire: wire})
       assert :ok = Embedding.index(id)
-      assert_receive {:wire_fault, ^fault}
-      refute_receive {:wire_fault, ^fault}, 50
-      assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+      assert_received {:wire_fault, ^fault, limit}
+      refute_received {:wire_fault, ^fault, _}
+      assert limit == 0
+      assert [[^state, true, ^reservation, 81_920, ^amount]] = reservation_rows(id)
+
+      case amount do
+        nil -> assert [] == ledger_rows(id)
+        8 -> assert [[_, "settlement", "settlement", nil, 8, 3, nil]] = ledger_rows(id)
+      end
+
+      assert [[_, nil]] = vector_rows(id)
       assert [["invalidated", nil]] = vector_rows(sibling)
       assert :ok = Embedding.index(id)
       assert :ok = Embedding.index(sibling)
-      refute_receive {:wire_fault, ^fault}, 50
+      refute_received {:wire_fault, ^fault, _}
     end
   end
 
@@ -489,42 +515,72 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
       month_cap: 81_920,
       closure_approved_by: ctx.admin.id,
       before_settlement: fn attempt ->
-        send(parent, {:settlement, self(), attempt.id})
+        if self() != parent do
+          send(parent, {:settlement, self(), attempt.id})
 
-        receive do
-          :complete -> :ok
+          receive do
+            :complete -> :ok
+          after
+            8_000 -> exit(:article_settlement_fixture_timeout)
+          end
         end
       end
     })
 
     [id, _] = request_index(ctx, revision)
     task = Task.async(fn -> Embedding.index(id) end)
-    assert_receive {:settlement, worker, attempt_id}, 8_000
+    assert_receive {:settlement, worker, attempt_id}, 5_000
     Agent.update(clock, fn _ -> DateTime.add(origin, 65) end)
+    args = %{id: attempt_id, reason: :conservative_closure}
+
+    {ceiling, ceiling_id} =
+      try do
+        assert :ok = Embedding.recover(id)
+        assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+        assert :ok = Embedding.index(id)
+
+        [candidate, _] = request_index(ctx, revision, :retry_publication)
+        assert :ok = Embedding.index(candidate)
+        assert [] == reservation_rows(candidate)
+
+        assert {:error, _} = invoke(InferenceRun, :close_unknown_embedding, args, ctx.reviewer)
+
+        for _ <- 1..2 do
+          assert {:ok, %{state: :abandoned}} =
+                   invoke(InferenceRun, :close_unknown_embedding, args, ctx.admin)
+        end
+
+        assert [["abandoned", true, "conservatively_settled", 81_920, 81_920]] =
+                 reservation_rows(id)
+
+        assert [[ceiling_id, "settlement", "settlement", nil, 81_920, nil, admin]] =
+                 ceiling = ledger_rows(id)
+
+        assert admin == ctx.admin.id
+
+        assert [["day", ~D[2027-01-31], 81_920], ["month", ~D[2027-01-01], 81_920]] ==
+                 origin_windows()
+
+        {ceiling, ceiling_id}
+      after
+        send(worker, :complete)
+      end
+
+    assert :ok = Task.await(task)
+
+    assert correction =
+             [_, "correction", "late-usage", ^ceiling_id, -81_912, 3, nil] =
+             Enum.at(ledger_rows(id), 1)
+
+    assert ledger_rows(id) == ceiling ++ [correction]
+    assert Enum.sum(Enum.map(ledger_rows(id), &Enum.at(&1, 4))) == 8
+
+    assert {:ok, %{state: :abandoned}} =
+             invoke(InferenceRun, :close_unknown_embedding, args, ctx.admin)
 
     assert :ok = Embedding.recover(id)
-    assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
     assert :ok = Embedding.index(id)
-
-    [candidate, _] = request_index(ctx, revision, :retry_publication)
-    assert :ok = Embedding.index(candidate)
-    assert [] == reservation_rows(candidate)
-
-    args = %{id: attempt_id, reason: :conservative_closure}
-    assert {:error, _} = invoke(InferenceRun, :close_unknown_embedding, args, ctx.reviewer)
-
-    assert {:ok, %{state: :abandoned}} =
-             invoke(InferenceRun, :close_unknown_embedding, args, ctx.admin)
-
-    assert {:ok, %{state: :abandoned}} =
-             invoke(InferenceRun, :close_unknown_embedding, args, ctx.admin)
-
-    assert [["abandoned", true, "conservatively_settled", 81_920, 81_920]] = reservation_rows(id)
-
-    send(worker, :complete)
-    assert :ok = Task.await(task)
-    assert [["settlement", 81_920, nil, admin], ["correction", -81_912, 3, nil]] = ledger_rows(id)
-    assert admin == ctx.admin.id
+    assert ledger_rows(id) == ceiling ++ [correction]
     assert [["failed", nil]] = vector_rows(id)
     assert [["day", ~D[2027-01-31], 8], ["month", ~D[2027-01-01], 8]] == origin_windows()
   end
@@ -625,7 +681,7 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     send(wire_pid, :complete)
     assert :ok = Task.await(task)
     assert [["succeeded", true, "settled", 81_920, 100_000]] = reservation_rows(id)
-    assert [["settlement", 100_000, 40_000, nil]] = ledger_rows(id)
+    assert [[_, "settlement", "settlement", nil, 100_000, 40_000, nil]] = ledger_rows(id)
 
     assert %{rows: [["embedding-fixture-v1", 5, 2, "over_reserve"]]} =
              SQL.query!(
@@ -1536,7 +1592,8 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     SQL.query!(
       Repo,
       """
-      SELECT entry_kind, amount_nano_usd, input_tokens, closure_approved_by_id::text
+      SELECT id::text, entry_kind, entry_key, corrects_id::text, amount_nano_usd,
+             input_tokens, closure_approved_by_id::text
       FROM usage_ledger_entries
       WHERE inference_run_id IN (SELECT id FROM inference_runs WHERE article_embedding_id = $1)
       ORDER BY inserted_at, id
