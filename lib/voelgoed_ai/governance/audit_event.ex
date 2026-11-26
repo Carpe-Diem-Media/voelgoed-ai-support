@@ -376,7 +376,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         )
       )
 
-      prepare(build(sort: [:occurred_at, :id], limit: 100))
+      prepare(build(sort: [occurred_at: :desc, id: :desc], limit: 100))
     end
 
     create :append_support_operator do

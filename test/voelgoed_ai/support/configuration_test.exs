@@ -8,7 +8,7 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
   alias VoelgoedAi.Accounts.StaffAccess.Scope
   alias VoelgoedAi.Governance.{AuditEvent, AutomationControl}
   alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
-  alias VoelgoedAi.Support.{ActionScope, InboxBinding}
+  alias VoelgoedAi.Support.{ActionScope, Configuration, InboxBinding}
   alias VoelgoedAi.Support.ActionScope.Storage
 
   setup do
@@ -109,6 +109,46 @@ defmodule VoelgoedAi.Support.ConfigurationTest do
              invoke(AssistantRevision, :read_configuration, %{id: revision.id}, admin)
 
     assert {:ok, _} = publish(admin, revision, nil)
+  end
+
+  test "a published v1 configuration still verifies and renders its fixed reply", ctx do
+    admin = bootstrap_admin(ctx.admin)
+    assistant = create(admin, ctx.slug)
+    fixture = allow_fixture(assistant)
+    revision = draft(admin, assistant)
+
+    # Use the predecessor hash encoding, independent of the current writer.
+    legacy_values = ["test-v1", "test-v1", :af, :fixed_reply, fixture.fixed_text]
+
+    hash =
+      :crypto.hash(:sha256, :erlang.term_to_binary(legacy_values)) |> Base.encode16(case: :lower)
+
+    SQL.query!(
+      Repo,
+      """
+      UPDATE assistant_revisions
+      SET status = 'published', published_by_id = $1, published_at = now(),
+          config_hash_version = 1, config_hash = $2
+      WHERE id = $3
+      """,
+      [Ecto.UUID.dump!(admin.id), hash, Ecto.UUID.dump!(revision.id)]
+    )
+
+    SQL.query!(Repo, "UPDATE assistants SET active_revision_id = $1 WHERE id = $2", [
+      Ecto.UUID.dump!(revision.id),
+      Ecto.UUID.dump!(assistant.id)
+    ])
+
+    current = %Assistant{id: assistant.id, active_revision_id: revision.id}
+
+    assert {:ok, %{config_hash_version: 1, config_hash: ^hash}} =
+             Repo.transact(fn -> Configuration.current_revision(current) end)
+
+    run = %{assistant_revision_id: revision.id}
+    delivery = %{template_version: revision.template_version, template_hash: hash}
+
+    assert Repo.transact(fn -> Configuration.render_fixed_reply(current, run, delivery) end) ==
+             {:ok, fixture.fixed_text}
   end
 
   test "publish serializes the compare and switch on the assistant row", ctx do

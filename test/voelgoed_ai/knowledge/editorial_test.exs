@@ -5,8 +5,10 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
   import VoelgoedAi.SupportFixtures, except: [setup: 0]
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.{Accounts, Repo}
-  alias VoelgoedAi.Intelligence.AssistantRevision
+  alias VoelgoedAi.Governance.AuditEvent
+  alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
   alias VoelgoedAi.Knowledge.{Article, ArticleRevision, Content, KnowledgeCollection}
+  alias VoelgoedAi.Support.Configuration
 
   setup do
     ctx = VoelgoedAi.SupportFixtures.setup()
@@ -245,7 +247,7 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     assert {:ok, history} =
              invoke(VoelgoedAi.Governance.AuditEvent, :knowledge_history, args, ctx.reviewer)
 
-    assert Enum.map(history, & &1.event) == [:create_draft, :submit_review, :withdraw]
+    assert Enum.map(history, & &1.event) == [:withdraw, :submit_review, :create_draft]
   end
 
   test "concurrent edits and approvals serialize on real connections", ctx do
@@ -329,15 +331,129 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     args = Map.put(attest(snapshot(revision)), :self_approval, true)
     assert {:ok, %{status: :approved}} = invoke(ArticleRevision, :approve, args, both)
 
-    assert %{rows: [["self_approval_attested"]]} =
-             SQL.query!(
-               Repo,
-               """
-               SELECT reason_code FROM audit_events
-               WHERE article_revision_target_id = $1 AND event = 'approve'
-               """,
-               [Ecto.UUID.dump!(revision.id)]
+    assert approval_reason(revision.id) == "self_approval_attested"
+  end
+
+  test "editing another staff member's draft requires a self-approval attestation", ctx do
+    collection = collection(ctx)
+    reviewer = enable_reviewer_edits(ctx, collection)
+    revision = draft_revision(ctx, collection)
+
+    content =
+      put_in(
+        payload(),
+        ["localized_content", Access.at(0), "approved_answer"],
+        "Revised synthetic answer."
+      )
+
+    assert {:ok, edited} =
+             invoke(
+               ArticleRevision,
+               :edit_draft,
+               Map.put(snapshot(revision), :content, content),
+               reviewer
              )
+
+    reviewed = review(ctx, edited)
+    args = attest(snapshot(reviewed))
+
+    assert {:error, error} = invoke(ArticleRevision, :approve, args, reviewer)
+    assert Exception.message(error) =~ "approval_denied"
+
+    assert {:ok, %{status: :approved}} =
+             invoke(ArticleRevision, :approve, %{args | self_approval: true}, reviewer)
+
+    assert approval_reason(reviewed.id) == "self_approval_attested"
+  end
+
+  test "submitting another staff member's draft requires a self-approval attestation", ctx do
+    collection = collection(ctx)
+    reviewer = enable_reviewer_edits(ctx, collection)
+
+    assert {:ok, _} =
+             Accounts.set_roles(ctx.admin, ctx.admin.id, [:admin, :knowledge_reviewer])
+
+    assert {:ok, independent} = authenticate(ctx.admin.id)
+
+    Application.put_env(:voelgoed_ai, :knowledge_fixture_scope, %{
+      collection.id => %{
+        editors: [ctx.editor.id, reviewer.id],
+        reviewers: [reviewer.id, independent.id]
+      }
+    })
+
+    revision = draft_revision(ctx, collection)
+    reviewed = review(%{ctx | editor: reviewer}, revision)
+    args = attest(snapshot(reviewed))
+
+    assert {:error, error} = invoke(ArticleRevision, :approve, args, reviewer)
+    assert Exception.message(error) =~ "approval_denied"
+
+    assert {:ok, %{status: :approved}} = invoke(ArticleRevision, :approve, args, independent)
+    assert approval_reason(reviewed.id) == "source_verified"
+  end
+
+  test "a disabled collection fences all draft and review writes", ctx do
+    collection = collection(ctx)
+    submitted = review(ctx, draft_revision(ctx, collection))
+
+    assert {:ok, draft} =
+             invoke(
+               ArticleRevision,
+               :create_draft,
+               %{article_id: submitted.article_id, content: payload()},
+               ctx.editor
+             )
+
+    assert {:ok, _} = invoke(KnowledgeCollection, :disable, %{id: collection.id}, ctx.admin)
+
+    new_article = %{
+      draft_args(ctx, collection)
+      | article_ref: "VG-KB-" <> alphabetic_suffix(ctx.slug) <> "-NEW",
+        slug: "new-faq"
+    }
+
+    for {resource, action, args, actor} <- [
+          {ArticleRevision, :edit_draft, Map.put(snapshot(draft), :content, payload()),
+           ctx.editor},
+          {ArticleRevision, :submit_review, snapshot(draft), ctx.editor},
+          {ArticleRevision, :approve, attest(snapshot(submitted)), ctx.reviewer},
+          {ArticleRevision, :create_draft, %{article_id: draft.article_id, content: payload()},
+           ctx.editor},
+          {Article, :create_draft, new_article, ctx.editor}
+        ] do
+      assert {:error, error} = invoke(resource, action, args, actor)
+      assert Exception.message(error) =~ "inactive_scope"
+    end
+  end
+
+  test "knowledge history returns the newest 100 events", ctx do
+    collection = collection(ctx)
+    ids = for _ <- 1..101, do: Ecto.UUID.dump!(Ash.UUIDv7.generate())
+
+    SQL.query!(
+      Repo,
+      """
+      INSERT INTO audit_events
+        (id, actor_kind, actor_staff_id, target_kind, knowledge_collection_target_id,
+         event, reason_code, operational_after, correlation_id, occurred_at)
+      SELECT id, 'staff', $1, 'knowledge_collection', $2, 'enable', 'local_admin',
+             '{"status":"active"}', id, now() + ordinal * interval '1 second'
+      FROM unnest($3::uuid[]) WITH ORDINALITY AS event(id, ordinal)
+      """,
+      [Ecto.UUID.dump!(ctx.admin.id), Ecto.UUID.dump!(collection.id), ids]
+    )
+
+    assert {:ok, history} =
+             invoke(
+               AuditEvent,
+               :knowledge_history,
+               %{target_kind: :knowledge_collection, id: collection.id},
+               ctx.reviewer
+             )
+
+    expected_ids = ids |> Enum.reverse() |> Enum.take(100) |> Enum.map(&Ecto.UUID.load!/1)
+    assert Enum.map(history, & &1.id) == expected_ids
   end
 
   test "sensitive approvals stay pending and archive fences editing", ctx do
@@ -418,6 +534,42 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     assert next.collection_ids == []
     refute next.config_hash == published.config_hash
     assert {:error, _} = invoke(AssistantRevision, :remove_collection, args, ctx.admin)
+  end
+
+  test "published v2 configuration rejects a changed grant set", ctx do
+    granted = collection(ctx)
+    added = collection(ctx, "-other")
+    assistant = create(ctx.admin, ctx.slug)
+    allow_fixture(assistant)
+    revision = draft(ctx.admin, assistant)
+
+    assert {:ok, _} =
+             invoke(
+               AssistantRevision,
+               :grant_collection,
+               %{id: revision.id, collection_id: granted.id},
+               ctx.admin
+             )
+
+    assert {:ok, %{id: id, config_hash_version: 2}} =
+             invoke(
+               AssistantRevision,
+               :publish,
+               %{id: revision.id, expected_active_revision_id: nil},
+               ctx.admin
+             )
+
+    current = %Assistant{id: assistant.id, active_revision_id: id}
+    assert {:ok, %{id: ^id}} = Repo.transact(fn -> Configuration.current_revision(current) end)
+
+    SQL.query!(
+      Repo,
+      "INSERT INTO assistant_knowledge_grants (id, assistant_revision_id, collection_id) VALUES ($1, $2, $3)",
+      Enum.map([Ash.UUIDv7.generate(), id, added.id], &Ecto.UUID.dump!/1)
+    )
+
+    assert {:error, :stale_policy} =
+             Repo.transact(fn -> Configuration.current_revision(current) end)
   end
 
   test "assistant publication locks its previous revision before collections", ctx do
@@ -524,6 +676,12 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
     assert {:ok, %{articles: [%{outcome: :create}]}} = invoke_import.(:preview_import, doc)
 
+    wrong_hash =
+      put_in(doc, ["articles", Access.at(0), "source_content_hash"], String.duplicate("0", 64))
+
+    assert {:error, error} = invoke_import.(:apply_import, wrong_hash)
+    assert Exception.message(error) =~ "invalid_portable_document"
+
     assert {:error, _} =
              invoke_import.(
                :apply_import,
@@ -626,7 +784,7 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
                ctx.editor
              )
 
-    assert {:ok, %{revision_number: 2, status: :draft}} =
+    assert {:ok, %{revision_number: 2, status: :draft} = imported} =
              invoke(ArticleRevision, :read_revision, %{id: new_id}, ctx.editor)
 
     assert {:ok, %{status: :approved, content_hash: hash}} =
@@ -657,6 +815,28 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
                },
                ctx.editor
              )
+
+    submitter = enable_reviewer_edits(ctx, collection)
+
+    assert {:ok, _} =
+             Accounts.set_roles(ctx.admin, ctx.editor.id, [:knowledge_editor, :knowledge_reviewer])
+
+    assert {:ok, importer} = authenticate(ctx.editor.id)
+
+    Application.put_env(:voelgoed_ai, :knowledge_fixture_scope, %{
+      collection.id => %{editors: [submitter.id], reviewers: [importer.id]}
+    })
+
+    reviewed_import = review(%{ctx | editor: submitter}, imported)
+    args = attest(snapshot(reviewed_import))
+
+    assert {:error, error} = invoke(ArticleRevision, :approve, args, importer)
+    assert Exception.message(error) =~ "approval_denied"
+
+    assert {:ok, %{status: :approved}} =
+             invoke(ArticleRevision, :approve, %{args | self_approval: true}, importer)
+
+    assert approval_reason(imported.id) == "self_approval_attested"
   end
 
   defp compete(operation) do
@@ -689,6 +869,33 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     Application.put_env(:voelgoed_ai, :knowledge_fixture_scope, %{
       row.id => %{editors: [ctx.editor.id], reviewers: [ctx.reviewer.id]}
     })
+  end
+
+  defp enable_reviewer_edits(ctx, collection) do
+    assert {:ok, _} =
+             Accounts.set_roles(ctx.admin, ctx.reviewer.id, [
+               :knowledge_editor,
+               :knowledge_reviewer
+             ])
+
+    assert {:ok, reviewer} = authenticate(ctx.reviewer.id)
+
+    Application.put_env(:voelgoed_ai, :knowledge_fixture_scope, %{
+      collection.id => %{editors: [ctx.editor.id, reviewer.id], reviewers: [reviewer.id]}
+    })
+
+    reviewer
+  end
+
+  defp approval_reason(id) do
+    assert %{rows: [[reason]]} =
+             SQL.query!(
+               Repo,
+               "SELECT reason_code FROM audit_events WHERE article_revision_target_id = $1 AND event = 'approve'",
+               [Ecto.UUID.dump!(id)]
+             )
+
+    reason
   end
 
   defp draft_args(ctx, row),

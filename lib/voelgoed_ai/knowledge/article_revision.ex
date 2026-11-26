@@ -54,6 +54,13 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       constraints: [match: ~r/\A[a-f0-9]{64}\z/]
     )
 
+    attribute(:contributor_ids, {:array, :uuid},
+      description:
+        "Staff IDs that created, edited or submitted this revision. Used to require self-approval attestation.",
+      allow_nil?: false,
+      default: []
+    )
+
     attribute(:review_hash, :string, constraints: [match: ~r/\A[a-f0-9]{64}\z/])
     attribute(:approved_at, :utc_datetime_usec)
     create_timestamp(:inserted_at)
@@ -176,6 +183,7 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       accept([
         :article_id,
         :created_by_id,
+        :contributor_ids,
         :revision_number,
         :content,
         :content_hash,
@@ -191,6 +199,7 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
         :content,
         :content_hash,
         :edit_version,
+        :contributor_ids,
         :review_hash,
         :status,
         :approved_by_id,

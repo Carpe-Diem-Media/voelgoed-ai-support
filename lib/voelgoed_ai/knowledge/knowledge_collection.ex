@@ -120,11 +120,6 @@ defmodule VoelgoedAi.Knowledge.KnowledgeCollection do
       filter(expr(id == ^arg(:id)))
     end
 
-    read :collection_by_slug do
-      argument(:slug, :string, allow_nil?: false)
-      filter(expr(slug == ^arg(:slug)))
-    end
-
     create :insert_row do
       transaction?(false)
       accept([:slug, :name, :audience])
@@ -151,7 +146,7 @@ defmodule VoelgoedAi.Knowledge.KnowledgeCollection do
       authorize_if(Editorial)
     end
 
-    policy action([:insert_row, :change_row, :collection_by_slug]) do
+    policy action([:insert_row, :change_row]) do
       authorize_if(Storage)
     end
 

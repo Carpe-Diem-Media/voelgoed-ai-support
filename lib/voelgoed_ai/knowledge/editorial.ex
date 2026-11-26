@@ -212,22 +212,27 @@ defmodule VoelgoedAi.Knowledge.Editorial do
        else: {:error, :stale_snapshot}
   end
 
-  defp revision_transition(%{status: :draft} = row, :edit_draft, args, _staff) do
+  defp revision_transition(%{status: :draft} = row, :edit_draft, args, staff) do
     with {:ok, content} <- Content.parse(args.content) do
       {:ok,
        %{
          content: content,
          content_hash: Content.hash(content),
-         edit_version: row.edit_version + 1
+         edit_version: row.edit_version + 1,
+         contributor_ids: record_contributor(row, staff)
        }, :local_editor}
     end
   end
 
-  defp revision_transition(%{status: :draft} = row, :submit_review, _args, _staff) do
+  defp revision_transition(%{status: :draft} = row, :submit_review, _args, staff) do
     if Content.reviewable?(row.content) do
       {:ok,
-       %{status: :in_review, review_hash: row.content_hash, edit_version: row.edit_version + 1},
-       :local_editor}
+       %{
+         status: :in_review,
+         review_hash: row.content_hash,
+         edit_version: row.edit_version + 1,
+         contributor_ids: record_contributor(row, staff)
+       }, :local_editor}
     else
       {:error, :missing_source}
     end
@@ -240,7 +245,7 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   end
 
   defp revision_transition(%{status: :in_review} = row, :approve, args, staff) do
-    self? = row.created_by_id == staff.id
+    self? = staff.id in row.contributor_ids
 
     with :ok <- review_snapshot(row),
          true <-
@@ -261,6 +266,9 @@ defmodule VoelgoedAi.Knowledge.Editorial do
        do: {:ok, %{status: :withdrawn, review_hash: nil}, args.reason}
 
   defp revision_transition(_, _, _, _), do: {:error, :invalid_transition}
+
+  # The revision stays locked through the transition and its audit write.
+  defp record_contributor(row, staff), do: Enum.uniq([staff.id | row.contributor_ids])
 
   defp review_snapshot(%{review_hash: hash, content_hash: hash}) when is_binary(hash), do: :ok
   defp review_snapshot(_), do: {:error, :stale_snapshot}
@@ -334,6 +342,7 @@ defmodule VoelgoedAi.Knowledge.Editorial do
       attrs = %{
         article_id: article.id,
         created_by_id: staff.id,
+        contributor_ids: [staff.id],
         revision_number: number,
         content: content,
         content_hash: Content.hash(content),
