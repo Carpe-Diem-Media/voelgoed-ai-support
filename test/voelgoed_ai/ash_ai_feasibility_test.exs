@@ -56,14 +56,15 @@ defmodule VoelgoedAi.AshAiFeasibilityTest do
           flow
 
         attempt ->
-          options =
-            Keyword.put(
-              flow.req_llm_opts,
-              :req_http_options,
-              TransportEvidence.options(attempt, __MODULE__)
-            )
+          http_options = TransportEvidence.options(attempt, __MODULE__)
 
-          %{flow | req_llm_opts: options}
+          http_options =
+            case flow.source_context[:observe_adapter] do
+              nil -> http_options
+              observe -> Keyword.update!(http_options, :adapter, &observe.(&1))
+            end
+
+          %{flow | req_llm_opts: Keyword.put(flow.req_llm_opts, :req_http_options, http_options)}
       end
     end
   end
@@ -304,6 +305,59 @@ defmodule VoelgoedAi.AshAiFeasibilityTest do
                DurableLedger.fetch(ledger, 2)
     end
 
+    for {fault, outcome, classification} <- [
+          {:malformed_json, "unknown", "http_success"},
+          {:invalid_result, "settled", "http_success"},
+          {:status_503, "unknown", "http_failure"},
+          {:timeout, "unknown", "timeout"}
+        ] do
+      @generation_fault fault
+      @generation_outcome outcome
+      @generation_classification classification
+      test "generation fails once at the fake Responses endpoint for #{fault}", %{ledger: ledger} do
+        owner = self()
+        fault = @generation_fault
+        outcome = @generation_outcome
+        classification = @generation_classification
+        {:ok, ceiling} = TransportEvidence.ceiling("gpt-6-luna")
+
+        Req.Test.stub(Probe, fn conn ->
+          send(owner, :generation_wire)
+
+          generation_failure(conn, fault)
+        end)
+
+        observe = fn adapter ->
+          fn request ->
+            send(owner, {:generation_options, request.options[:max_retries]})
+            adapter.(request)
+          end
+        end
+
+        assert {:error, result} =
+                 TransportEvidence.run(
+                   ledger,
+                   1,
+                   ~D[2026-11-30],
+                   "gpt-6-luna",
+                   limits(),
+                   fn attempt -> propose_attempt(attempt, observe) end
+                 )
+
+        assert_received :generation_wire
+        refute_received :generation_wire
+        assert_received {:generation_options, 0}
+        refute_received {:generation_options, _}
+
+        assert %{state: ^outcome, ceiling: ^ceiling, actual: actual, evidence: evidence} =
+                 DurableLedger.fetch(ledger, 1)
+
+        assert evidence["classification"] == classification
+
+        assert_generation_charge(fault, actual, result, evidence)
+      end
+    end
+
     test "a worker killed after the real adapter records evidence is recoverable", %{
       ledger: ledger
     } do
@@ -463,16 +517,43 @@ defmodule VoelgoedAi.AshAiFeasibilityTest do
     end
   end
 
+  defp assert_generation_charge(:invalid_result, actual, _result, evidence) do
+    assert actual == 8750
+    assert evidence["response_id"] == "resp_synthetic"
+  end
+
+  defp assert_generation_charge(_fault, actual, result, _evidence) do
+    assert result == :unknown
+    assert is_nil(actual)
+  end
+
+  defp generation_failure(conn, :malformed_json) do
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.send_resp(200, "{")
+  end
+
+  defp generation_failure(conn, :invalid_result), do: respond(conn, %{"decision" => "send"})
+
+  defp generation_failure(conn, :status_503) do
+    conn
+    |> Plug.Conn.put_resp_header("retry-after", "0")
+    |> Plug.Conn.put_status(503)
+    |> Req.Test.json(%{"error" => %{"message" => "fixture"}})
+  end
+
+  defp generation_failure(conn, :timeout), do: Req.Test.transport_error(conn, :timeout)
+
   defp run_generation(ledger, id) do
     TransportEvidence.run(ledger, id, ~D[2026-11-30], "gpt-6-luna", limits(), fn attempt ->
       propose_attempt(attempt)
     end)
   end
 
-  defp propose_attempt(attempt) do
+  defp propose_attempt(attempt, observe \\ nil) do
     Probe
     |> Ash.ActionInput.for_action(:propose, %{text: "Synthetic request"})
-    |> Ash.ActionInput.set_context(%{feasibility_attempt: attempt})
+    |> Ash.ActionInput.set_context(%{feasibility_attempt: attempt, observe_adapter: observe})
     |> Ash.run_action()
   end
 

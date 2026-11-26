@@ -223,3 +223,17 @@ The decoy remains individually valid after changes limited to the
 target article. Grant publication and ownership changes invalidate
 the old claim as a whole, so their mixed-citation cases establish
 whole-claim denial.
+
+## Corrections from review
+
+- The grant-join mutant leaves three fences that keep SQL parameters
+  `$1` and `$2` on the same assistant revision. Retrieval checks the pair in
+  `lib/voelgoed_ai/knowledge/retrieval.ex:376`. The valid-run check at
+  `lib/voelgoed_ai/support/run_processing.ex:490` also requires the active
+  revision. The assistant `security_epoch` fence at
+  `lib/voelgoed_ai/support/ownership.ex:103` rejects the old pin after
+  publication increments the epoch at
+  `lib/voelgoed_ai/support/configuration.ex:233`.
+- The `article_revisions_active_index` constraint in
+  `priv/repo/migrations/20261126090442_vgas_003b2a_publication.exs:20–34`
+  forbids an active generation or profile for every non-published status.
