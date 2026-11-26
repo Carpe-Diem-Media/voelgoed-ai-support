@@ -1,7 +1,12 @@
 # VGAS-18 PR C verification
 
 Base is `b287f84a038e0555cd05eaf41328d33a479334d2`, the merge of PR #18.
-The executable changes are in `22fba9a8d85024003f16ce8467bf328597213d21`. This record follows that commit.
+## Implementation commits
+
+- `22fba9a8d85024003f16ce8467bf328597213d21` adds the PR C support lifecycle safeguards.
+- `4e2ed8fa6853752411044fc829c6d243cd906b44` applies the review corrections.
+
+`6aeab45083c873034ae4f383895b1ac8e0f95c0a` records the original verification.
 Authority is [VGAS-18_PLAN.md](VGAS-18_PLAN.md), addendum rulings 2, 3 and 5,
 and G008, G010–G013 and T05–T06. The live VGAS-18 issue was In Progress when
 read for this slice.
@@ -24,7 +29,7 @@ shared list caused the provisional snapshot check to report pending
 generation, so the final code leaves that list alone. The delivery column
 can already store the reason.
 
-## Commands and results
+## Original PR C commands and results
 
 The disposable runner reported PostgreSQL 18.7 and pgvector 0.8.7. Mise
 reported Erlang/OTP 29 through the pinned 29.1.2 toolchain and Elixir
@@ -79,7 +84,7 @@ mise exec -- mix test test/voelgoed_ai/knowledge/{retrieval,editorial,publicatio
 | 103 | 0 | 338 passed. |
 | 8125 | 0 | 338 passed. |
 
-## Mutation evidence
+## Original PR C mutation evidence
 
 Each run changed a single guard or route, selected the named ExUnit test
 with `mise exec -- mix test <selector> --seed 0`, and restored the source
@@ -107,12 +112,122 @@ restored, `mise exec -- mix test test/voelgoed_ai/support/{workflow,delivery_rec
 exited 0 with 103 passing tests and zero failures. The restoration check
 `git diff --exit-code HEAD -- lib test` exited 0.
 
+## Review corrections
+
+1. **Abandonment during handoff.** The ordinary `observe_human_takeover`
+   action again accepts only UNVERIFIED and BOT_ACTIVE. For HANDOFF_PENDING,
+   qualified signed ingress owns a separate Ash action. Under the receipt
+   transaction and session lock, ingress fences the status intent, advances
+   the epoch and preserves the existing inhibit. In the operator abandonment
+   regression, the UNKNOWN reply becomes ABANDONED, the handoff stays
+   PENDING, and delivery makes one status POST and records SENT
+   `accepted`. The action and WorkStore tests check the state and owner
+   restrictions.
+2. **Qualified GET of the existing goal.** A signed
+   `conversation_updated` receipt now updates the observed assignee and
+   leaves the handoff pending. The delivery worker confirms the open,
+   human-assigned conversation in the configured team and records SENT
+   `already_human` with zero attempts and zero POSTs. The test also
+   verifies the inhibit after resolution and reopen.
+3. **Overdue routing guards.** The receipt tests hold the fake GET while
+   the clock reaches the cutoff. A mismatched contact, a fresh human
+   assignee and a fresh resolved status each produce a deadline audit and
+   zero handoff intents. A separate test disables the binding after
+   accepting a receipt in the existing bot session, then processes it
+   overdue in shadow mode and checks the same outcome. Each assertion
+   reads the committed delivery rows.
+4. **Global control and shadow routing.** The shadow and automatic mode
+   asymmetry remains an open item below.
+5. **Dispatch cutoff reason.** The status intent cutoff reason remains an
+   open item below.
+
+On `6aeab45` with the regression tests added, the command below exited 2.
+The abandonment and qualified-goal tests both failed, and all four new
+overdue cases passed.
+
+```sh
+mise exec -- mix test test/voelgoed_ai/support/delivery_recovery_test.exs:859:1191 test/voelgoed_ai/support/workflow_test.exs:471:492 --seed 0
+```
+
+With the fix, the following command exited 0 with 108 passing tests.
+
+```sh
+mise exec -- mix test test/voelgoed_ai/support/{workflow,delivery_recovery}_test.exs --seed 0
+```
+
+### Review mutant runs
+
+Each run used the disposable runner on 55435, with locked dependency
+verification and fresh strict migration both exiting 0 before
+`mise exec -- mix test <selector> --seed 0`. All seven ExUnit commands
+exited 2 and their runners exited 1. Each selector is relative to
+`test/voelgoed_ai/support`. The source was restored and compared with its
+original contents before the next run.
+
+- **Widen the ordinary takeover again** (`delivery_recovery_test.exs:859`).
+  1/1 failed. Abandonment cancelled the handoff while the test expected it
+  to remain pending.
+- **O1, route on scope denial** (`workflow_test.exs:471`). 1/3 failed.
+  The mismatched contact staged a handoff and cancelled the prior reply.
+- **O2, route on any successful GET** (`workflow_test.exs:471`).
+  2/3 failed. Both the fresh human and resolved responses staged a handoff.
+- **O4, remove shadow permission** (`workflow_test.exs:492`). 1/1 failed.
+  The disabled shadow binding staged a handoff.
+- **C3, signed reply updates metadata only**
+  (`delivery_recovery_test.exs:1148`). 3/3 failed. All phases stayed
+  HANDOFF_PENDING when the tests expected HUMAN_ACTIVE.
+- **C1, generic final denial fence** (`delivery_recovery_test.exs:681`).
+  2/2 failed. Both cases found UNKNOWN where the tests expected CANCELLED
+  `dispatch_denied`.
+- **C2, permit shadow in `Delivery.valid?/4`**
+  (`workflow_test.exs:521`). 1/1 failed. The fake recorded a status POST
+  at the assertion for zero writes.
+
+### Verification after the review corrections
+
+The commands below ran through the same offline disposable runner
+documented above. The focused runner on 55435 exited 0 and removed its
+container and volume.
+
+- `mise exec -- mix deps.get --check-locked` and
+  `mise exec -- mix ecto.migrate --strict-version-order` both exited 0.
+- `mise exec -- mix format --check-formatted` exited 0.
+- `ELIXIR_ERL_OPTIONS="+S 1" mise exec -- mix compile --force --warnings-as-errors`
+  and `ELIXIR_ERL_OPTIONS="+S 2" mise exec -- mix compile --force --warnings-as-errors`
+  both exited 0 in TEST.
+- `mise exec -- mix ash.codegen --check` exited 0.
+- The focused command above exited 0 on seeds 0, 103 and 8125, with
+  343 passes and zero failures for each seed.
+- The full-suite runner on 55434 also passed locked-dependency verification
+  and strict migrations. `mise exec -- mix test --seed 103` and
+  `mise exec -- mix test --seed 8125` each exited 0 with 565 passed,
+  5 skipped and 1 excluded. Both runs included the complete editorial file.
+  The runner exited 0 and removed its container and volume.
+- `HEX_OFFLINE=1 mise exec -- mix hex.audit` exited 0 with no findings in
+  the available advisory data.
+- `git diff --check b287f84..HEAD` exited 0.
+- `python3 .github/scripts/plan_tests.py` exited 0 and assigned 30 files
+  to eight shards.
+- `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts=b287f84..HEAD .`
+  exited 0 with no leaks reported.
+- `git diff --exit-code b287f84 -- mix.exs mix.lock priv/repo/migrations priv/resource_snapshots`
+  exited 0.
+- `rg 'authorize\?: false' lib` exited 1 with zero matches.
+
 ## Open decisions and handoff
 
 - Initial or unverified overdue input keeps the existing staff triage
   audit. The owner still needs to decide its eventual route and the alert
   destination and staffing.
 - G012 idle-routing thresholds belong to the VGAS-005 gates and VGAS-9.
+- With global automation disabled, a permitted shadow binding can stage
+  an overdue handoff locally, and automatic mode skips it. Both modes
+  suppress Chatwoot writes in that state. G031 permits operational handoff
+  while disabled. Aligning the modes needs a separate owner decision.
+- At the final dispatch gate, a lease or deadline cutoff on an authorized
+  status intent records `ambiguous_write`. The governing clauses allow
+  conservative uncertainty and do not require `deadline` at this gate.
+  The cutoff reason remains open for owner review.
 - The known isolation failure at `knowledge/editorial_test.exs:304` is
   tracked on VGAS-22. These runs included the complete file.
 - Existing Chatwoot read-to-write race and release gates still apply.
