@@ -2,6 +2,8 @@ defmodule VoelgoedAi.Application do
   @moduledoc false
   use Application
 
+  alias VoelgoedAiWeb.KnowledgeLive.CrashLog
+
   @impl true
   def start(_type, _args) do
     development_ai = Application.get_env(:voelgoed_ai, :development_ai, [])
@@ -23,6 +25,21 @@ defmodule VoelgoedAi.Application do
       VoelgoedAiWeb.Endpoint
     ]
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: VoelgoedAi.Supervisor)
+    :ok = CrashLog.install()
+
+    case Supervisor.start_link(children, strategy: :one_for_one, name: VoelgoedAi.Supervisor) do
+      {:ok, _pid} = started ->
+        started
+
+      error ->
+        CrashLog.uninstall()
+        error
+    end
+  end
+
+  @impl true
+  def stop(_state) do
+    CrashLog.uninstall()
+    :ok
   end
 end

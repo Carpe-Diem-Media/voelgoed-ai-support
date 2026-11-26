@@ -39,6 +39,24 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
     {conn.resp_cookies["_vgas_staff"].value, csrf}
   end
 
+  def channel_socket(page) do
+    socket = %Phoenix.Socket{
+      endpoint: Endpoint,
+      handler: VoelgoedAiWeb.StaffLiveSocket,
+      transport_pid: self(),
+      pubsub_server: Endpoint.config(:pubsub_server),
+      serializer: Phoenix.Socket.V2.JSONSerializer
+    }
+
+    {:ok, socket} =
+      VoelgoedAiWeb.StaffLiveSocket.connect(%{}, socket, %{
+        uri: URI.parse(@origin <> page.request_path),
+        session: get_session(page)
+      })
+
+    socket
+  end
+
   def start_listener(:https) do
     key = X509.PrivateKey.new_rsa(2048)
     cert = X509.Certificate.self_signed(key, "/CN=" <> @host)
@@ -65,21 +83,29 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
     )
   end
 
-  def upgrade(transport, cookie, csrf, origin, extra_headers \\ []) do
-    {module, socket} = connect(transport)
+  def https_status(path, headers) do
+    request_status(:https, path, [{"Host", @host}, {"Connection", "close"} | headers])
+  end
+
+  def upgrade(transport, cookie, csrf, origin, header_overrides \\ []) do
     path = "/staff/live/websocket?vsn=2.0.0"
     path = if csrf, do: path <> "&_csrf_token=" <> URI.encode_www_form(csrf), else: path
 
-    headers =
-      [
-        {"Host", @host},
-        {"Connection", "Upgrade"},
-        {"Upgrade", "websocket"},
-        {"Sec-WebSocket-Version", "13"},
-        {"Sec-WebSocket-Key", Base.encode64(:crypto.strong_rand_bytes(16))},
-        {"Cookie", cookie && "_vgas_staff=" <> cookie},
-        {"Origin", origin}
-      ] ++ extra_headers
+    headers = %{
+      "Host" => @host,
+      "Connection" => "Upgrade",
+      "Upgrade" => "websocket",
+      "Sec-WebSocket-Version" => "13",
+      "Sec-WebSocket-Key" => Base.encode64(:crypto.strong_rand_bytes(16)),
+      "Cookie" => cookie && "_vgas_staff=" <> cookie,
+      "Origin" => origin
+    }
+
+    request_status(transport, path, Map.merge(headers, Map.new(header_overrides)))
+  end
+
+  defp request_status(transport, path, headers) do
+    {module, socket} = connect(transport)
 
     request = [
       "GET ",

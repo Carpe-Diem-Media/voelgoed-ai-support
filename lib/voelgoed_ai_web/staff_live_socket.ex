@@ -7,7 +7,10 @@ defmodule VoelgoedAiWeb.StaffLiveSocket do
   def connect(_params, socket, %{uri: uri, session: cookie}) do
     with true <- StaffSession.knowledge_origin?(uri),
          {:ok, :authorized} <- cookie |> StaffSession.decode() |> StaffSession.knowledge_access() do
-      {:ok, socket}
+      # Channel.Server merges these over the channel defaults. Upload joins
+      # carry a signed token and can carry arbitrary client parameters.
+      {:ok,
+       %{socket | private: Map.merge(socket.private, %{log_join: false, log_handle_in: false})}}
     else
       _ -> :error
     end

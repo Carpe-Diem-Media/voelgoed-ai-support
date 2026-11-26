@@ -1,11 +1,15 @@
 defmodule VoelgoedAiWeb.StaffKnowledgeAuthTest do
   use ExUnit.Case, async: false
 
+  @endpoint VoelgoedAiWeb.Endpoint
+
   import ExUnit.CaptureLog
+  import Phoenix.ConnTest, only: [get: 2]
+  import Phoenix.LiveViewTest, only: [live: 1]
   import Plug.Conn
   import VoelgoedAi.StaffKnowledgeFixture
 
-  alias VoelgoedAi.StaffEntraFixture
+  alias VoelgoedAi.{Accounts, StaffEntraFixture, StaffFixtures}
 
   setup do
     VoelgoedAi.StaffFixtures.setup()
@@ -18,6 +22,11 @@ defmodule VoelgoedAiWeb.StaffKnowledgeAuthTest do
     # New subscribers fail CI until their handling of sensitive metadata is reviewed.
     for prefix <- [
           [:phoenix, :socket_connected],
+          [:phoenix, :channel_joined],
+          [:phoenix, :channel_handled_in],
+          [:phoenix, :endpoint],
+          [:phoenix, :router_dispatch],
+          [:phoenix, :error_rendered],
           [:phoenix, :live_view],
           [:phoenix, :live_component]
         ],
@@ -75,6 +84,83 @@ defmodule VoelgoedAiWeb.StaffKnowledgeAuthTest do
     assert get_resp_header(denied, "cache-control") == ["private, no-store"]
   end
 
+  test "a current support-only session is denied by HTTP, TLS and connected mount", ctx do
+    admin = StaffFixtures.bootstrap_admin(ctx.admin)
+    assert {:ok, operator} = Accounts.provision(admin, ctx.invited, [:support_operator])
+    assert {:ok, session} = StaffFixtures.authenticate(operator.id)
+    assert StaffFixtures.resolve(operator.id).roles == [:support_operator]
+
+    denied = read_page(session, "/staff/knowledge")
+    assert denied.status == 302
+    assert get_resp_header(denied, "location") == ["/staff/knowledge/denied"]
+
+    # Use a CSRF value signed for the same cookie, so transport denial reaches
+    # the current-role check. The page token alone conveys no staff identity.
+    page = read_page(admin, "/staff/knowledge")
+    {_, csrf} = browser_credentials(page)
+    staff = {session.id, session.generation, session.expiry, session.binding}
+    cookie = refresh_cookie(page, &put_session(&1, :staff, staff))
+
+    start_listener(:https)
+    assert upgrade(:https, cookie, csrf, origin()) == 403
+
+    page = put_private(page, :live_view_connect_info, %{session: %{"staff" => staff}})
+    assert {:error, {:redirect, %{to: "/staff/knowledge/denied"}}} = live(page)
+
+    socket = %Phoenix.LiveView.Socket{
+      transport_pid: self(),
+      private: %{
+        connect_info: %{session: %{"staff" => staff}},
+        lifecycle: %Phoenix.LiveView.Lifecycle{}
+      }
+    }
+
+    assert {:halt, %{redirected: {:redirect, %{to: "/staff/knowledge/denied"}}}} =
+             VoelgoedAiWeb.KnowledgeLive.Auth.on_mount(:default, %{}, %{}, socket)
+  end
+
+  test "the endpoint rejects the wrong effective port before Phoenix processes the cookie", ctx do
+    admin = StaffFixtures.bootstrap_admin(ctx.admin)
+    {cookie, csrf} = admin |> read_page("/staff/knowledge") |> browser_credentials()
+    start_listener(:https)
+
+    id = {__MODULE__, make_ref()}
+
+    assert :ok =
+             :telemetry.attach(
+               id,
+               [:phoenix, :socket_connected],
+               &__MODULE__.observe_socket_connect/4,
+               self()
+             )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+
+    assert upgrade(:https, cookie, csrf, nil) == 101
+    assert_receive :staff_socket_connect_attempted
+
+    assert upgrade(:https, cookie, csrf, nil, [{"Host", "staff.example.test:444"}]) == 403
+    refute_received :staff_socket_connect_attempted
+  end
+
+  test "the socket rejects a same-host Origin with the wrong port on a trusted endpoint", ctx do
+    admin = StaffFixtures.bootstrap_admin(ctx.admin)
+    {cookie, csrf} = admin |> read_page("/staff/knowledge") |> browser_credentials()
+    start_listener(:https)
+
+    assert upgrade(:https, cookie, csrf, origin()) == 101
+
+    capture_log(fn ->
+      assert upgrade(:https, cookie, csrf, origin() <> ":444") == 403
+    end)
+  end
+
+  def observe_socket_connect(_, _, %{user_socket: VoelgoedAiWeb.StaffLiveSocket}, test_pid) do
+    send(test_pid, :staff_socket_connect_attempted)
+  end
+
+  def observe_socket_connect(_, _, _, _), do: :ok
+
   test "plaintext upgrade cannot use a valid staff cookie", %{admin: identity} do
     admin = VoelgoedAi.StaffFixtures.bootstrap_admin(identity)
     {cookie, csrf} = admin |> read_page("/staff/knowledge") |> browser_credentials()
@@ -120,30 +206,33 @@ defmodule VoelgoedAiWeb.StaffKnowledgeAuthTest do
     end
   end
 
-  defp allowed_logger?({logger, event}, event, callback) do
-    case event do
-      [:phoenix, :socket_connected] ->
-        logger == Phoenix.Logger and callback == (&Phoenix.Logger.phoenix_socket_connected/4)
+  defp allowed_logger?({Phoenix.Logger, event}, event, callback) do
+    {event, callback} in [
+      {[:phoenix, :socket_connected], &Phoenix.Logger.phoenix_socket_connected/4},
+      {[:phoenix, :channel_joined], &Phoenix.Logger.phoenix_channel_joined/4},
+      {[:phoenix, :channel_handled_in], &Phoenix.Logger.phoenix_channel_handled_in/4},
+      {[:phoenix, :endpoint, :start], &Phoenix.Logger.phoenix_endpoint_start/4},
+      {[:phoenix, :endpoint, :stop], &Phoenix.Logger.phoenix_endpoint_stop/4},
+      {[:phoenix, :router_dispatch, :start], &Phoenix.Logger.phoenix_router_dispatch_start/4},
+      {[:phoenix, :error_rendered], &Phoenix.Logger.phoenix_error_rendered/4}
+    ]
+  end
 
-      [:phoenix, type, lifecycle, suffix] ->
-        logger == Phoenix.LiveView.Logger and
-          {type, lifecycle, suffix, callback} in [
-            {:live_view, :mount, :start, &Phoenix.LiveView.Logger.lv_mount_start/4},
-            {:live_view, :mount, :stop, &Phoenix.LiveView.Logger.lv_mount_stop/4},
-            {:live_view, :handle_params, :start,
-             &Phoenix.LiveView.Logger.lv_handle_params_start/4},
-            {:live_view, :handle_params, :stop, &Phoenix.LiveView.Logger.lv_handle_params_stop/4},
-            {:live_view, :handle_event, :start, &Phoenix.LiveView.Logger.lv_handle_event_start/4},
-            {:live_view, :handle_event, :stop, &Phoenix.LiveView.Logger.lv_handle_event_stop/4},
-            {:live_component, :handle_event, :start,
-             &Phoenix.LiveView.Logger.lc_handle_event_start/4},
-            {:live_component, :handle_event, :stop,
-             &Phoenix.LiveView.Logger.lc_handle_event_stop/4}
-          ]
-
-      _ ->
-        false
-    end
+  defp allowed_logger?(
+         {Phoenix.LiveView.Logger, event},
+         [:phoenix, type, lifecycle, suffix] = event,
+         callback
+       ) do
+    {type, lifecycle, suffix, callback} in [
+      {:live_view, :mount, :start, &Phoenix.LiveView.Logger.lv_mount_start/4},
+      {:live_view, :mount, :stop, &Phoenix.LiveView.Logger.lv_mount_stop/4},
+      {:live_view, :handle_params, :start, &Phoenix.LiveView.Logger.lv_handle_params_start/4},
+      {:live_view, :handle_params, :stop, &Phoenix.LiveView.Logger.lv_handle_params_stop/4},
+      {:live_view, :handle_event, :start, &Phoenix.LiveView.Logger.lv_handle_event_start/4},
+      {:live_view, :handle_event, :stop, &Phoenix.LiveView.Logger.lv_handle_event_stop/4},
+      {:live_component, :handle_event, :start, &Phoenix.LiveView.Logger.lc_handle_event_start/4},
+      {:live_component, :handle_event, :stop, &Phoenix.LiveView.Logger.lc_handle_event_stop/4}
+    ]
   end
 
   defp allowed_logger?(_id, _event, _callback), do: false

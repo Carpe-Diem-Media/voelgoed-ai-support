@@ -14,7 +14,15 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
   alias VoelgoedAi.Knowledge.{Article, ArticleRevision, KnowledgeCollection}
 
   import VoelgoedAi.StaffKnowledgeFixture,
-    only: [browser_credentials: 1, origin: 0, read_page: 2, start_listener: 1, upgrade: 4]
+    only: [
+      browser_credentials: 1,
+      origin: 0,
+      read_page: 2,
+      start_listener: 1,
+      upgrade: 4,
+      channel_socket: 1,
+      https_status: 2
+    ]
 
   setup :setup_knowledge
 
@@ -138,6 +146,24 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
         assert upgrade(:https, cookie, csrf, origin()) == 101
         assert upgrade(:https, cookie, nil, origin()) == 403
 
+        assert https_status("/staff/unmatched", [
+                 {"Cookie", "_vgas_staff=" <> cookie},
+                 {"X-CSRF-Token", csrf}
+               ]) == 404
+
+        assert {:error, %{reason: :invalid_token}} =
+                 Phoenix.Channel.Server.join(
+                   channel_socket(index),
+                   Phoenix.LiveView.UploadChannel,
+                   %Phoenix.Socket.Message{
+                     topic: "lvu:synthetic-upload",
+                     event: "phx_join",
+                     ref: "1",
+                     payload: %{"token" => "invalid", "draft" => "synthetic-upload-payload"}
+                   },
+                   []
+                 )
+
         assert {:ok, index_view, _} = live(index)
         collection_path = "/staff/knowledge/collections/#{row.id}"
         assert has_element?(index_view, ~s(a[href="#{collection_path}"]))
@@ -200,7 +226,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
     assert_absent(log, "staff HTTP or WebSocket transport log", [
       "GET /staff/",
       "CONNECTED TO VoelgoedAiWeb.StaffLiveSocket",
-      "REFUSED CONNECTION TO VoelgoedAiWeb.StaffLiveSocket"
+      "REFUSED CONNECTION TO VoelgoedAiWeb.StaffLiveSocket",
+      "synthetic-upload-payload"
     ])
 
     assert_absent(log, "staff LiveView lifecycle log", [
@@ -282,7 +309,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
     assert get_resp_header(denied, "location") == ["/staff/knowledge/denied"]
   end
 
-  test "role revocation stops a connected refresh even when scope is unchanged", ctx do
+  test "a role change invalidates the connected session generation even when scope is unchanged",
+       ctx do
     row = collection(ctx)
     revision = draft_revision(ctx, row)
     assert {:ok, view, _} = live(connected_page(ctx.editor, revision_path(revision)))
