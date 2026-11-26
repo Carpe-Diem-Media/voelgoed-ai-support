@@ -10,15 +10,26 @@ Plane VGAS-14. Base `e1040b8eaa9e5074bfed3e07d16ce93eab68dbbe`. On `feat/vgas-00
 - **Pass.** Read-only pages and asset controls. Authenticated HTML rendered the index, collection, article and revision. It included no-store, no-referrer, nosniff and staff CSP. Both endpoint and Chromium tests verified the exact browser assets and MIME types. Denials shared one response, and scoped empty collections rendered their empty state.
 - **Pass.** Authenticated visual and accessibility checks. See the Hallmark and Chromium results below.
 - **Pass.** Compilation, regression suites, migration rehearsals and C1 mutation checks. See the command record below.
-- **Pass.** Staff telemetry and logs under the clarified C1 criterion. Only the pinned framework loggers were attached to the covered events, and they emitted no staff transport or LiveView logs during the captured flow. The capture contained none of the tested credentials, editorial text or staff identifiers. Both telemetry and logging mutations failed on their intended assertions.
+- **Pass.** Staff telemetry and logs under the clarified C1 criterion. The pinned framework callbacks are the only allowed subscribers. The debug captures excluded the tested credentials, editorial text and staff identifiers, including during three LiveView crashes. The transport, upload logging and telemetry mutations failed on their intended assertions.
 
 ## Telemetry ruling
 
 > The plan says "keep ... connection credentials out of logs, flashes and telemetry". Its authority is the spec rule "redact telemetry ... no raw request logging". That rule governs data that is emitted, logged or exported. It does not govern the in-memory metadata that framework events carry. The clarified C1 criterion: no handler, logger or exporter in this application receives, logs or exports the sensitive metadata of those pinned Phoenix and LiveView events (raw transport params, connect_info, session, socket assigns). Future instrumentation (VGAS-8 observability) must attach only through an allowlisted filtering handler; record that as a follow-up rule, do not build it now. This ruling is a clarification. It is not a framework change and not a waiver.
 
-The tripwire queries the full `[:phoenix, :socket_connected]`, `[:phoenix, :live_view]` and `[:phoenix, :live_component]` prefixes after startup. It checks each subscription's event, handler ID and callback. Phoenix 1.8.17 emits `socket_connected` directly in `deps/phoenix/lib/phoenix/socket.ex`. LiveView 1.2.15 emits mount, parameter, event and render spans, component event and update spans, and the component destroyed event in `utils.ex`, `channel.ex` and `diff.ex` under `deps/phoenix_live_view/lib/phoenix_live_view/`. Prefix matching includes start, stop and exception suffixes. Only the callbacks in the two packages' logger modules are on the allowlist.
+The tripwire checks subscriptions after startup. Each subscription must match an exact event, handler ID and callback from the pinned Phoenix or LiveView logger. It covers these prefixes, including start, stop and exception suffixes where applicable.
 
-The debug capture covers real Bandit TLS upgrades and cookie-backed CSRF rejection. It uses LiveViewTest for static and connected mounts, ordinary page navigation, refresh, access denial and idle expiry. It checks the issued cookie and CSRF values, signed LiveView tokens, both FAQ answers and synthetic staff identifiers without printing the captured values on assertion failure. It also checks for the framework log messages. Phoenix's socket `log: false` silences its telemetry logger. `transport_log: false` silences the upgrade request log. Each staff view's `log: false` silences the LiveView logger, including its component callbacks.
+- `[:phoenix, :socket_connected]`
+- `[:phoenix, :channel_joined]`
+- `[:phoenix, :channel_handled_in]`
+- `[:phoenix, :router_dispatch]`
+- `[:phoenix, :endpoint]`
+- `[:phoenix, :error_rendered]`
+- `[:phoenix, :live_view]`
+- `[:phoenix, :live_component]`
+
+Phoenix 1.8.17 emits the socket and channel events in `phoenix/socket.ex` and `phoenix/channel/server.ex`. `phoenix/router.ex`, Plug.Telemetry in the endpoint and `phoenix/endpoint/render_errors.ex` emit the HTTP events. LiveView 1.2.15 emits the view and component events in `utils.ex`, `channel.ex` and `diff.ex`.
+
+The debug capture covers Bandit TLS upgrades, a missing CSRF rejection and an unmatched staff request with the issued cookie and CSRF header. It also exercises a rejected upload-channel join with an arbitrary client parameter. The staff socket sets Phoenix's channel join and event log options to `false`. The endpoint and staff routes suppress request and dispatch logging. The pinned error-rendered callback reports the exception class on the covered 404 and does not inspect the conn. LiveViewTest covers mounts, navigation, refresh, access denial and idle expiry. The capture checks issued credentials, signed page tokens, editorial text and synthetic staff identifiers. Assertion failures report the field label only.
 
 ## Commands
 
@@ -130,20 +141,64 @@ Ordinary sign-out removes the browser's cookie. An already connected tab or a ca
 
 - VGAS-8 observability. Any new instrumentation for the protected Phoenix and LiveView events must attach through an allowlisted filtering handler. Review the handler's event list and callback and test its output before allowlisting it. Pass only approved fields downstream. Exclude raw transport params, `connect_info`, sessions and socket assigns from exported data.
 
+## Review 1 corrections
+
+### Crash reporting
+
+The application installs the primary filter before it starts the endpoint and removes it after the supervision tree stops. OTP 29.1.2 `kernel/src/logger_server.erl` prepends filters registered with `:logger.add_primary_filter/2`. `logger_backend.erl` passes a replacement event to subsequent filters and handlers. Elixir 1.20.5 `Logger.App` registers its translator as a primary filter. Its GenServer translator prints the last message at every reportable level and prints the state at debug. Redacting before translation also keeps exception details out of structured handler metadata.
+
+OTP `stdlib/src/gen_server.erl` and `proc_lib.erl` expose process labels on their termination and crash reports. LiveView 1.2.15 `channel.ex` labels the channel with the verified view module before mount callbacks and returns the entire state from `format_status(:terminate, ...)`. It prunes connect info and connect params after mount. The views keep the page projection for rendering and the decoded session for event authorization.
+
+Phoenix's `socket/pool_supervisor.ex` gives the staff socket a dedicated supervisor tree. The filter uses that ancestry for reports created before the LiveView label is set, upload channel reports and DynamicSupervisor child failures. It also replaces the formatted join error from `Phoenix.Channel.Server.join/4` when the transport has the staff socket label assigned by `Phoenix.Socket.__init__/1`. The replacement keeps a fixed notice, the view module when available, and only OTP time, process and group leader metadata.
+
+The crash tests run the actual revision channel in the staff socket pool. At debug, with all logger metadata included, an unexpected call, a raise during `handle_params` and a raise during an event each produce a redacted notice. The tests check the article answers, event payload, cookie, CSRF, signed tokens, staff ID, session binding and last-message label.
+
+### Role and origin checks
+
+A freshly authenticated support-only operator is denied by the static GET, the real TLS upgrade and the connected mount. The previous refresh test now names the session-generation invalidation it exercises.
+
+Two real TLS requests vary the origin layers independently. A wrong effective Host port with no Origin header must be denied before the `socket_connected` event. Without the early endpoint guard, the socket still rejects that URI, but Phoenix has already parsed and processed the cookie and emits the event. A trusted Host with a wrong-port Origin must also be denied. Phoenix's `:conn` check compares the browser Origin's scheme, host and port to the conn and rejects that mismatch before cookie processing.
+
+C2 derives the approve control from both `approve` and `self_approval_required`. The existing generic denial for an uppercase revision UUID remains the C1 behavior.
+
+### Review checks
+
+The implementation under test was `119e428f9269f78421393546e93a2199e0be52eb`. All database commands ran in TEST via `bash /home/jcschoeman96/.t3/userdata/attachments/vgas_disposable_pg.sh "$PWD" "$steps" 55434` on PostgreSQL 18.7 with vector 0.8.7. The helper reported these step results.
+
+- `mise exec -- mix format --check-formatted`, `mise exec -- mix compile --warnings-as-errors`, `mise exec -- mix ash.codegen --check` and `mise exec -- mix ecto.migrate --strict-version-order` each exited 0.
+- `ELIXIR_ERL_OPTIONS="+S 1" MIX_ENV=test mise exec -- mix compile --warnings-as-errors --force` and the same command at `+S 2` each exited 0.
+- `mise exec -- mix test test/voelgoed_ai_web/staff_knowledge{_auth,_live,_crash_log}_test.exs test/voelgoed_ai_web/staff_auth_test.exs --seed 0` exited 0 after restoration, with 53 passed. An earlier invocation exited 2 with 52/53 passed. The existing indexing-status test returned a failed locale for its expected active index. The failure did not recur in the fresh focused rerun or either final full-suite run. Its cause is unconfirmed.
+- `mise exec -- mix test --seed 0` and `mise exec -- mix test --seed 8125` each exited 0 with 462 passed, 5 skipped and 1 excluded. Both runs logged the expected synthetic reserve-commit failure from its rollback fixture.
+- `git diff --exit-code e1040b8 -- mix.exs mix.lock priv/repo/migrations priv/resource_snapshots`, `git diff --check`, `mise exec -- mix hex.audit` and `python3 .github/scripts/plan_tests.py` each exited 0. `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='e1040b8..HEAD' --no-banner .` exited 0 and reported no leaks.
+
+The initial focused run exited 2 with 21/22 passed, and its full seed 0 exited 2 with 461/462 passed, 5 skipped and 1 excluded. The Plug.Test 404 probe reused a response marker in its test process mailbox. The probe now uses the real TLS listener. The command runner terminated that initial combined lane with exit 143 during its second seed. Its disposable container and volume were removed before restarting in separate lanes. The final runs cleaned up their containers and volumes, and `ss -ltn ' ( sport = :4205 or sport = :55434 )'` showed both ports free.
+
+### Review mutations
+
+The implementation was committed before mutation. Each target was run as `mise exec -- mix test <target> --seed 0`. All 13 mutations exited 2 on the intended assertions. Each mutation was restored with `git checkout -- lib test config`. The subsequent `git diff --exit-code -- lib test config` exited 0 before the focused rerun.
+
+- Crash filter disabled. `test/voelgoed_ai_web/staff_knowledge_crash_log_test.exs` failed all 3 tests. The logs included an event payload or the last message.
+- M11, any staff role can pass. `test/voelgoed_ai_web/staff_knowledge_auth_test.exs:87` failed its TLS assertion with HTTP 101.
+- M8, effective port ignored. `test/voelgoed_ai_web/staff_knowledge_auth_test.exs:122` failed its wrong-Host-port assertion with HTTP 101.
+- M12, early endpoint check removed. The same test at line 122 received the socket connection event on the rejected request.
+- M13, socket Origin check removed. `test/voelgoed_ai_web/staff_knowledge_auth_test.exs:146` failed its wrong-Origin-port assertion with HTTP 101.
+- Six extra telemetry subscriptions were tested one at a time in `test/voelgoed_ai_web/staff_knowledge_auth_test.exs:18`. The allowlist rejected a handler on each of `socket_connected`, `endpoint/start`, `router_dispatch/exception`, `error_rendered`, `channel_joined` and `channel_handled_in`. Each run had one failure and six exclusions.
+- The original transport log mutation and an upload join log mutation each failed the privacy capture at `test/voelgoed_ai_web/staff_knowledge_live_test.exs:130`. Each run had one failure and 11 exclusions.
+
 ## Completion assessment
 
-IMPLEMENTATION. Author self-assessment for VGAS-003 C1 only. All seven criteria above passed for the local author handoff. Zero criteria failed or remained unverified or incomplete in that scope.
+BUG_FIX. Author self-assessment for VGAS-003 C1 Review 1, tracked in Plane VGAS-14. Four of four corrections passed. The debug captures verified crash redaction, the HTTP, TLS and connected mount tests verified current wrong-role denial, the expanded telemetry tripwire and flow capture verified the logging criterion, and the port and origin tests verified both transport guards. Zero corrections failed, remained unverified or were left incomplete. The seven C1 criteria remain the scope of the local handoff. The earlier visual and migration-upgrade evidence applies to the same staff page markup, assets and schema.
 
-Implementation score is **9/10**. Requirements 4/4, verification 2/3, correctness and risk 2/2, and handoff 1/1. Hosted exact-head CI accounts for the verification deduction. Confidence is **95%**, based on the TLS upgrade checks, captured flow, targeted mutations and full local seed. Hosted CI and independent review remain pending. Production TLS termination and any future instrumentation require separate verification.
+Implementation score is **9/10**. Requirements 4/4, observed verification 2/3, correctness and risk 2/2, and handoff 1/1. Hosted exact-head CI accounts for the verification deduction. Confidence is **90%**, based on three channel crash tests, real TLS requests, the targeted mutations, and both full local seeds. The transient indexing-status failure and reliance on pinned report shapes limit confidence.
 
-Verification status is **VERIFIED** for local C1 author handoff. Merge status is `NOT_VERIFIED_FOR_MERGE`. The orchestrator must obtain hosted CI and independent review on the exact branch head. The VGAS-9 decisions still govern staff use.
+Verification status is **VERIFIED** for the local C1 Review 1 corrections. Merge status is `NOT_VERIFIED_FOR_MERGE`. The orchestrator owns hosted CI and independent review on the pushed head. The VGAS-9 decisions still govern staff use.
 
 ## Files changed
 
 - Plans and evidence in `docs/plans/VGAS-003C_PLAN.md` and this record.
-- Application and endpoint configuration in `config/config.exs` and `lib/voelgoed_ai/application.ex`.
+- Application and endpoint configuration in `config/config.exs` and `lib/voelgoed_ai/application.ex`. Review 1 adds the filter in `lib/voelgoed_ai_web/knowledge_live/crash_log.ex`.
 - Read actions and projections in `lib/voelgoed_ai/knowledge/{article,article_revision,editorial,knowledge_collection}.ex`.
 - Transport and routing in `lib/voelgoed_ai_web/{endpoint,router,staff_live_socket,staff_session}.ex`.
 - Staff HTML and authorization in `lib/voelgoed_ai_web/knowledge_live/{article,auth,components,denial_controller,index,revision}.ex`.
 - First-party assets in `priv/static/staff/{knowledge.css,knowledge.js}`.
-- Test fixture and checks in `test/support/staff_knowledge_fixture.ex` and `test/voelgoed_ai_web/{staff_knowledge_auth,staff_knowledge_live}_test.exs`.
+- Test fixture and checks in `test/support/staff_knowledge_fixture.ex` and `test/voelgoed_ai_web/{staff_knowledge_auth,staff_knowledge_live,staff_knowledge_crash_log}_test.exs`.
