@@ -45,7 +45,7 @@ defmodule VoelgoedAiWeb.KnowledgeLive.CrashLog do
   defp redact(%{meta: %{mfa: {Phoenix.Logger, :phoenix_error_rendered, 4}}}) do
     # Phoenix wraps Endpoint.call/2 at compile time. On failure the marker
     # must survive until that outer wrapper emits this event.
-    if clear_staff_http(), do: :stop, else: :ignore
+    if Process.get(@staff_http), do: :stop, else: :ignore
   end
 
   defp redact(%{msg: {:report, %{label: {:gen_server, :terminate}} = report}} = event) do

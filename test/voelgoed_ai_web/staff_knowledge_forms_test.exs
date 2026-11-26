@@ -1,0 +1,161 @@
+defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
+  use ExUnit.Case, async: false
+
+  import Phoenix.LiveViewTest
+  import Phoenix.ConnTest, only: [get: 2]
+
+  @endpoint VoelgoedAiWeb.Endpoint
+  import Plug.Conn, only: [put_private: 3]
+  import VoelgoedAi.KnowledgeFixtures
+  import VoelgoedAi.StaffKnowledgeFixture, only: [read_page: 2]
+  import VoelgoedAi.SupportFixtures, only: [invoke: 4]
+
+  alias VoelgoedAi.{Accounts, StaffFixtures}
+  alias VoelgoedAi.Knowledge.ArticleRevision
+
+  setup :setup_knowledge
+
+  test "review uses the displayed draft snapshot and ignores a forged target", ctx do
+    collection = collection(ctx)
+    draft = draft_revision(ctx, collection)
+    assert {:ok, view, _} = live(connected_page(ctx.editor, path(draft)))
+    submit = form(view, "#submit-review", %{"confirm" => "true"})
+
+    changed =
+      put_in(payload(), ["localized_content", Access.at(0), "title"], "New synthetic title")
+
+    assert {:ok, newer} =
+             invoke(
+               ArticleRevision,
+               :edit_draft,
+               Map.put(snapshot(draft), :content, changed),
+               ctx.editor
+             )
+
+    assert render_submit(submit, %{
+             "id" => Ash.UUIDv7.generate(),
+             "expected_version" => newer.edit_version,
+             "expected_hash" => newer.content_hash
+           }) =~ "Reload"
+
+    assert {:ok, %{status: :draft}} =
+             invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.editor)
+  end
+
+  test "a contributor with both roles cannot approve through the staff workspace", ctx do
+    assert {:ok, _} =
+             Accounts.set_roles(ctx.admin, ctx.editor.id, [:knowledge_editor, :knowledge_reviewer])
+
+    assert {:ok, actor} = StaffFixtures.authenticate(ctx.editor.id)
+    ctx = %{ctx | editor: actor, reviewer: actor}
+    reviewed = review(ctx, draft_revision(ctx, collection(ctx)))
+
+    assert {:ok, view, _} = live(connected_page(actor, path(reviewed)))
+    refute has_element?(view, "#approve")
+
+    [token] =
+      view
+      |> render()
+      |> LazyHTML.from_fragment()
+      |> LazyHTML.query("#request-changes [name=form_token]")
+      |> LazyHTML.attribute("value")
+
+    render_submit(view, "approve", %{
+      "form_token" => token,
+      "source_verified" => "true",
+      "self_approval" => "true"
+    })
+
+    assert {:ok, %{status: :in_review, self_approval_required: true}} =
+             invoke(ArticleRevision, :read_revision, %{id: reviewed.id}, actor)
+  end
+
+  @tag :embedding_index
+  test "an independent reviewer approves once and explicitly requests publication", ctx do
+    reviewed = review(ctx, draft_revision(ctx, collection(ctx)))
+    assert {:ok, view, _} = live(connected_page(ctx.reviewer, path(reviewed)))
+
+    assert render_submit(form(view, "#approve", %{"source_verified" => "true"})) =~ "Approved"
+    render_submit(view, "approve", %{"source_verified" => "true"})
+
+    assert render_submit(form(view, "#request-publish", %{"confirm" => "true"})) =~ "Publishing"
+
+    assert {:ok, %{status: :publishing, publication_generation: 1}} =
+             invoke(ArticleRevision, :read_revision, %{id: reviewed.id}, ctx.reviewer)
+  end
+
+  test "draft validation associates errors and editing preserves exact answer text", ctx do
+    row = collection(ctx)
+    draft = draft_revision(ctx, row)
+    edit = path(draft) <> "/edit"
+    assert {:ok, view, _} = live(connected_page(ctx.editor, edit))
+
+    assert render_change(
+             form(view, "#draft-form", %{"draft" => %{"effective_from" => "invalid"}})
+           ) =~
+             "ISO 8601 date with offset"
+
+    assert has_element?(
+             view,
+             "#effective_from[aria-invalid=true][aria-describedby=effective_from-error]"
+           )
+
+    assert has_element?(view, "#draft-feedback a[href='#effective_from']")
+
+    exact = "\n  Synthetic edited answer.\r\nSecond line.  "
+
+    fields = %{
+      "draft" => %{"effective_from" => "2026-01-01T00:00:00Z", "en-ZA-approved_answer" => exact}
+    }
+
+    assert {:error, {:redirect, %{to: destination}}} =
+             render_submit(form(view, "#draft-form", fields))
+
+    assert destination == path(draft)
+
+    assert {:ok, %{content: content, edit_version: 2}} =
+             invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.editor)
+
+    assert Enum.find(content["localized_content"], &(&1["locale"] == "en-ZA"))["approved_answer"] ==
+             exact
+  end
+
+  test "the page cannot write after session generation changes", ctx do
+    draft = draft_revision(ctx, collection(ctx))
+    assert {:ok, view, _} = live(connected_page(ctx.editor, path(draft)))
+    assert {:ok, _} = Accounts.set_roles(ctx.admin, ctx.editor.id, [:support_operator])
+
+    assert {:error, {:redirect, %{to: "/staff/knowledge/denied"}}} =
+             render_submit(form(view, "#submit-review", %{"confirm" => "true"}))
+
+    assert {:ok, %{status: :draft}} =
+             invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.reviewer)
+  end
+
+  @tag :embedding_index
+  test "publication keeps the current pointer shown to the reviewer", ctx do
+    {_collection, approved} = approved(ctx)
+    assert {:ok, view, _} = live(connected_page(ctx.reviewer, path(approved)))
+
+    # Simulate a reviewer confirming a formerly displayed pointer. The action
+    # must compare the server-side snapshot against the real current pointer.
+    stale_pointer = Ash.UUIDv7.generate()
+
+    :sys.replace_state(view.pid, fn state ->
+      put_in(state.socket.assigns.page.article.current_revision_id, stale_pointer)
+    end)
+
+    assert render_submit(form(view, "#request-publish", %{"confirm" => "true"})) =~ "Reload"
+
+    assert {:ok, %{status: :approved, publication_generation: 0}} =
+             invoke(ArticleRevision, :read_revision, %{id: approved.id}, ctx.reviewer)
+  end
+
+  defp connected_page(actor, path) do
+    session = %{"staff" => {actor.id, actor.generation, actor.expiry, actor.binding}}
+    actor |> read_page(path) |> put_private(:live_view_connect_info, %{session: session})
+  end
+
+  defp path(revision),
+    do: "/staff/knowledge/articles/#{revision.article_id}/revisions/#{revision.id}"
+end

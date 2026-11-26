@@ -344,7 +344,22 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
     assert failed.publication_reason == :deadline
 
     fixture(%{})
-    ids = request_index(ctx, approved, :retry_publication)
+    assert {:ok, failed_view, html} = live(connected_page(ctx.reviewer, revision_path(failed)))
+    assert html =~ "Publish failed"
+    assert html =~ "Deadline"
+
+    assert render_submit(form(failed_view, "#retry-publication", %{"confirm" => "true"})) =~
+             "Publishing"
+
+    %{rows: rows} =
+      Ecto.Adapters.SQL.query!(
+        VoelgoedAi.Repo,
+        "SELECT id::text FROM article_embeddings WHERE revision_id = $1 AND generation = 2 ORDER BY locale",
+        [Ecto.UUID.dump!(approved.id)]
+      )
+
+    ids = List.flatten(rows)
+    assert length(ids) == 2
 
     for id <- ids do
       assert :ok =

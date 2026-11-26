@@ -199,8 +199,15 @@ defmodule VoelgoedAi.Knowledge.Editorial do
          do: history_scope(:knowledge_article, row.article_id, staff)
   end
 
-  defp collection_action(collection, :read_collection, _args, _staff),
-    do: {:ok, collection_view(collection)}
+  defp collection_action(collection, :read_collection, _args, staff),
+    do:
+      {:ok,
+       Map.put(collection_view(collection), :action_hints, %{
+         manage: :admin in staff.roles,
+         create_draft: collection.status == :active and scoped?(collection.id, staff, @editor),
+         import: collection.status == :active and scoped?(collection.id, staff, @editor),
+         export: collection.status == :active and scoped?(collection.id, staff, @reviewer)
+       })}
 
   defp collection_action(collection, action, args, staff)
        when action in [:preview_import, :apply_import, :export_articles] do
@@ -220,8 +227,15 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   defp collection_state(:disabled, :retire), do: {:ok, :retired}
   defp collection_state(_, _), do: {:error, :invalid_transition}
 
-  defp article_action(_collection, article, :read_article, _args, _staff),
-    do: {:ok, article_view(article)}
+  defp article_action(collection, article, :read_article, _args, staff) do
+    {:ok,
+     Map.put(article_view(article), :action_hints, %{
+       create_draft:
+         collection.status == :active and article.status == :active and
+           scoped?(collection.id, staff, @editor),
+       archive: article.status == :active and scoped?(collection.id, staff, @reviewer)
+     })}
+  end
 
   defp article_action(_collection, article, :archive, args, staff) do
     with :ok <- active(article),
@@ -272,15 +286,7 @@ defmodule VoelgoedAi.Knowledge.Editorial do
           updated_at: row.updated_at,
           self_approval_required: self_approval?,
           index_status: locale_status(row, active_index, pending_index),
-          action_hints: %{
-            edit_draft:
-              row.status == :draft and collection.status == :active and
-                article.status == :active and scoped?(collection.id, staff, @editor),
-            approve:
-              row.status == :in_review and collection.status == :active and
-                article.status == :active and scoped?(collection.id, staff, @reviewer) and
-                row.content["sensitive"] != true
-          }
+          action_hints: revision_hints(collection, article, row, staff)
         })
 
       {:ok, view}
@@ -384,6 +390,45 @@ defmodule VoelgoedAi.Knowledge.Editorial do
          {:ok, result} <- change(row, attrs, action, staff, reason) do
       {:ok, revision_view(result)}
     end
+  end
+
+  # These hints control affordances. The actions repeat their own guards under lock.
+  defp revision_hints(collection, article, row, staff) do
+    active? = collection.status == :active and article.status == :active
+    editor? = scoped?(collection.id, staff, @editor)
+    reviewer? = scoped?(collection.id, staff, @reviewer)
+
+    public? =
+      collection.audience == :public and row.content["sensitive"] != true and
+        row.content["response_mode"] != "escalate_only"
+
+    index_args = %{
+      expected_generation: row.active_index_generation,
+      expected_index_epoch: row.index_epoch,
+      expected_hash: row.content_hash
+    }
+
+    reindex? =
+      reviewer? and row.status == :published and
+        current_index(collection, article, row, index_args) == :ok
+
+    %{
+      edit_draft: active? and editor? and row.status == :draft,
+      submit_review: active? and editor? and row.status == :draft,
+      withdraw: active? and (editor? or reviewer?) and row.status in [:draft, :in_review],
+      request_changes: active? and reviewer? and row.status == :in_review,
+      approve:
+        active? and reviewer? and row.status == :in_review and row.content["sensitive"] != true,
+      request_publish: active? and reviewer? and public? and row.status == :approved,
+      retry_publication: active? and reviewer? and public? and row.status == :publish_failed,
+      request_reindex: reindex?,
+      request_index_rollback:
+        reindex? and Publication.rollback_available() == :ok and
+          is_integer(row.retained_index_generation),
+      revoke:
+        article.status == :active and reviewer? and
+          row.status in [:approved, :publishing, :publish_failed, :published]
+    }
   end
 
   defp current_index(collection, article, row, args) do

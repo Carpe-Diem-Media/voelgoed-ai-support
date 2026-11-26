@@ -79,15 +79,9 @@ defmodule VoelgoedAiWeb.Endpoint do
       else: super(conn, opts)
   end
 
-  defp encoded_staff_path?(%{path_info: [segment | _]}) do
-    String.contains?(segment, "%") and
-      try do
-        URI.decode(segment) == "staff"
-      rescue
-        # Malformed escapes cannot name a route; the router rejects them itself.
-        ArgumentError -> false
-      end
-  end
+  # URI.decode/1 leaves malformed escapes intact, so they cannot equal "staff".
+  defp encoded_staff_path?(%{path_info: [segment | _]}),
+    do: String.contains?(segment, "%") and URI.decode(segment) == "staff"
 
   defp encoded_staff_path?(_conn), do: false
 

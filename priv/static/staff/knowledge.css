@@ -105,7 +105,12 @@ button {
   cursor: pointer;
 }
 button:hover, button:active { background: var(--color-accent-pressed); }
-button:disabled, .phx-disconnected button { opacity: .65; cursor: wait; }
+button:disabled, fieldset:disabled button, .phx-disconnected button {
+  background: var(--color-paper);
+  border-color: var(--color-rule);
+  color: var(--color-muted);
+  cursor: wait;
+}
 .phx-disconnected button { pointer-events: none; }
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 th, td {
@@ -147,4 +152,53 @@ dd, time { font-variant-numeric: tabular-nums; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+.editorial-form, .form-links, .form-feedback {
+  padding: var(--space-3) var(--space-6);
+}
+.form-feedback:empty { display: none; }
+.form-links { display: flex; flex-wrap: wrap; gap: var(--space-4); }
+.form-links a { display: inline-flex; align-items: center; min-height: 44px; }
+.editorial-form { border-top: 1px solid var(--color-rule); }
+.editorial-form fieldset {
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+.form-body > fieldset + fieldset { border-top: 1px solid var(--color-rule); }
+.form-body > fieldset { margin-block: var(--space-3) var(--space-6); }
+.editorial-form legend { font-weight: 650; }
+.field {
+  display: grid;
+  gap: var(--space-1);
+  max-width: 42rem;
+  margin-block: var(--space-3);
+}
+.editorial-form :is(input:not([type="checkbox"], [type="hidden"]), select, textarea) {
+  width: 100%;
+  min-width: 0;
+  max-width: 42rem;
+  min-height: 36px;
+  padding: var(--space-2);
+  border: 1px solid var(--color-muted);
+  border-radius: var(--radius-control);
+  background: var(--color-sheet);
+  color: var(--color-ink);
+  caret-color: var(--color-accent);
+  font: inherit;
+}
+.editorial-form textarea { resize: vertical; }
+.editorial-form [aria-invalid="true"] { border: 2px solid var(--color-accent); }
+.editorial-form input[type="checkbox"] { accent-color: var(--color-accent); }
+.check, .editorial-form summary {
+  min-height: 44px;
+  cursor: pointer;
+}
+.check { display: flex; align-items: center; gap: var(--space-2); }
+.editorial-form summary { align-content: center; }
+.error-summary { border-inline-start: 2px solid var(--color-accent); padding-inline: var(--space-3); }
+@media (max-width: 36rem) {
+  .editorial-form, .form-links, .form-feedback { padding-inline: var(--space-3); }
 }
