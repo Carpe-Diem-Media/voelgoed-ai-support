@@ -323,6 +323,78 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
   @tag :requires_pgvector
   @tag :embedding_index
+  test "revoke clears ready and queued vectors and the shape check rejects unusable vectors",
+       ctx do
+    {_collection, revision} = approved(ctx)
+    [id, sibling] = request_index(ctx, revision)
+    parent = self()
+
+    fixture(%{
+      wire: fn request ->
+        send(parent, :wire)
+        EmbeddingTransport.fixture_wire(request)
+      end
+    })
+
+    assert :ok = Embedding.index(id)
+    assert_receive :wire
+    assert [["ready", 1536]] = vector_rows(id)
+    assert [["queued", nil]] = vector_rows(sibling)
+
+    # Retrieval reads embedding rows directly, so the stored shape must hold
+    # without relying on application checks.
+    for sql <- [
+          "UPDATE article_embeddings SET vector = NULL WHERE id = $1",
+          "UPDATE article_embeddings SET vector = array_fill(0::real, ARRAY[1536])::vector WHERE id = $1"
+        ] do
+      assert {:error, %Postgrex.Error{postgres: %{constraint: "article_embeddings_shape"}}} =
+               SQL.query(Repo, sql, [Ecto.UUID.dump!(id)])
+    end
+
+    # Worker rechecks are a second fence; revocation itself must clear the rows.
+    args = Map.put(snapshot(revision), :reason, :obsolete)
+    assert {:ok, %{status: :revoked}} = invoke(ArticleRevision, :revoke, args, ctx.reviewer)
+    assert [["invalidated", nil]] = vector_rows(id)
+    assert [["invalidated", nil]] = vector_rows(sibling)
+    assert :ok = Embedding.index(sibling)
+    refute_receive :wire, 50
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "an early recovery run waits for the queued deadline", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, _sibling] = request_index(ctx, revision)
+    fixture(%{})
+
+    assert {:snooze, wait} = Embedding.recover(id)
+    assert wait in 1..60
+    assert [["queued", nil]] = vector_rows(id)
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "archive clears ready vectors of a publishing revision", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, sibling] = request_index(ctx, revision)
+    fixture(%{})
+    assert :ok = Embedding.index(id)
+    assert [["ready", 1536]] = vector_rows(id)
+
+    assert {:ok, %{status: :archived}} =
+             invoke(
+               Article,
+               :archive,
+               %{id: revision.article_id, reason: :obsolete},
+               ctx.reviewer
+             )
+
+    assert [["invalidated", nil]] = vector_rows(id)
+    assert [["invalidated", nil]] = vector_rows(sibling)
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
   test "missing gate, price, cap or reservation storage denies before the adapter", ctx do
     {_collection, revision} = approved(ctx)
     parent = self()

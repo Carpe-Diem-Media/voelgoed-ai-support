@@ -353,10 +353,13 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     end
   end
 
+  # An early run (clock skew) waits for the deadline instead of completing,
+  # because the sweep only covers attempts and would never revisit this row.
   defp recover_queued(%{row: %{state: :queued} = row} = context) do
-    if DateTime.compare(now(), row.deadline_at) != :lt,
-      do: fail_publication(context, :deadline),
-      else: {:ok, :noop}
+    case DateTime.diff(row.deadline_at, now(), :second) do
+      wait when wait > 0 -> {:ok, {:snooze, wait}}
+      _ -> fail_publication(context, :deadline)
+    end
   end
 
   defp recover_queued(_), do: {:ok, :noop}
@@ -669,13 +672,19 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     end
   end
 
+  defp result({:ok, {:snooze, _} = snooze}), do: snooze
   defp result({:ok, _}), do: :ok
   defp result({:error, reason}) when reason in [:already_claimed, :missing_row], do: :ok
   defp result({:error, _}), do: {:error, :indexing_storage}
 
   # Only TEST installs this settings map. B1 has no configuration source that
-  # can select the real adapter or accept a provider key.
-  defp fixture, do: Application.get_env(:voelgoed_ai, :embedding_fixture, %{})
+  # can select the real adapter or accept a provider key, and other builds
+  # ignore the setting entirely.
+  if Mix.env() == :test do
+    defp fixture, do: Application.get_env(:voelgoed_ai, :embedding_fixture, %{})
+  else
+    defp fixture, do: %{}
+  end
 
   defp gate do
     config = fixture()
