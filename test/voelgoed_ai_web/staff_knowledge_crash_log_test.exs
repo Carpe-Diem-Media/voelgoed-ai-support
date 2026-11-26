@@ -55,6 +55,33 @@ defmodule VoelgoedAiWeb.StaffKnowledgeCrashLogTest do
     end
   end
 
+  test "a percent-encoded staff segment over TLS is refused before routing or logging", ctx do
+    row = collection(ctx)
+    start_listener(:https)
+    cookie = issue_cookie(ctx.editor).resp_cookies["_vgas_staff"].value
+    owner = self()
+
+    fail_scope(row, fn ->
+      send(owner, {:crashing_request, self()})
+      throw({ctx.editor.id, ctx.editor.binding, @payload})
+    end)
+
+    # The router decodes each of these to "/staff/knowledge"; the raw-path
+    # redaction checks would not recognise them.
+    for path <- ["/%73taff/knowledge", "/st%61ff/knowledge", "/%73%74%61%66%66/knowledge"] do
+      log =
+        capture_debug(fn ->
+          assert https_status("#{path}?probe=#{@payload}", [
+                   {"Cookie", "_vgas_staff=" <> cookie}
+                 ]) == 404
+        end)
+
+      refute_received {:crashing_request, _}, "#{path} reached the staff route"
+      assert_no_private_data(log, ctx, [{"cookie", cookie}])
+      refute String.contains?(log, ["taff", "%73", "%61"]), "#{path} was request-logged"
+    end
+  end
+
   test "a non-staff HTTP crash over TLS retains Bandit diagnostics" do
     owner = self()
 

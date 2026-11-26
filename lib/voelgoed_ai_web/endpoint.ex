@@ -70,8 +70,26 @@ defmodule VoelgoedAiWeb.Endpoint do
 
   def call(conn, opts) do
     CrashLog.clear_staff_http()
-    super(conn, opts)
+
+    # The router URI-decodes segments before matching, so "/%73taff/..." would
+    # reach the staff routes while every raw-path check here and in CrashLog
+    # misses it. Refuse those requests before any plug or log sees them.
+    if encoded_staff_path?(conn),
+      do: conn |> Plug.Conn.send_resp(404, "") |> Plug.Conn.halt(),
+      else: super(conn, opts)
   end
+
+  defp encoded_staff_path?(%{path_info: [segment | _]}) do
+    String.contains?(segment, "%") and
+      try do
+        URI.decode(segment) == "staff"
+      rescue
+        # Malformed escapes cannot name a route; the router rejects them itself.
+        ArgumentError -> false
+      end
+  end
+
+  defp encoded_staff_path?(_conn), do: false
 
   defp staff_asset_gate(%{path_info: ["staff", "assets" | _]} = conn, opts) do
     conn
