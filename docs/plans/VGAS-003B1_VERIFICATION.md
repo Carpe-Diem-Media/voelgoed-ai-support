@@ -138,6 +138,59 @@ application tests used a non-superuser `vgas_test` role and database.
 - `mix format --check-formatted`, `mix deps.get --check-locked`, `mix hex.audit`, `python3 .github/scripts/plan_tests.py`, `git diff --check cee3cdd HEAD`, and `git diff --exit-code cee3cdd HEAD -- mix.exs mix.lock` exited 0. `rg 'authorize\?: false' lib` exited 1 with no matches. `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='cee3cdd..HEAD'` exited 0 with no findings.
 - Exact-head hosted CI and independent review belong to PR handoff. No PR was opened by this task.
 
+## Review 1 fixes
+
+Independent review 1 of `0584964` (PR #11) requested changes. The
+orchestrator fixed the in-scope findings:
+
+1. **Revoke invalidation was untested.** A new test indexes a revision to
+   READY with a queued sibling, revokes it, and asserts that both rows become
+   `invalidated` with a NULL vector. It also asserts that indexing the sibling
+   afterwards makes no transport call. A second test covers archive of a
+   PUBLISHING revision.
+2. **The `article_embeddings_shape` CHECK was untested.** The revoke test
+   sets a READY row's vector to NULL, then to a zero vector, and asserts that
+   PostgreSQL rejects both with that constraint.
+3. **Non-test builds read the fixture setting.** The fixture settings, the
+   fixture price, the gate and the closure approval now compile only in TEST.
+   Every other build returns `{:error, :disabled}` from the gate and refuses
+   closure approval before any reservation or transport work.
+4. **An early recovery run failed the publication.** When `RecoverIndexing`
+   ran before a queued row's deadline (clock skew), it failed the publication.
+   The recovery sweep covers only attempts, so nothing would revisit the row.
+   Recovery now snoozes for the remaining seconds. A test asserts the snooze
+   and that the row stays queued.
+
+Three mutants were killed on `991057d`:
+- removing revoke invalidation failed 1 test;
+- removing archive invalidation failed 2;
+- reverting the snooze failed 1.
+
+On the final head, disposable `mix test --seed 0` and `--seed 103` each passed
+397 tests, with 5 skipped and 1 excluded. The editorial file passed 32 tests.
+TEST `mix compile --warnings-as-errors --force`, `mix ash.codegen --check`,
+`mix format --check-formatted`, `git diff --check cee3cdd HEAD` and gitleaks
+exited 0. `rg 'authorize\?: false' lib` found nothing.
+
+`MIX_ENV=prod mix compile --warnings-as-errors` exits 1 on `cee3cdd` already.
+The type checker flags TEST-only fixture branches in `run_processing.ex`,
+`chatwoot_webhook.ex` and `configuration.ex`, plus dependency warnings. B1
+adds the same class of warning for the four `gate()` call sites in
+`embedding.ex`. Hosted CI does not compile prod. A clean release build is a
+follow-up before staging (VGAS-8).
+
+Recorded as follow-ups, not fixed in B1:
+- Financial closure writes no `AuditEvent` row. Closure stays unreachable
+  outside TEST until the owner sets the closure procedure, so the audit row
+  belongs with that procedure.
+- A revision that is marked sensitive or uses the `escalate_only` response
+  mode cannot request publication, so it never reaches retrieval. Whether
+  such articles should be indexed so retrieval can route to handoff is an
+  owner decision for B2.
+- Nits: a reservation's `actual_nano_usd` after a correction, leftover test
+  mailbox messages, a database CHECK on `contributor_ids`, and an
+  `admission_denied` reason for invalid content.
+
 ## Owner decisions
 
 VGAS-7 still owns live provider entitlement, usable transport evidence,

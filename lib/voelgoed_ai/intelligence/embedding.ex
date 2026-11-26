@@ -28,12 +28,6 @@ defmodule VoelgoedAi.Intelligence.Embedding do
 
   @indexing_seconds 60
   @timeout_ms 5_000
-  @fixture_price %{
-    version: "embedding-fixture-v1",
-    rate_nano_usd: 5,
-    token_unit: 2,
-    max_input_tokens: 32_768
-  }
 
   @impl Ash.Policy.Check
   def describe(_opts), do: "a staff session presented for scoped financial closure"
@@ -677,39 +671,43 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   defp result({:error, reason}) when reason in [:already_claimed, :missing_row], do: :ok
   defp result({:error, _}), do: {:error, :indexing_storage}
 
-  # Only TEST installs this settings map. B1 has no configuration source that
-  # can select the real adapter or accept a provider key, and other builds
-  # ignore the setting entirely.
+  # Only TEST compiles the fixture gate. B1 has no configuration source that
+  # can select the real adapter or accept a provider key, so every other build
+  # refuses before any reservation or transport work.
   if Mix.env() == :test do
+    @fixture_price %{
+      version: "embedding-fixture-v1",
+      rate_nano_usd: 5,
+      token_unit: 2,
+      max_input_tokens: 32_768
+    }
+
     defp fixture, do: Application.get_env(:voelgoed_ai, :embedding_fixture, %{})
-  else
-    defp fixture, do: %{}
-  end
 
-  defp gate do
-    config = fixture()
+    defp gate do
+      config = fixture()
 
-    if config[:mode] == :fixture and Map.get(config, :enabled, true) do
-      settings = %{
-        price: @fixture_price,
-        day_cap: 10_000_000,
-        month_cap: 20_000_000,
-        transport: {:fixture, Map.get(config, :wire, &EmbeddingTransport.fixture_wire/1)}
-      }
+      if config[:mode] == :fixture and Map.get(config, :enabled, true) do
+        settings = %{
+          price: @fixture_price,
+          day_cap: 10_000_000,
+          month_cap: 20_000_000,
+          transport: {:fixture, Map.get(config, :wire, &EmbeddingTransport.fixture_wire/1)}
+        }
 
-      {:ok, Map.merge(settings, Map.take(config, [:price, :day_cap, :month_cap]))}
-    else
-      {:error, :disabled}
+        {:ok, Map.merge(settings, Map.take(config, [:price, :day_cap, :month_cap]))}
+      else
+        {:error, :disabled}
+      end
     end
-  end
 
-  defp closure_approved?(id), do: fixture()[:closure_approved_by] == id
-
-  if Mix.env() == :test do
+    defp closure_approved?(id), do: fixture()[:closure_approved_by] == id
     defp now, do: Map.get(fixture(), :clock, &DateTime.utc_now/0).()
     defp hook(stage, attempt), do: Map.get(fixture(), stage, fn _ -> :ok end).(attempt)
     defp consume(fence), do: Map.get(fixture(), :consume_dispatch, fn fun -> fun.() end).(fence)
   else
+    defp gate, do: {:error, :disabled}
+    defp closure_approved?(_id), do: false
     defp now, do: DateTime.utc_now()
     defp hook(_, _), do: :ok
     defp consume(fence), do: fence.()
