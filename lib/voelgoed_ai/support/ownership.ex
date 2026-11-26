@@ -4,9 +4,11 @@ defmodule VoelgoedAi.Support.Ownership do
   A human inhibit survives delivery failure and a closed session generation.
   """
 
+  use VoelgoedAi.Support.WorkStore, [:read, :create, :update]
+
   alias VoelgoedAi.Repo
   alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, InboundEvent, OutboundDelivery}
-  alias VoelgoedAi.Support.{SupportRun, SupportSession, WorkStore}
+  alias VoelgoedAi.Support.{SupportRun, SupportSession}
   alias VoelgoedAi.Support.Workers.{Deliver, Sweep}
 
   @inbox [:installation_ref, :external_account_id, :external_inbox_id]
@@ -40,17 +42,26 @@ defmodule VoelgoedAi.Support.Ownership do
   def ensure_session(config, event) do
     where = Map.take(event, @conversation)
 
+    with {:ok, latest} <- lock_latest(where) do
+      case latest do
+        %{state: state} = session when state != :closed -> {:ok, session}
+        prior -> register(config, event, where, prior)
+      end
+    end
+  end
+
+  @doc false
+  def lock_latest(session_or_identity) do
+    where = Map.take(session_or_identity, @conversation)
+
     with {:ok, sessions} <-
-           WorkStore.read(SupportSession, :by_conversation, %{}, where,
+           store_read(SupportSession, :by_conversation, %{}, where,
              many: true,
              sort: [generation: :desc],
              limit: 1,
              lock: true
            ) do
-      case sessions do
-        [%{state: state} = session] when state != :closed -> {:ok, session}
-        sessions -> register(config, event, where, List.first(sessions))
-      end
+      {:ok, List.first(sessions)}
     end
   end
 
@@ -64,12 +75,12 @@ defmodule VoelgoedAi.Support.Ownership do
       correlation_id: Ash.UUIDv7.generate()
     }
 
-    WorkStore.create(SupportSession, :register, Map.merge(where, attrs))
+    store_create(SupportSession, :register, Map.merge(where, attrs))
   end
 
   @doc false
   def get(resource, id, opts \\ []),
-    do: WorkStore.read(resource, :by_id, %{}, %{id: id}, opts)
+    do: store_read(resource, :by_id, %{}, %{id: id}, opts)
 
   @doc false
   def permitted?(config) do
@@ -104,7 +115,7 @@ defmodule VoelgoedAi.Support.Ownership do
   @doc false
   def active_run(session, opts \\ []),
     do:
-      WorkStore.read(
+      store_read(
         SupportRun,
         :active,
         %{},
@@ -116,13 +127,13 @@ defmodule VoelgoedAi.Support.Ownership do
   def blocking_delivery(session, opts \\ []) do
     # An UNKNOWN intent still blocks this conversation if the old generation closed.
     with {:ok, sessions} <-
-           WorkStore.read(SupportSession, :by_conversation, %{}, Map.take(session, @conversation),
+           store_read(SupportSession, :by_conversation, %{}, Map.take(session, @conversation),
              many: true,
              sort: [:id]
            ) do
       opts = Keyword.merge([many: true, sort: [:id], limit: 1], opts)
 
-      case WorkStore.read(
+      case store_read(
              OutboundDelivery,
              :for_session,
              %{},
@@ -151,20 +162,20 @@ defmodule VoelgoedAi.Support.Ownership do
         {:ok, session}
 
       observation.status == :resolved ->
-        close_locked(session, attrs, now, :resolved)
+        close_locked(session, attrs, now)
 
       observation.assignee == :human ->
         human_takeover(session, attrs, now)
 
       eligible_bot?(config, session, observation) and session.state == :unverified ->
-        WorkStore.update(
+        store_update(
           session,
           :activate_bot,
-          Map.merge(attrs, next(session, :bot_active, false))
+          Map.merge(attrs, next_epoch(session))
         )
 
       true ->
-        WorkStore.update(session, :verify_owner, attrs)
+        store_update(session, :verify_owner, attrs)
     end
   end
 
@@ -180,31 +191,41 @@ defmodule VoelgoedAi.Support.Ownership do
       when state in [:unverified, :bot_active] do
     with :ok <- fence(session, now, :human_takeover),
          {:ok, updated} <-
-           WorkStore.update(
+           store_update(
              session,
              :observe_human_takeover,
-             Map.merge(attrs, next(session, :human_active, true))
+             Map.merge(attrs, next_epoch(session))
            ) do
       {:ok, updated}
     end
   end
 
-  def human_takeover(session, attrs, _now), do: WorkStore.update(session, :verify_owner, attrs)
+  def human_takeover(%{state: :closed, human_inhibit: false} = session, _attrs, _now),
+    do: store_update(session, :inhibit_closed, %{})
+
+  def human_takeover(%{state: :closed} = session, _attrs, _now), do: {:ok, session}
+
+  def human_takeover(session, attrs, _now), do: store_update(session, :verify_owner, attrs)
 
   @doc false
-  def close_locked(session, attrs, now, reason) do
-    with :ok <- fence(session, now, reason) do
-      WorkStore.update(
-        session,
-        :close,
-        Map.merge(
-          attrs,
-          Map.merge(
-            next(session, :closed, attrs[:human_inhibit] == true or session.human_inhibit),
-            %{closed_at: now, reason_code: reason}
-          )
-        )
-      )
+  def close_locked(session, observation, now) do
+    with {:ok, attrs} <- close_attributes(session, now, :resolved) do
+      store_update(session, :close, Map.merge(observation, attrs))
+    end
+  end
+
+  @doc false
+  def close_attributes(session, now, reason) do
+    with {:ok, outstanding} <- blocking_delivery(session),
+         :ok <- fence(session, now, reason) do
+      inhibit = reason == :manual_closure or session.human_inhibit or outstanding != nil
+
+      {:ok,
+       Map.merge(next_epoch(session), %{
+         closed_at: now,
+         reason_code: reason,
+         human_inhibit: inhibit
+       })}
     end
   end
 
@@ -213,7 +234,7 @@ defmodule VoelgoedAi.Support.Ownership do
     if write_enabled?(config) do
       with :ok <- fence(session, now, :explicit_handoff),
            {:ok, session} <-
-             WorkStore.update(session, :request_handoff, next(session, :handoff_pending, true)),
+             store_update(session, :request_handoff, next_epoch(session)),
            {:ok, _} <- prepare(config, session, nil, :handoff_status, DateTime.add(now, 300)) do
         {:ok, session}
       end
@@ -226,7 +247,7 @@ defmodule VoelgoedAi.Support.Ownership do
 
   @doc false
   def confirm_locked(%{state: :handoff_pending} = session),
-    do: WorkStore.update(session, :confirm_handoff, %{state: :human_active})
+    do: store_update(session, :confirm_handoff, %{})
 
   def confirm_locked(session), do: {:ok, session}
 
@@ -243,7 +264,7 @@ defmodule VoelgoedAi.Support.Ownership do
 
     with {:ok, attrs} <- template(delivery, config, run),
          {:ok, row} <-
-           WorkStore.create(
+           store_create(
              OutboundDelivery,
              :prepare,
              Map.merge(attrs, epoch_snapshot(config, session))
@@ -280,7 +301,7 @@ defmodule VoelgoedAi.Support.Ownership do
     with {:ok, run} <- active_run(session, lock: true),
          :ok <- cancel_run(run, now, reason),
          {:ok, rows} <-
-           WorkStore.read(
+           store_read(
              OutboundDelivery,
              :for_session,
              %{},
@@ -301,11 +322,8 @@ defmodule VoelgoedAi.Support.Ownership do
   defp cancel_run(nil, _, _), do: :ok
 
   defp cancel_run(run, now, reason) do
-    case WorkStore.update(run, :cancel, %{
-           state: :cancelled,
+    case store_update(run, :cancel, %{
            finished_at: now,
-           lease_expires_at: nil,
-           retry_at: nil,
            reason_code: reason
          }) do
       {:ok, _} -> :ok
@@ -313,6 +331,5 @@ defmodule VoelgoedAi.Support.Ownership do
     end
   end
 
-  defp next(session, state, inhibit),
-    do: %{state: state, ownership_epoch: session.ownership_epoch + 1, human_inhibit: inhibit}
+  defp next_epoch(session), do: %{ownership_epoch: session.ownership_epoch + 1}
 end

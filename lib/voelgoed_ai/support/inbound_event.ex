@@ -175,25 +175,40 @@ defmodule VoelgoedAi.Support.InboundEvent do
     update :dispatch do
       transaction?(false)
       require_atomic?(false)
-      accept([:state, :session_id, :reason_code, :disposition, :processed_at])
+      accept([:session_id])
+
+      validate({VoelgoedAi.Support.FromState, states: [:accepted]})
+      change(set_attribute(:state, :dispatched))
     end
 
     update :ignore do
       transaction?(false)
       require_atomic?(false)
-      accept([:state, :session_id, :reason_code, :disposition, :processed_at])
+      accept([:processed_at])
+
+      validate({VoelgoedAi.Support.FromState, states: [:accepted]})
+      change(set_attribute(:state, :ignored))
+      change(set_attribute(:disposition, :ignored))
+      change(set_attribute(:reason_code, :ignored))
     end
 
     update :quarantine do
       transaction?(false)
       require_atomic?(false)
-      accept([:state, :session_id, :reason_code, :disposition, :processed_at])
+      accept([:session_id, :reason_code, :processed_at])
+
+      validate({VoelgoedAi.Support.FromState, states: [:accepted]})
+      change(set_attribute(:state, :quarantined))
+      change(set_attribute(:disposition, :triage))
     end
 
     update :record_disposition do
       transaction?(false)
       require_atomic?(false)
-      accept([:state, :session_id, :reason_code, :disposition, :processed_at])
+      accept([:session_id, :reason_code, :disposition, :processed_at])
+
+      validate({VoelgoedAi.Support.FromState, states: [:dispatched]})
+      validate({VoelgoedAi.Support.FromState, attribute: :disposition, states: [:pending]})
     end
   end
 

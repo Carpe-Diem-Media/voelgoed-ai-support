@@ -2,9 +2,11 @@ defmodule VoelgoedAi.Support do
   @moduledoc "Support configuration and current-operator recovery commands."
   use Ash.Domain
 
+  use VoelgoedAi.Support.WorkStore, [:read, :create, :update]
+
   alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Governance.AuditEvent
-  alias VoelgoedAi.Support.{ChatwootAdapter, Delivery, OutboundDelivery, Ownership, WorkStore}
+  alias VoelgoedAi.Support.{ChatwootAdapter, Delivery, OutboundDelivery, Ownership}
 
   authorization do
     authorize(:always)
@@ -33,7 +35,7 @@ defmodule VoelgoedAi.Support do
   def reconciliation_projection(staff, session_id) do
     operator_session(staff, session_id, fn _, _, session, _ ->
       with {:ok, rows} <-
-             WorkStore.read(OutboundDelivery, :for_session, %{}, %{session_id: session.id},
+             store_read(OutboundDelivery, :for_session, %{}, %{session_id: session.id},
                many: true,
                sort: [:id],
                limit: 100
@@ -46,13 +48,11 @@ defmodule VoelgoedAi.Support do
   @doc "Close UNKNOWN without asserting remote delivery or granting permission to resend."
   def abandon_delivery(staff, delivery_id, :acknowledge_uncertainty) do
     StaffAccess.with_current(staff, :support_operator, fn operator ->
-      Delivery.with_delivery(delivery_id, fn _, session, row, now ->
+      Delivery.with_delivery_and_latest(delivery_id, fn _, _source, latest, row, now ->
         if row.state == :unknown do
-          with {:ok, _} <- Ownership.human_takeover(session, %{}, now),
+          with {:ok, _} <- Ownership.human_takeover(latest, %{}, now),
                {:ok, updated} <-
-                 WorkStore.update(row, :abandon, %{
-                   state: :abandoned,
-                   reason_code: :manual_closure,
+                 store_update(row, :abandon, %{
                    read_sequence: row.read_sequence + 1
                  }),
                {:ok, _} <- audit(operator, row, updated, :abandon_delivery) do
@@ -71,8 +71,8 @@ defmodule VoelgoedAi.Support do
   def close_session(staff, session_id) do
     operator_session(staff, session_id, fn operator, _, session, now ->
       if session.state != :closed do
-        with {:ok, updated} <-
-               Ownership.close_locked(session, %{human_inhibit: true}, now, :manual_closure),
+        with {:ok, attrs} <- Ownership.close_attributes(session, now, :manual_closure),
+             {:ok, updated} <- store_update(session, :close, attrs),
              {:ok, _} <- audit(operator, session, updated, :close_session) do
           {:ok, project(updated)}
         end
@@ -93,9 +93,7 @@ defmodule VoelgoedAi.Support do
              Ownership.eligible_bot?(config, %{current | human_inhibit: false}, observation) do
           with {:ok, nil} <- Ownership.blocking_delivery(current, lock: true),
                {:ok, updated} <-
-                 WorkStore.update(current, :return_to_bot, %{
-                   state: :bot_active,
-                   human_inhibit: false,
+                 store_update(current, :return_to_bot, %{
                    ownership_epoch: current.ownership_epoch + 1,
                    observed_status: observation.status,
                    observed_assignee: observation.assignee,
@@ -133,7 +131,7 @@ defmodule VoelgoedAi.Support do
         _ -> {:support_session, :session_target_id}
       end
 
-    WorkStore.create(AuditEvent, :append_support_operator, %{
+    store_create(AuditEvent, :append_support_operator, %{
       key => after_row.id,
       target_kind: kind,
       actor_kind: :staff,

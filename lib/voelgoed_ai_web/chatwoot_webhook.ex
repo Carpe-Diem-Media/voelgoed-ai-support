@@ -43,8 +43,17 @@ defmodule VoelgoedAiWeb.ChatwootWebhook do
          :ok <- verify(bytes, timestamp, signature, signing_key),
          {:ok, payload} <- decode(bytes),
          {:ok, receipt} <- qualify(payload, scope) do
-      {:ok, Map.put(receipt, :received_at, now), conn}
+      {:ok, receipt |> replay_key(timestamp, bytes) |> Map.put(:received_at, now), conn}
     end
+  end
+
+  # Non-message webhooks lack a provider event ID. Suppress exact signed
+  # replays only; separately signed observations still reconcile current state.
+  defp replay_key(%{message_id: _} = receipt, _timestamp, _bytes), do: receipt
+
+  defp replay_key(receipt, timestamp, bytes) do
+    digest = :crypto.hash(:sha256, ["signed:", timestamp, ".", :crypto.hash(:sha256, bytes)])
+    Map.put(receipt, :stable_event_key, Base.encode16(digest, case: :lower))
   end
 
   defp signed_headers(conn, now) do

@@ -184,172 +184,91 @@ defmodule VoelgoedAi.Support.SupportRun do
     update :extend_batch do
       transaction?(false)
       require_atomic?(false)
+      accept([:batch_cutoff_at, :watermark])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:queued]})
     end
 
     update :claim do
       transaction?(false)
       require_atomic?(false)
+      accept([:claim_generation, :attempt_count, :lease_expires_at, :started_at])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:queued]})
+      change(set_attribute(:state, :running))
     end
 
     update :complete do
       transaction?(false)
       require_atomic?(false)
+      accept([:decision, :finished_at])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:running]})
+      change(set_attribute(:state, :completed))
+      change(set_attribute(:lease_expires_at, nil))
     end
 
     update :cancel do
       transaction?(false)
       require_atomic?(false)
+      accept([:finished_at, :reason_code])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:queued, :running, :retry_wait]})
+      change(set_attribute(:state, :cancelled))
+      change(set_attribute(:lease_expires_at, nil))
+      change(set_attribute(:retry_at, nil))
     end
 
     update :supersede do
       transaction?(false)
       require_atomic?(false)
+      accept([:finished_at, :reason_code])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:queued, :running, :retry_wait]})
+      change(set_attribute(:state, :superseded))
+      change(set_attribute(:lease_expires_at, nil))
+      change(set_attribute(:retry_at, nil))
     end
 
     update :fail do
       transaction?(false)
       require_atomic?(false)
+      accept([:finished_at, :reason_code])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:queued, :running, :retry_wait]})
+      change(set_attribute(:state, :failed))
+      change(set_attribute(:lease_expires_at, nil))
+      change(set_attribute(:retry_at, nil))
     end
 
     update :schedule_retry do
       transaction?(false)
       require_atomic?(false)
+      accept([:retry_at, :reason_code])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:running]})
+      change(set_attribute(:state, :retry_wait))
+      change(set_attribute(:lease_expires_at, nil))
     end
 
     update :requeue do
       transaction?(false)
       require_atomic?(false)
+      accept([])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:retry_wait]})
+      change(set_attribute(:state, :queued))
+      change(set_attribute(:retry_at, nil))
     end
 
     update :recover_expired_claim do
       transaction?(false)
       require_atomic?(false)
+      accept([:claim_generation, :retry_at])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :lease_expires_at,
-        :retry_at,
-        :started_at,
-        :finished_at,
-        :decision,
-        :reason_code,
-        :watermark,
-        :batch_cutoff_at
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:running]})
+      change(set_attribute(:state, :retry_wait))
+      change(set_attribute(:lease_expires_at, nil))
     end
   end
 

@@ -4,6 +4,8 @@ defmodule VoelgoedAi.Support.Delivery do
   treats the marker as possible delivery, even if the worker died before POST.
   """
 
+  use VoelgoedAi.Support.WorkStore, [:read, :update]
+
   alias VoelgoedAi.Repo
 
   alias VoelgoedAi.Support.{
@@ -19,8 +21,7 @@ defmodule VoelgoedAi.Support.Delivery do
     Recovery,
     RunProcessing,
     SupportRun,
-    SystemAudit,
-    WorkStore
+    SystemAudit
   }
 
   alias VoelgoedAi.Support.Workers.{Reconcile, Sweep}
@@ -45,7 +46,9 @@ defmodule VoelgoedAi.Support.Delivery do
          :ok <- fixture_barrier(:after_claim),
          {:ok, {:authorized, authorized, text}} <-
            with_delivery(id, &authorize(&1, &2, &3, &4, claim, generation)),
-         :ok <- fixture_barrier(:after_authorization) do
+         :ok <- fixture_barrier(:after_authorization),
+         {:ok, :dispatch_current} <-
+           with_delivery(id, &dispatch_current(&1, &2, &3, &4, authorized, generation)) do
       result = post(session, authorized, text)
 
       case with_delivery(id, &settle(&1, &2, &3, &4, authorized, result, generation)) do
@@ -84,12 +87,25 @@ defmodule VoelgoedAi.Support.Delivery do
 
   @doc false
   def with_delivery(id, operation) do
+    with_delivery_sessions(id, &{:ok, &1}, fn config, session, _, delivery, now ->
+      operation.(config, session, delivery, now)
+    end)
+  end
+
+  @doc false
+  def with_delivery_and_latest(id, operation),
+    do: with_delivery_sessions(id, &Ownership.lock_latest/1, operation)
+
+  defp with_delivery_sessions(id, lock_latest, operation) do
     Repo.transact(fn ->
       with {:ok, %OutboundDelivery{} = candidate} <- Ownership.get(OutboundDelivery, id) do
         Ownership.locked_session(candidate.session_id, fn config, session, now ->
-          with {:ok, run} <- lock_runs(session, candidate),
+          # With the binding locked, acquire the source generation and then any
+          # newer generation before locking runs or deliveries.
+          with {:ok, latest} <- lock_latest.(session),
+               {:ok, run} <- lock_runs(session, candidate),
                {:ok, %OutboundDelivery{} = delivery} <- lock_deliveries(session, id) do
-            operation.(Map.put(config, :run, run), session, delivery, now)
+            operation.(Map.put(config, :run, run), session, latest, delivery, now)
           end
         end)
       else
@@ -106,7 +122,7 @@ defmodule VoelgoedAi.Support.Delivery do
     filters = if delivery.run_id, do: [%{id: delivery.run_id} | filters], else: filters
 
     with {:ok, rows} <-
-           WorkStore.read(SupportRun, :active, %{}, %{session_id: session.id, or: filters},
+           store_read(SupportRun, :active, %{}, %{session_id: session.id, or: filters},
              many: true,
              lock: true,
              sort: [:id]
@@ -117,7 +133,7 @@ defmodule VoelgoedAi.Support.Delivery do
 
   defp lock_deliveries(session, id) do
     with {:ok, rows} <-
-           WorkStore.read(
+           store_read(
              OutboundDelivery,
              :for_session,
              %{},
@@ -189,15 +205,12 @@ defmodule VoelgoedAi.Support.Delivery do
     end
   end
 
-  defp qualify(_config, session, delivery, now, {:ok, %{status: :resolved}}, _) do
-    with {:ok, _} <- fence(delivery, now, :resolved) do
-      Ownership.close_locked(
-        session,
-        %{observed_status: :resolved, observed_at: now},
-        now,
-        :resolved
-      )
-    end
+  defp qualify(_config, session, _delivery, now, {:ok, %{status: :resolved}}, _) do
+    Ownership.close_locked(
+      session,
+      %{observed_status: :resolved, observed_at: now},
+      now
+    )
   end
 
   defp qualify(
@@ -285,13 +298,11 @@ defmodule VoelgoedAi.Support.Delivery do
   def expire_pending(delivery, now), do: fence(delivery, now, :deadline)
 
   defp fail_pending(delivery, reason),
-    do: fail_intent(delivery, :fail, :failed, reason)
+    do: fail_intent(delivery, :fail, reason)
 
-  defp fail_intent(delivery, action, state, reason) do
+  defp fail_intent(delivery, action, reason) do
     with {:ok, row} <-
-           WorkStore.update(delivery, action, %{
-             state: state,
-             lease_expires_at: nil,
+           store_update(delivery, action, %{
              reason_code: reason
            }) do
       audit_handoff_failure(row, reason)
@@ -311,7 +322,7 @@ defmodule VoelgoedAi.Support.Delivery do
       |> Map.take([:installation_ref, :external_account_id, :external_inbox_id, :conversation_id])
       |> Map.merge(%{kind: :input, state: :dispatched, disposition: :pending})
 
-    with {:ok, rows} <- WorkStore.read(InboundEvent, :pending, %{}, where, many: true, limit: 1) do
+    with {:ok, rows} <- store_read(InboundEvent, :pending, %{}, where, many: true, limit: 1) do
       {:ok, rows != []}
     end
   end
@@ -320,8 +331,7 @@ defmodule VoelgoedAi.Support.Delivery do
     lease = DateTime.add(now, @lease_seconds)
 
     with {:ok, row} <-
-           WorkStore.update(delivery, :claim, %{
-             state: :sending,
+           store_update(delivery, :claim, %{
              lease_expires_at: lease,
              claim_generation: delivery.claim_generation + 1
            }),
@@ -350,16 +360,13 @@ defmodule VoelgoedAi.Support.Delivery do
         with {:ok, false} <- newer_input?(session, delivery),
              {:ok, text} <- render(config, delivery),
              {:ok, row} <-
-               WorkStore.update(delivery, :authorize_dispatch, %{
-                 dispatch_authorized_at: now,
-                 attempt_count: 1
+               store_update(delivery, :authorize_dispatch, %{
+                 dispatch_authorized_at: now
                }) do
           {:ok, {:authorized, row, text}}
         else
           {:ok, true} ->
-            WorkStore.update(delivery, :safe_retry, %{
-              state: :pending,
-              lease_expires_at: nil,
+            store_update(delivery, :safe_retry, %{
               claim_generation: delivery.claim_generation + 1
             })
 
@@ -379,6 +386,20 @@ defmodule VoelgoedAi.Support.Delivery do
 
   defp render(config, delivery),
     do: Configuration.render_fixed_reply(config.assistant, config.run, delivery)
+
+  defp dispatch_current(config, session, delivery, now, authorized, generation) do
+    cond do
+      not current_claim?(delivery, authorized) ->
+        {:ok, :stale_claim}
+
+      not valid?(config, session, delivery, now) or
+          not BindingCircuit.closed?(config.binding, generation) ->
+        fence(delivery, now, :stale_policy)
+
+      true ->
+        {:ok, :dispatch_current}
+    end
+  end
 
   defp post(session, delivery, text) do
     deadline = earlier(delivery.deadline_at, delivery.lease_expires_at)
@@ -415,10 +436,10 @@ defmodule VoelgoedAi.Support.Delivery do
   end
 
   defp finish_post(_, delivery, _now, {:error, {:not_issued, :deadline}}),
-    do: fail_intent(delivery, :cancel, :cancelled, :deadline)
+    do: fail_intent(delivery, :cancel, :deadline)
 
   defp finish_post(_, delivery, _now, {:error, {:not_issued, _}}),
-    do: fail_intent(delivery, :fail, :failed, :no_effect)
+    do: fail_intent(delivery, :fail, :no_effect)
 
   defp finish_post(_, delivery, now, _result), do: unknown(delivery, now, :ambiguous_write)
 
@@ -429,13 +450,11 @@ defmodule VoelgoedAi.Support.Delivery do
 
   def fence(%{purpose: :handoff_status, state: state} = delivery, _now, :deadline)
       when state in [:pending, :sending],
-      do: fail_intent(delivery, :cancel, :cancelled, :deadline)
+      do: fail_intent(delivery, :cancel, :deadline)
 
   def fence(%{state: state} = delivery, _now, reason) when state in [:pending, :sending],
     do:
-      WorkStore.update(delivery, :cancel, %{
-        state: :cancelled,
-        lease_expires_at: nil,
+      store_update(delivery, :cancel, %{
         reason_code: reason
       })
 
@@ -447,12 +466,9 @@ defmodule VoelgoedAi.Support.Delivery do
       if delivery.purpose == :public_reply, do: DateTime.add(now, 300), else: delivery.deadline_at
 
     with {:ok, row} <-
-           WorkStore.update(delivery, :mark_unknown, %{
-             state: :unknown,
-             lease_expires_at: nil,
+           store_update(delivery, :mark_unknown, %{
              uncertainty_reason: reason,
              recovery_deadline_at: deadline,
-             last_read_at: nil,
              read_count: if(delivery.purpose == :public_reply, do: 0, else: delivery.read_count)
            }),
          {:ok, _} <- SystemAudit.append(row, :delivery_unknown, reason),
@@ -463,7 +479,7 @@ defmodule VoelgoedAi.Support.Delivery do
 
   @doc false
   def reserve_read(delivery, now) do
-    WorkStore.update(delivery, :reserve_read, %{
+    store_update(delivery, :reserve_read, %{
       read_sequence: delivery.read_sequence + 1,
       read_count: delivery.read_count + 1,
       last_read_at: now
@@ -474,9 +490,7 @@ defmodule VoelgoedAi.Support.Delivery do
   def confirm(delivery, now, message_id, reason) do
     action = if delivery.state == :unknown, do: :reconcile, else: :confirm_sent
 
-    WorkStore.update(delivery, action, %{
-      state: :sent,
-      lease_expires_at: nil,
+    store_update(delivery, action, %{
       external_message_id: message_id,
       confirmed_at: now,
       reason_code: reason

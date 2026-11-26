@@ -40,7 +40,7 @@ defmodule VoelgoedAi.Governance.Admission do
       Repo,
       """
       INSERT INTO support_admission_windows (window_type, scope, starts_at, expires_at)
-      VALUES ($1, $2, to_timestamp($3), to_timestamp($4))
+      VALUES ($1, $2, (to_timestamp($3) AT TIME ZONE 'UTC'), (to_timestamp($4) AT TIME ZONE 'UTC'))
       ON CONFLICT (window_type, scope, starts_at) DO NOTHING
       """,
       [type, scope, start, expiry]
@@ -51,7 +51,7 @@ defmodule VoelgoedAi.Governance.Admission do
         Repo,
         """
         SELECT count FROM support_admission_windows
-        WHERE window_type = $1 AND scope = $2 AND starts_at = to_timestamp($3)
+        WHERE window_type = $1 AND scope = $2 AND starts_at = (to_timestamp($3) AT TIME ZONE 'UTC')
         FOR UPDATE
         """,
         [type, scope, start]
@@ -65,7 +65,7 @@ defmodule VoelgoedAi.Governance.Admission do
       Repo,
       """
       UPDATE support_admission_windows SET count = count + 1
-      WHERE window_type = $1 AND scope = $2 AND starts_at = to_timestamp($3)
+      WHERE window_type = $1 AND scope = $2 AND starts_at = (to_timestamp($3) AT TIME ZONE 'UTC')
       """,
       [type, scope, start]
     )

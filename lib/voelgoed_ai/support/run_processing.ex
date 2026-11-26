@@ -4,10 +4,12 @@ defmodule VoelgoedAi.Support.RunProcessing do
   claim. Only verified history supplies message order.
   """
 
+  use VoelgoedAi.Support.WorkStore, [:read, :create, :update]
+
   alias VoelgoedAi.Governance.Admission
   alias VoelgoedAi.Repo
   alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, Delivery, InboundEvent}
-  alias VoelgoedAi.Support.{Ownership, RunInput, SupportRun, SystemAudit, WorkStore}
+  alias VoelgoedAi.Support.{Ownership, RunInput, SupportRun, SystemAudit}
   alias VoelgoedAi.Support.Workers.{ProcessRun, Sweep}
 
   @max_pending 100
@@ -97,7 +99,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
          :ok <- charge(event, now, batch == nil),
          {:ok, run} <- schedule(config, session, revision, batch, delivery, now, deadline) do
       with {:ok, _} <-
-             WorkStore.create(RunInput, :cover, %{
+             store_create(RunInput, :cover, %{
                run_id: run.id,
                event_id: event.id,
                position: position
@@ -124,7 +126,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
         with {:ok, _} <- Delivery.fence(delivery, now, :late_input), do: :ok
 
       run != nil ->
-        with {:ok, _} <- finish(run, :fail, :failed, now, :late_input), do: :ok
+        with {:ok, _} <- finish(run, :fail, now, :late_input), do: :ok
 
       true ->
         :ok
@@ -141,7 +143,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   defp authorize_capacity(nil) do
     with {:ok, rows} <-
-           WorkStore.read(SupportRun, :active, %{}, %{state: %{in: @active}},
+           store_read(SupportRun, :active, %{}, %{state: %{in: @active}},
              many: true,
              limit: @max_pending
            ) do
@@ -215,7 +217,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   defp schedule(_, _, _, %{state: :queued} = run, _, now, _) do
     with {:ok, run} <-
-           WorkStore.update(run, :extend_batch, %{
+           store_update(run, :extend_batch, %{
              batch_cutoff_at: cutoff(now, run.deadline_at),
              watermark: run.watermark + 1
            }),
@@ -258,14 +260,14 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   defp suppress(previous, _, now) do
-    with {:ok, _} <- finish(previous, :supersede, :superseded, now, :late_input), do: :ok
+    with {:ok, _} <- finish(previous, :supersede, now, :late_input), do: :ok
   end
 
   defp move_inputs(inputs, run_id) do
     Enum.reduce_while(inputs, :ok, fn input, :ok ->
-      with {:ok, _} <- WorkStore.update(input, :release, %{current: false}),
+      with {:ok, _} <- store_update(input, :release, %{current: false}),
            {:ok, _} <-
-             WorkStore.create(RunInput, :cover, %{
+             store_create(RunInput, :cover, %{
                run_id: run_id,
                event_id: input.event_id,
                position: input.position
@@ -278,7 +280,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   defp queue(attrs) do
-    with {:ok, run} <- WorkStore.create(SupportRun, :queue, attrs),
+    with {:ok, run} <- store_create(SupportRun, :queue, attrs),
          {:ok, _} <- enqueue_run(run),
          {:ok, _} <-
            Ownership.enqueue(Sweep, %{"run_id" => run.id}, scheduled_at: run.deadline_at) do
@@ -297,7 +299,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   defp disposition(event, session, disposition, reason, now) do
     with {:ok, row} <-
-           WorkStore.update(event, :record_disposition, %{
+           store_update(event, :record_disposition, %{
              session_id: session.id,
              disposition: disposition,
              reason_code: reason,
@@ -345,21 +347,23 @@ defmodule VoelgoedAi.Support.RunProcessing do
   defp claim(config, session, %{state: :queued} = run, now) do
     cond do
       DateTime.compare(now, run.deadline_at) != :lt ->
-        finish(run, :fail, :failed, now, :deadline)
+        finish(run, :fail, now, :deadline)
 
       not valid_run?(config, session, run) ->
-        finish(run, :cancel, :cancelled, now, :stale_policy)
+        finish(run, :cancel, now, :stale_policy)
 
       DateTime.compare(now, run.batch_cutoff_at) == :lt ->
         {:ok, :debouncing}
 
       true ->
+        # with_run holds the singleton control row through the count and claim.
+        # All claims take that same lock, including claims for other inboxes.
         with {:ok, running} <-
-               WorkStore.read(SupportRun, :active, %{}, %{state: :running}, many: true, limit: 5),
+               store_read(SupportRun, :active, %{}, %{state: :running}, many: true, limit: 5),
              {:ok, nil} <- Ownership.blocking_delivery(session, lock: true) do
           if length(running) < 5, do: claim_run(run, session, now), else: {:ok, :capacity}
         else
-          {:ok, _} -> finish(run, :cancel, :cancelled, now, :awaiting_operator)
+          {:ok, _} -> finish(run, :cancel, now, :awaiting_operator)
           error -> error
         end
     end
@@ -371,14 +375,13 @@ defmodule VoelgoedAi.Support.RunProcessing do
     lease = DateTime.add(now, 5)
 
     attrs = %{
-      state: :running,
       lease_expires_at: lease,
       claim_generation: run.claim_generation + 1,
       attempt_count: run.attempt_count + 1,
       started_at: now
     }
 
-    with {:ok, run} <- WorkStore.update(run, :claim, attrs),
+    with {:ok, run} <- store_update(run, :claim, attrs),
          {:ok, _} <- Ownership.enqueue(Sweep, %{"run_id" => run.id}, scheduled_at: lease) do
       {:ok, {:claimed, run, session}}
     end
@@ -391,10 +394,10 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
       DateTime.compare(now, run.deadline_at) != :lt or
           DateTime.compare(now, run.lease_expires_at) != :lt ->
-        finish(run, :fail, :failed, now, :deadline)
+        finish(run, :fail, now, :deadline)
 
       not valid_run?(config, session, run) or run.watermark != claim.watermark ->
-        finish(run, :cancel, :cancelled, now, :stale_policy)
+        finish(run, :cancel, now, :stale_policy)
 
       true ->
         decide(config, session, run, now, observation, history)
@@ -408,27 +411,25 @@ defmodule VoelgoedAi.Support.RunProcessing do
            :ok <- check_coverage(inputs, history) do
         complete_decision(config, session, run, now, revision.response_policy)
       else
-        {:error, :history_changed} -> finish(run, :fail, :failed, now, :history_changed)
+        {:error, :history_changed} -> finish(run, :fail, now, :history_changed)
         error -> error
       end
     else
-      with {:ok, _} <- finish(run, :cancel, :cancelled, now, :scope_denied) do
+      with {:ok, _} <- finish(run, :cancel, now, :scope_denied) do
         Ownership.observe(config, session, observation, now)
       end
     end
   end
 
-  defp decide(_, _, run, now, _, _), do: finish(run, :fail, :failed, now, :unavailable)
+  defp decide(_, _, run, now, _, _), do: finish(run, :fail, now, :unavailable)
 
   defp complete_decision(config, session, run, now, policy) do
     decision = if Ownership.write_enabled?(config), do: policy, else: :no_send
 
     with {:ok, completed} <-
-           WorkStore.update(run, :complete, %{
-             state: :completed,
+           store_update(run, :complete, %{
              decision: decision,
-             finished_at: now,
-             lease_expires_at: nil
+             finished_at: now
            }) do
       case decision do
         :fixed_reply ->
@@ -458,7 +459,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
       Enum.reduce_while(inputs, {:ok, -1}, fn input, {:ok, latest} ->
         with {:ok, %InboundEvent{} = event} <- Ownership.get(InboundEvent, input.event_id),
              {:contact, position} <- Map.get(positions, event.message_id),
-             {:ok, _} <- WorkStore.update(input, :set_position, %{position: position}) do
+             {:ok, _} <- store_update(input, :set_position, %{position: position}) do
           {:cont, {:ok, max(latest, position)}}
         else
           _ -> {:halt, {:error, :history_changed}}
@@ -476,7 +477,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
   @doc false
   def inputs(run_id),
     do:
-      WorkStore.read(RunInput, :for_run, %{}, %{run_id: run_id, current: true},
+      store_read(RunInput, :for_run, %{}, %{run_id: run_id, current: true},
         many: true,
         sort: [:id],
         lock: true
@@ -490,14 +491,12 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   @doc false
-  def finish(run, action, state, now, reason) do
+  def finish(%SupportRun{} = run, action, now, reason)
+      when action in [:cancel, :fail, :supersede] do
     with {:ok, row} <-
-           WorkStore.update(run, action, %{
-             state: state,
+           store_update(run, action, %{
              reason_code: reason,
-             finished_at: now,
-             lease_expires_at: nil,
-             retry_at: nil
+             finished_at: now
            }) do
       audit_deadline(row)
     end

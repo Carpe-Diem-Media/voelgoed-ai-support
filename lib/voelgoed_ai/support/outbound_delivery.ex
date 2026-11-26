@@ -228,211 +228,108 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
     update :reserve_read do
       transaction?(false)
       require_atomic?(false)
+      accept([:read_sequence, :read_count, :last_read_at])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:pending, :unknown]})
     end
 
     update :claim do
       transaction?(false)
       require_atomic?(false)
+      accept([:claim_generation, :lease_expires_at])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:pending]})
+      change(set_attribute(:state, :sending))
     end
 
     update :authorize_dispatch do
       transaction?(false)
       require_atomic?(false)
+      accept([:dispatch_authorized_at])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:sending]})
+      validate({VoelgoedAi.Support.FromState, attribute: :dispatch_authorized_at, states: [nil]})
+      change(set_attribute(:attempt_count, 1))
     end
 
     update :confirm_sent do
       transaction?(false)
       require_atomic?(false)
+      accept([:external_message_id, :confirmed_at, :reason_code])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:sending]})
+      change(set_attribute(:state, :sent))
+      change(set_attribute(:lease_expires_at, nil))
     end
 
     update :mark_unknown do
       transaction?(false)
       require_atomic?(false)
+      accept([:uncertainty_reason, :recovery_deadline_at, :read_count])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:sending]})
+      change(set_attribute(:state, :unknown))
+      change(set_attribute(:lease_expires_at, nil))
+      change(set_attribute(:last_read_at, nil))
     end
 
     update :cancel do
       transaction?(false)
       require_atomic?(false)
+      accept([:reason_code])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:pending, :sending]})
+      change(set_attribute(:state, :cancelled))
+      change(set_attribute(:lease_expires_at, nil))
     end
 
     update :fail do
       transaction?(false)
       require_atomic?(false)
+      accept([:reason_code])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:pending, :sending]})
+      change(set_attribute(:state, :failed))
+      change(set_attribute(:lease_expires_at, nil))
     end
 
     update :safe_retry do
       transaction?(false)
       require_atomic?(false)
+      accept([:claim_generation])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:sending]})
+      validate({VoelgoedAi.Support.FromState, attribute: :dispatch_authorized_at, states: [nil]})
+      change(set_attribute(:state, :pending))
+      change(set_attribute(:lease_expires_at, nil))
     end
 
     update :reconcile do
       transaction?(false)
       require_atomic?(false)
+      accept([:external_message_id, :confirmed_at, :reason_code])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:unknown]})
+      change(set_attribute(:state, :sent))
     end
 
     update :abandon do
       transaction?(false)
       require_atomic?(false)
+      accept([:read_sequence])
 
-      accept([
-        :state,
-        :claim_generation,
-        :attempt_count,
-        :read_sequence,
-        :read_count,
-        :external_message_id,
-        :lease_expires_at,
-        :dispatch_authorized_at,
-        :confirmed_at,
-        :last_read_at,
-        :recovery_deadline_at,
-        :reason_code,
-        :uncertainty_reason
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:unknown]})
+      change(set_attribute(:state, :abandoned))
+      change(set_attribute(:reason_code, :manual_closure))
+    end
+
+    update :record_read_exhausted do
+      transaction?(false)
+      require_atomic?(false)
+      accept([])
+
+      validate({VoelgoedAi.Support.FromState, states: [:unknown]})
+      change(set_attribute(:reason_code, :read_exhausted))
     end
   end
 
@@ -455,6 +352,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
              :fail,
              :safe_retry,
              :reconcile,
+             :record_read_exhausted,
              :abandon
            ]) do
       authorize_if(VoelgoedAi.Support.WorkStore)

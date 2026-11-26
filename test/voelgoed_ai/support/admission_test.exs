@@ -28,6 +28,32 @@ defmodule VoelgoedAi.Support.AdmissionTest do
              ])
   end
 
+  test "rate window timestamps and lookups are UTC in a non-UTC session" do
+    scope = Ash.UUIDv7.generate()
+    window = Admission.window(:contact_minute, scope, ~U[2026-11-26 12:00:00Z], 60, 1)
+
+    assert {:error, :restore_fixture} =
+             Repo.transact(fn ->
+               SQL.query!(Repo, "SET LOCAL TimeZone TO 'Africa/Johannesburg'", [])
+               assert :ok = Admission.reserve([window])
+
+               assert %{
+                        rows: [
+                          [~N[2026-11-26 12:00:00.000000], ~N[2026-11-26 12:01:00.000000], 1]
+                        ]
+                      } =
+                        SQL.query!(
+                          Repo,
+                          "SELECT starts_at, expires_at, count FROM support_admission_windows WHERE scope = $1",
+                          [scope]
+                        )
+
+               SQL.query!(Repo, "SET LOCAL TimeZone TO 'America/New_York'", [])
+               assert {:error, :admission_limited} = Admission.reserve([window])
+               {:error, :restore_fixture}
+             end)
+  end
+
   for {type, seconds, limit} <- [{:contact_minute, 60, 10}, {:contact_hour, 3600, 60}] do
     test "#{type} serializes concurrent reservations and permits the next window" do
       scope = Ash.UUIDv7.generate()
@@ -131,7 +157,7 @@ defmodule VoelgoedAi.Support.AdmissionTest do
     assert [] = SupportDBCase.writes(ctx)
   end
 
-  test "five distinct conversations can run while a sixth waits for global capacity" do
+  test "a sixth conversation waits at the global claim lock while five runs hold capacity" do
     ctx = SupportDBCase.setup()
 
     runs =
@@ -160,7 +186,22 @@ defmodule VoelgoedAi.Support.AdmissionTest do
       end
 
     {6, sixth} = List.last(runs)
-    assert :ok = RunProcessing.process_run(sixth)
+
+    assert {:ok, waiter} =
+             Repo.transact(fn ->
+               SQL.query!(
+                 Repo,
+                 "SELECT singleton FROM automation_controls WHERE singleton FOR UPDATE",
+                 []
+               )
+
+               {:ok,
+                VoelgoedAi.SupportFixtures.blocked_task(fn ->
+                  RunProcessing.process_run(sixth)
+                end)}
+             end)
+
+    assert :ok = Task.await(waiter)
 
     assert %{rows: [["queued", 0]]} =
              SQL.query!(Repo, "SELECT state, attempt_count FROM support_runs WHERE id = $1", [

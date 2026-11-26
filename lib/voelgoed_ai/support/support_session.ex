@@ -177,86 +177,50 @@ defmodule VoelgoedAi.Support.SupportSession do
     update :activate_bot do
       transaction?(false)
       require_atomic?(false)
+      accept([:ownership_epoch, :observed_status, :observed_assignee, :observed_at])
 
-      accept([
-        :state,
-        :ownership_epoch,
-        :human_inhibit,
-        :contact_id,
-        :observed_status,
-        :observed_assignee,
-        :observed_at,
-        :closed_at,
-        :reason_code
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:unverified]})
+      validate(attribute_equals(:human_inhibit, false))
+      change(set_attribute(:state, :bot_active))
     end
 
     update :observe_human_takeover do
       transaction?(false)
       require_atomic?(false)
+      accept([:ownership_epoch, :observed_status, :observed_assignee, :observed_at])
 
-      accept([
-        :state,
-        :ownership_epoch,
-        :human_inhibit,
-        :contact_id,
-        :observed_status,
-        :observed_assignee,
-        :observed_at,
-        :closed_at,
-        :reason_code
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:unverified, :bot_active]})
+      change(set_attribute(:state, :human_active))
+      change(set_attribute(:human_inhibit, true))
     end
 
     update :request_handoff do
       transaction?(false)
       require_atomic?(false)
+      accept([:ownership_epoch])
 
-      accept([
-        :state,
-        :ownership_epoch,
-        :human_inhibit,
-        :contact_id,
-        :observed_status,
-        :observed_assignee,
-        :observed_at,
-        :closed_at,
-        :reason_code
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:bot_active]})
+      change(set_attribute(:state, :handoff_pending))
+      change(set_attribute(:human_inhibit, true))
     end
 
     update :confirm_handoff do
       transaction?(false)
       require_atomic?(false)
+      accept([])
 
-      accept([
-        :state,
-        :ownership_epoch,
-        :human_inhibit,
-        :contact_id,
-        :observed_status,
-        :observed_assignee,
-        :observed_at,
-        :closed_at,
-        :reason_code
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:handoff_pending]})
+      change(set_attribute(:state, :human_active))
     end
 
     update :return_to_bot do
       transaction?(false)
       require_atomic?(false)
+      accept([:ownership_epoch, :observed_status, :observed_assignee, :observed_at])
 
-      accept([
-        :state,
-        :ownership_epoch,
-        :human_inhibit,
-        :contact_id,
-        :observed_status,
-        :observed_assignee,
-        :observed_at,
-        :closed_at,
-        :reason_code
-      ])
+      validate({VoelgoedAi.Support.FromState, states: [:human_active]})
+      change(set_attribute(:state, :bot_active))
+      change(set_attribute(:human_inhibit, false))
     end
 
     update :close do
@@ -264,33 +228,41 @@ defmodule VoelgoedAi.Support.SupportSession do
       require_atomic?(false)
 
       accept([
-        :state,
         :ownership_epoch,
         :human_inhibit,
-        :contact_id,
         :observed_status,
         :observed_assignee,
         :observed_at,
         :closed_at,
         :reason_code
       ])
+
+      validate(
+        {VoelgoedAi.Support.FromState,
+         states: [:unverified, :bot_active, :handoff_pending, :human_active]}
+      )
+
+      change(set_attribute(:state, :closed))
+    end
+
+    update :inhibit_closed do
+      transaction?(false)
+      require_atomic?(false)
+      accept([])
+
+      validate({VoelgoedAi.Support.FromState, states: [:closed]})
+      change(set_attribute(:human_inhibit, true))
     end
 
     update :verify_owner do
       transaction?(false)
       require_atomic?(false)
+      accept([:observed_status, :observed_assignee, :observed_at])
 
-      accept([
-        :state,
-        :ownership_epoch,
-        :human_inhibit,
-        :contact_id,
-        :observed_status,
-        :observed_assignee,
-        :observed_at,
-        :closed_at,
-        :reason_code
-      ])
+      validate(
+        {VoelgoedAi.Support.FromState,
+         states: [:unverified, :bot_active, :handoff_pending, :human_active]}
+      )
     end
   end
 
@@ -305,6 +277,7 @@ defmodule VoelgoedAi.Support.SupportSession do
              :confirm_handoff,
              :return_to_bot,
              :close,
+             :inhibit_closed,
              :verify_owner
            ]) do
       authorize_if(VoelgoedAi.Support.WorkStore)

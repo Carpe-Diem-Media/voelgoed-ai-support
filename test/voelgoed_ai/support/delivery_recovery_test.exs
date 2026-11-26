@@ -737,6 +737,280 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert [_] = SupportDBCase.writes(ctx)
   end
 
+  test "an untrusted caller cannot mint or forge operator storage authority", ctx do
+    alias VoelgoedAi.Support.{Ownership, WorkStore}
+
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :timeout)
+    assert :ok = Delivery.deliver(id)
+
+    assert {:ok, :denied} =
+             Repo.transact(fn ->
+               assert {:ok, row} = Ownership.get(OutboundDelivery, id)
+               attrs = %{read_sequence: row.read_sequence + 1}
+
+               audit_attrs = %{
+                 actor_kind: :staff,
+                 actor_staff_id: ctx.operator.id,
+                 target_kind: :outbound_delivery,
+                 delivery_target_id: id,
+                 event: :abandon_delivery,
+                 reason_code: :local_operator,
+                 correlation_id: row.correlation_id,
+                 operational_before: %{status: :unknown, ownership_epoch: row.ownership_epoch},
+                 operational_after: %{status: :abandoned, ownership_epoch: row.ownership_epoch}
+               }
+
+               assert {:error, :denied} =
+                        WorkStore.update(&work_store_owner/0, row, :abandon, attrs)
+
+               assert {:error, :denied} =
+                        WorkStore.create(
+                          &work_store_owner/0,
+                          AuditEvent,
+                          :append_support_operator,
+                          audit_attrs
+                        )
+
+               ref = make_ref()
+               actor = %WorkStore{ref: ref}
+
+               try do
+                 Process.put(WorkStore, {ref, OutboundDelivery, :abandon, &work_store_owner/0})
+
+                 assert {:error, %Ash.Error.Forbidden{}} =
+                          Ash.update(row, attrs, action: :abandon, actor: actor)
+
+                 Process.put(
+                   WorkStore,
+                   {ref, AuditEvent, :append_support_operator, &work_store_owner/0}
+                 )
+
+                 assert {:error, %Ash.Error.Forbidden{}} =
+                          Ash.create(AuditEvent, audit_attrs,
+                            action: :append_support_operator,
+                            actor: actor
+                          )
+               after
+                 Process.delete(WorkStore)
+               end
+
+               {:ok, :denied}
+             end)
+
+    assert %{rows: [["unknown"]]} = SupportDBCase.delivery_rows(ctx, "state")
+
+    assert [["support_worker", "outbound_delivery", "delivery_unknown", "ambiguous_write"]] =
+             SupportDBCase.audit_rows(:delivery_target_id, id)
+  end
+
+  defp work_store_owner, do: Support
+
+  test "Ash actions enforce original states and own their target state", ctx do
+    alias VoelgoedAi.Support.{InboundEvent, SupportRun, SupportSession}
+
+    for {row, action, attrs, field} <- [
+          {%OutboundDelivery{state: :sent}, :abandon, %{read_sequence: 1}, :state},
+          {%OutboundDelivery{state: :unknown}, :safe_retry, %{claim_generation: 1}, :state},
+          {%SupportRun{state: :completed}, :claim, %{}, :state},
+          {%SupportSession{state: :closed}, :return_to_bot, %{}, :state},
+          {%InboundEvent{state: :dispatched}, :dispatch, %{}, :state},
+          {%InboundEvent{state: :dispatched, disposition: :covered}, :record_disposition,
+           %{disposition: :triage}, :disposition},
+          {%OutboundDelivery{state: :sending, dispatch_authorized_at: ctx.event.received_at},
+           :safe_retry, %{claim_generation: 1}, :dispatch_authorized_at}
+        ] do
+      changeset = Ash.Changeset.for_update(row, action, attrs)
+
+      assert Enum.any?(changeset.errors, fn error ->
+               match?(
+                 %Ash.Error.Changes.InvalidAttribute{
+                   field: ^field,
+                   message: "cannot apply this action from the current state"
+                 },
+                 error
+               )
+             end),
+             "expected the original state guard on #{inspect(row.__struct__)}.#{action}"
+    end
+
+    row = %OutboundDelivery{state: :unknown}
+    legal = Ash.Changeset.for_update(row, :abandon, %{read_sequence: 1})
+    assert legal.valid?
+    assert Ash.Changeset.get_attribute(legal, :state) == :abandoned
+
+    for attrs <- [%{state: :failed}, %{attempt_count: 0}] do
+      refute Ash.Changeset.for_update(row, :abandon, attrs).valid?
+    end
+  end
+
+  test "PostgreSQL refuses to change a terminal delivery or run state", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    assert :ok = Delivery.deliver(id)
+
+    assert {:error,
+            %Postgrex.Error{postgres: %{constraint: "outbound_deliveries_terminal_state"}}} =
+             SQL.query(
+               Repo,
+               "UPDATE outbound_deliveries SET state = 'cancelled', confirmed_at = NULL WHERE id = $1",
+               [Ecto.UUID.dump!(id)]
+             )
+
+    assert {:error, %Postgrex.Error{postgres: %{constraint: "support_runs_terminal_state"}}} =
+             SQL.query(
+               Repo,
+               """
+               UPDATE support_runs SET state = 'queued', decision = NULL, finished_at = NULL
+               WHERE id = (SELECT run_id FROM outbound_deliveries WHERE id = $1)
+               """,
+               [Ecto.UUID.dump!(id)]
+             )
+  end
+
+  for closure <- [:resolved, :operator] do
+    test "#{closure} closure carries an unknown delivery's inhibit into the next generation",
+         ctx do
+      id = SupportDBCase.prepare_reply(ctx)
+      first = SupportDBCase.session_id(ctx)
+      SupportDBCase.write_mode(ctx, :timeout)
+      assert :ok = Delivery.deliver(id)
+
+      case unquote(closure) do
+        :resolved ->
+          observe_resolution(ctx)
+          Agent.update(ctx.fake, &put_in(&1.observation.status, :pending))
+
+        :operator ->
+          assert {:ok, %{state: :closed}} = Support.close_session(ctx.operator, first)
+      end
+
+      assert %{rows: [["closed", true]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT state, human_inhibit FROM support_sessions WHERE id = $1",
+                 [Ecto.UUID.dump!(first)]
+               )
+
+      assert ["triage", _] = process_next_input(ctx, 1)
+
+      assert %{rows: [[current, "unverified", true]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT id::text, state, human_inhibit FROM support_sessions WHERE conversation_id = $1 AND generation = 2",
+                 [ctx.event.conversation_id]
+               )
+
+      assert {:ok, %{state: :abandoned}} =
+               Support.abandon_delivery(ctx.operator, id, :acknowledge_uncertainty)
+
+      assert %{rows: [["human_active", true]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT state, human_inhibit FROM support_sessions WHERE id = $1",
+                 [Ecto.UUID.dump!(current)]
+               )
+
+      assert ["triage", _] = process_next_input(ctx, 2)
+      assert [_] = SupportDBCase.writes(ctx)
+
+      assert {:ok, %{state: :bot_active}} = Support.return_to_bot(ctx.operator, current)
+      assert ["covered", "accepted"] = process_next_input(ctx, 3)
+    end
+  end
+
+  test "a reopened legacy generation blocks and inherits takeover from an older unknown delivery",
+       ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    first = SupportDBCase.session_id(ctx)
+    SupportDBCase.write_mode(ctx, :timeout)
+    assert :ok = Delivery.deliver(id)
+    assert {:ok, %{state: :closed}} = Support.close_session(ctx.operator, first)
+
+    # Reproduce a closed generation persisted before closure inherited the hold.
+    assert %{num_rows: 1} =
+             SQL.query!(Repo, "UPDATE support_sessions SET human_inhibit = false WHERE id = $1", [
+               Ecto.UUID.dump!(first)
+             ])
+
+    assert ["triage", "awaiting_operator"] = process_next_input(ctx, 1)
+
+    assert {:ok, %{state: :abandoned}} =
+             Support.abandon_delivery(ctx.operator, id, :acknowledge_uncertainty)
+
+    assert ["triage", "scope_denied"] = process_next_input(ctx, 2)
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  test "signed human takeover fences an authorized delivery before POST", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    parent = self()
+    Agent.update(ctx.fake, &Map.put(&1, :authorization_barrier, parent))
+
+    task = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:delivery_authorized, worker}, 1_000
+    human = %{ctx.event | kind: :human_outbound, message_id: ctx.event.message_id + 1}
+    assert {:ok, _} = Ingress.accept(human)
+    assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+
+    send(worker, :resume_delivery_authorization)
+    assert :ok = Task.await(task)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "a resolved observation fences an authorized delivery before POST", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    parent = self()
+    Agent.update(ctx.fake, &Map.put(&1, :authorization_barrier, parent))
+
+    task = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:delivery_authorized, worker}, 1_000
+    observe_resolution(ctx)
+    assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+
+    assert %{rows: [["closed", true]]} =
+             SQL.query!(
+               Repo,
+               "SELECT state, human_inhibit FROM support_sessions WHERE conversation_id = $1",
+               [ctx.event.conversation_id]
+             )
+
+    send(worker, :resume_delivery_authorization)
+    assert :ok = Task.await(task)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  defp observe_resolution(ctx) do
+    Agent.update(ctx.fake, &put_in(&1.observation.status, :resolved))
+
+    assert SupportDBCase.signed_request(ctx, &Map.put(&1, "event", "conversation_updated")).status ==
+             204
+
+    assert %{rows: [[receipt]]} =
+             SQL.query!(
+               Repo,
+               "SELECT id::text FROM inbound_events WHERE conversation_id = $1 AND message_id IS NULL",
+               [ctx.event.conversation_id]
+             )
+
+    assert :ok = RunProcessing.process_event(receipt)
+  end
+
+  defp process_next_input(ctx, offset) do
+    message = ctx.event.message_id + offset
+    SupportDBCase.append_public_input(ctx, message)
+    assert {:ok, receipt} = Ingress.accept(%{ctx.event | message_id: message})
+    assert :ok = RunProcessing.process_event(receipt)
+
+    assert %{rows: [row]} =
+             SQL.query!(
+               Repo,
+               "SELECT disposition, reason_code FROM inbound_events WHERE id = $1",
+               [Ecto.UUID.dump!(receipt)]
+             )
+
+    row
+  end
+
   test "sweep fences an expired worker even while its write callback is blocked", ctx do
     id = SupportDBCase.prepare_reply(ctx)
     SupportDBCase.block_next_write(ctx, self())

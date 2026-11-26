@@ -592,6 +592,87 @@ defmodule VoelgoedAi.Support.WorkflowTest do
     assert [] = SupportDBCase.writes(ctx)
   end
 
+  test "return denies a changed ownership epoch while human ownership stays active", ctx do
+    SupportDBCase.prepare_reply(ctx)
+    session = SupportDBCase.session_id(ctx)
+
+    assert {:ok, _} =
+             Ingress.accept(%{
+               ctx.event
+               | kind: :human_outbound,
+                 message_id: ctx.event.message_id + 1
+             })
+
+    SupportDBCase.block_next_conversation(ctx, self())
+    task = Task.async(fn -> Support.return_to_bot(ctx.operator, session) end)
+    assert_receive {:chatwoot_read, worker}, 1_000
+
+    assert %{num_rows: 1} =
+             SQL.query!(
+               Repo,
+               "UPDATE support_sessions SET ownership_epoch = ownership_epoch + 1 WHERE id = $1 AND state = 'human_active'",
+               [Ecto.UUID.dump!(session)]
+             )
+
+    send(worker, :resume_chatwoot_read)
+    assert {:error, :scope_denied} = Task.await(task)
+    assert {:ok, %{state: :bot_active}} = Support.return_to_bot(ctx.operator, session)
+  end
+
+  test "locked session samples its clock after waiting on PostgreSQL", ctx do
+    SupportDBCase.prepare_reply(ctx)
+    session = SupportDBCase.session_id(ctx)
+
+    assert {:ok, {waiter, expected}} =
+             Repo.transact(fn ->
+               SQL.query!(Repo, "SELECT id FROM support_sessions WHERE id = $1 FOR UPDATE", [
+                 Ecto.UUID.dump!(session)
+               ])
+
+               waiter =
+                 VoelgoedAi.SupportFixtures.blocked_task(fn ->
+                   Repo.transact(fn ->
+                     VoelgoedAi.Support.Ownership.locked_session(session, fn _, _, now ->
+                       {:ok, now}
+                     end)
+                   end)
+                 end)
+
+               SupportDBCase.advance_clock(ctx, 46)
+               {:ok, {waiter, VoelgoedAi.Support.ChatwootAdapter.now()}}
+             end)
+
+    assert {:ok, ^expected} = Task.await(waiter)
+  end
+
+  test "an exact signed replay of an id-less observation creates one receipt and job", ctx do
+    event = &Map.put(&1, "event", "conversation_updated")
+    assert SupportDBCase.signed_request(ctx, event).status == 204
+    assert SupportDBCase.signed_request(ctx, event).status == 204
+
+    assert %{rows: [[receipt]]} =
+             SQL.query!(
+               Repo,
+               "SELECT id::text FROM inbound_events WHERE conversation_id = $1 AND message_id IS NULL",
+               [ctx.event.conversation_id]
+             )
+
+    assert %{rows: [[1]]} =
+             SQL.query!(Repo, "SELECT count(*) FROM oban_jobs WHERE args->>'event_id' = $1", [
+               receipt
+             ])
+
+    SupportDBCase.advance_clock(ctx, 1)
+    assert SupportDBCase.signed_request(ctx, event).status == 204
+
+    assert %{rows: [[2]]} =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM inbound_events WHERE conversation_id = $1 AND message_id IS NULL",
+               [ctx.event.conversation_id]
+             )
+  end
+
   test "signed human receipt fences before its job and rolls back on enqueue failure", ctx do
     id = SupportDBCase.prepare_reply(ctx)
 

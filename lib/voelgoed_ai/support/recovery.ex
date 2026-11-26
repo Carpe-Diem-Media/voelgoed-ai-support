@@ -4,9 +4,11 @@ defmodule VoelgoedAi.Support.Recovery do
   reservations keep late observations from changing a settled outcome.
   """
 
+  use VoelgoedAi.Support.WorkStore, [:read, :update]
+
   alias VoelgoedAi.Repo
   alias VoelgoedAi.Support.{ChatwootAdapter, Delivery, InboundEvent, OutboundDelivery}
-  alias VoelgoedAi.Support.{Ownership, RunProcessing, SupportRun, WorkStore}
+  alias VoelgoedAi.Support.{Ownership, RunProcessing, SupportRun}
   alias VoelgoedAi.Support.Workers.{Deliver, ProcessEvent, ProcessRun, Reconcile}
 
   @batch_size 25
@@ -82,8 +84,7 @@ defmodule VoelgoedAi.Support.Recovery do
                Ownership.close_locked(
                  session,
                  %{observed_status: :resolved, observed_at: now},
-                 now,
-                 :resolved
+                 now
                ) do
           exhausted(row, now)
         end
@@ -114,7 +115,7 @@ defmodule VoelgoedAi.Support.Recovery do
   defp exhausted(row, now) do
     reason = if remaining?(row, now), do: :read_exhausted, else: :deadline
 
-    with {:ok, updated} <- WorkStore.update(row, :reconcile, %{reason_code: :read_exhausted}) do
+    with {:ok, updated} <- store_update(row, :record_read_exhausted, %{}) do
       Delivery.audit_handoff_failure(updated, reason)
     end
   end
@@ -152,9 +153,7 @@ defmodule VoelgoedAi.Support.Recovery do
   defp recover_send(%{dispatch_authorized_at: nil, attempt_count: 0} = row, now) do
     if DateTime.compare(now, row.deadline_at) == :lt do
       with {:ok, updated} <-
-             WorkStore.update(row, :safe_retry, %{
-               state: :pending,
-               lease_expires_at: nil,
+             store_update(row, :safe_retry, %{
                claim_generation: row.claim_generation + 1
              }),
            {:ok, _} <- Ownership.enqueue(Deliver, %{"delivery_id" => updated.id}) do
@@ -179,7 +178,7 @@ defmodule VoelgoedAi.Support.Recovery do
   defp recover_run(%{state: state} = run, now) when state in [:queued, :running, :retry_wait] do
     cond do
       DateTime.compare(now, run.deadline_at) != :lt ->
-        RunProcessing.finish(run, :fail, :failed, now, :deadline)
+        RunProcessing.finish(run, :fail, now, :deadline)
 
       state == :running and DateTime.compare(now, run.lease_expires_at) != :lt ->
         retry_run(run, now)
@@ -195,17 +194,15 @@ defmodule VoelgoedAi.Support.Recovery do
   defp recover_run(_, _), do: {:ok, :finished}
 
   defp retry_run(%{attempt_count: count} = run, now) when count >= 2,
-    do: RunProcessing.finish(run, :fail, :failed, now, :unavailable)
+    do: RunProcessing.finish(run, :fail, now, :unavailable)
 
   defp retry_run(run, now) do
     with {:ok, row} <-
-           WorkStore.update(run, :recover_expired_claim, %{
-             state: :retry_wait,
-             lease_expires_at: nil,
+           store_update(run, :recover_expired_claim, %{
              retry_at: now,
              claim_generation: run.claim_generation + 1
            }),
-         {:ok, row} <- WorkStore.update(row, :requeue, %{state: :queued, retry_at: nil}) do
+         {:ok, row} <- store_update(row, :requeue, %{}) do
       Ownership.enqueue(ProcessRun, %{"run_id" => row.id})
     end
   end
@@ -231,7 +228,7 @@ defmodule VoelgoedAi.Support.Recovery do
     opts = [many: true, sort: [:inserted_at, :id], limit: @batch_size]
 
     with {:ok, events} <-
-           WorkStore.read(
+           store_read(
              InboundEvent,
              :pending,
              %{},
@@ -239,7 +236,7 @@ defmodule VoelgoedAi.Support.Recovery do
              opts
            ),
          {:ok, runs} <-
-           WorkStore.read(
+           store_read(
              SupportRun,
              :recoverable,
              %{},
@@ -252,7 +249,7 @@ defmodule VoelgoedAi.Support.Recovery do
              opts
            ),
          {:ok, deliveries} <-
-           WorkStore.read(
+           store_read(
              OutboundDelivery,
              :recoverable,
              %{},

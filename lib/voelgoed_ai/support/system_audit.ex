@@ -6,12 +6,14 @@ defmodule VoelgoedAi.Support.SystemAudit do
 
   use Ash.Resource.Actions.Implementation
 
+  use VoelgoedAi.Support.WorkStore, [:read, :create]
+
   alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Accounts.StaffAccess.Session
   alias VoelgoedAi.Governance.AuditEvent
   alias VoelgoedAi.Repo
   alias VoelgoedAi.Support.{ActionScope, ChatwootAdapter, InboundEvent, OutboundDelivery}
-  alias VoelgoedAi.Support.{Ownership, SupportRun, SupportSession, WorkStore}
+  alias VoelgoedAi.Support.{Ownership, SupportRun, SupportSession}
 
   @targets %{
     inbound_event: {InboundEvent, :event_target_id},
@@ -34,7 +36,7 @@ defmodule VoelgoedAi.Support.SystemAudit do
       correlation_id: row.correlation_id
     }
 
-    WorkStore.create(AuditEvent, :append_system, audit_attributes(attrs))
+    store_create(AuditEvent, :append_system, audit_attributes(attrs))
   end
 
   @impl true
@@ -66,7 +68,7 @@ defmodule VoelgoedAi.Support.SystemAudit do
     with {:ok, %{id: ^id} = row} <- Ownership.get(resource, id),
          {:ok, qualifier} <- qualifier(row),
          true <- authorized_inbox?(qualifier, inbox),
-         {:ok, rows} <- WorkStore.read(AuditEvent, :system_rows, args, %{}, many: true) do
+         {:ok, rows} <- store_read(AuditEvent, :system_rows, args, %{}, many: true) do
       {:ok,
        Enum.map(rows, &(&1 |> Map.take(@fields) |> Map.put(:target_id, Map.fetch!(&1, key))))}
     else

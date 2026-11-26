@@ -4,6 +4,8 @@ defmodule VoelgoedAi.Support.Ingress do
   transaction. The original timestamp survives replay.
   """
 
+  use VoelgoedAi.Support.WorkStore, [:read, :create, :update]
+
   alias VoelgoedAi.Repo
 
   alias VoelgoedAi.Support.{
@@ -11,12 +13,11 @@ defmodule VoelgoedAi.Support.Ingress do
     Configuration,
     InboundEvent,
     Ownership,
-    SupportRun,
-    WorkStore
+    SupportRun
   }
 
   @inbox [:installation_ref, :external_account_id, :external_inbox_id]
-  @identity [:installation_ref, :external_account_id, :event_type, :message_id]
+  @identity [:installation_ref, :external_account_id, :event_type]
 
   @doc false
   def accept(event) do
@@ -48,7 +49,16 @@ defmodule VoelgoedAi.Support.Ingress do
   end
 
   defp find_receipt(%{message_id: id} = event) when is_integer(id),
-    do: WorkStore.read(InboundEvent, :by_identity, %{}, Map.take(event, @identity))
+    do: store_read(InboundEvent, :by_identity, %{}, Map.take(event, [:message_id | @identity]))
+
+  defp find_receipt(%{stable_event_key: key} = event) when is_binary(key),
+    do:
+      store_read(
+        InboundEvent,
+        :by_identity,
+        %{},
+        Map.take(event, [:stable_event_key | @identity])
+      )
 
   defp find_receipt(_event), do: {:ok, nil}
 
@@ -68,31 +78,27 @@ defmodule VoelgoedAi.Support.Ingress do
     attrs = Map.put(event, :correlation_id, Ash.UUIDv7.generate())
 
     with {:ok, context} <- signed_human_inhibit(event, config),
-         {:ok, event} <- WorkStore.create(InboundEvent, :register, attrs),
+         {:ok, event} <- store_create(InboundEvent, :register, attrs),
          {:ok, event} <- finish_receipt(event, context) do
       {:ok, event.id}
     end
   end
 
-  defp finish_receipt(%{kind: kind} = event, _config) when kind in [:ignored, :oversize] do
-    {action, state, disposition, reason} =
-      if kind == :ignored,
-        do: {:ignore, :ignored, :ignored, :ignored},
-        else: {:quarantine, :quarantined, :triage, :oversize}
+  defp finish_receipt(%{kind: :ignored} = event, _context),
+    do: store_update(event, :ignore, %{processed_at: ChatwootAdapter.now()})
 
-    WorkStore.update(event, action, %{
-      state: state,
-      disposition: disposition,
-      reason_code: reason,
-      processed_at: DateTime.utc_now()
-    })
-  end
+  defp finish_receipt(%{kind: :oversize} = event, _context),
+    do:
+      store_update(event, :quarantine, %{
+        reason_code: :oversize,
+        processed_at: ChatwootAdapter.now()
+      })
 
   defp finish_receipt(event, session) do
     attrs = if session, do: %{session_id: session.id}, else: %{}
 
     with {:ok, receipts} <-
-           WorkStore.read(
+           store_read(
              InboundEvent,
              :pending,
              %{},
@@ -101,7 +107,7 @@ defmodule VoelgoedAi.Support.Ingress do
              limit: 100
            ),
          {:ok, runs} <-
-           WorkStore.read(
+           store_read(
              SupportRun,
              :active,
              %{},
@@ -110,12 +116,10 @@ defmodule VoelgoedAi.Support.Ingress do
              limit: 100
            ) do
       if length(receipts) + length(runs) >= 100 do
-        WorkStore.update(
+        store_update(
           event,
           :quarantine,
           Map.merge(attrs, %{
-            state: :quarantined,
-            disposition: :triage,
             reason_code: :admission_limited,
             processed_at: ChatwootAdapter.now()
           })
@@ -146,7 +150,7 @@ defmodule VoelgoedAi.Support.Ingress do
         max_attempts: 1
       )
 
-    with {:ok, event} <- WorkStore.update(event, :dispatch, Map.put(attrs, :state, :dispatched)),
+    with {:ok, event} <- store_update(event, :dispatch, attrs),
          {:ok, _job} <- Oban.insert(job) do
       {:ok, event}
     end
