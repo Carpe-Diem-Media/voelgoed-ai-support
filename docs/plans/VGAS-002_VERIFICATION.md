@@ -253,3 +253,143 @@ Rehearsals used a temporary PostgreSQL 18 container with pgvector on loopback po
 The first fresh rehearsal omitted the CI vector extension setup and stopped at the extension probe with exit 1. Two upgrade rehearsal attempts stopped at the synthetic seed with exit 3. The final seed supplies the required assistant audience. The rollback rehearsal used historical staff and configuration facts only. Once the new system facts exist, the predecessor audit constraints prevent a schema rollback that would discard those facts.
 
 F07/VGAS-8 still owns live Chatwoot and wire-attempt evidence. GitHub Actions and independent review must evaluate the pushed PR head.
+
+## PR B independent review fixes
+
+VGAS-13 review follow-up. The base was `24453be`. The implementation started
+at `4bfa5eb`, which includes the audit follow-up to the reviewed `3fbb385`.
+The code and tests are in `9773cad`.
+
+### Findings and regression evidence
+
+- **Cross-generation abandonment.** Closure records the human inhibit when a
+  PENDING, SENDING or UNKNOWN delivery still exists. Abandonment locks the
+  source session and then the latest qualified generation before locking any
+  target rows. It applies human takeover and writes the operator audit in the
+  same transaction as abandonment. The resolved-closure and operator-closure
+  tests cover inheritance, triage before and after abandonment, and explicit
+  return. The legacy-generation test proves the earlier UNKNOWN hold and
+  takeover of an already active successor.
+- **Storage authority.** WorkStore requires a private local function capture
+  bound to the allowlisted orchestration module and action. It checks that
+  authority at minting and again when authorizing the Ash action. The operator
+  capability and staff audit remain inside `StaffAccess.with_current`. The
+  untrusted-caller test tries both direct minting and a forged Ash actor.
+- **Transitions.** Actions validate the persisted source state under the
+  workflow's row lock. They set the destination state and accept only the
+  transition's inputs. Reconciliation records read exhaustion without changing
+  UNKNOWN. The Ash regression exercises all four resource types, a previously
+  authorized retry, and rejected state and attempt-count inputs. The
+  `20261126000422` migration rejects changes out of terminal run and delivery
+  states even through SQL. Its rollback removes only the guards.
+- **Authorized send fence.** The signed human takeover and resolved-observation
+  tests pause after authorization and resume the worker after fencing. Each
+  leaves UNKNOWN with one authorized attempt and zero wire writes. The final
+  dispatch check reads current local permission before calling the adapter.
+  A remote ownership or resolution race remains possible after that check.
+- **Time and concurrency.** The return test changes only the ownership epoch
+  while the adapter read is blocked. The session timing test proves PostgreSQL
+  lock contention before advancing the fake clock. The admission test changes
+  the SQL session time zone and verifies the same UTC window. The run capacity
+  test observes the sixth connection waiting on the singleton control lock
+  while five runs are active. That lock already covers the count and claim.
+  Ingress uses the adapter clock for ignored and oversize dispositions.
+- **Id-less signed replay.** The endpoint hashes the signed timestamp and body
+  digest under a dedicated prefix. It stores only the final digest in the
+  existing qualified index. The replay test proves one receipt and one job for
+  byte-identical retransmission with the same signature timestamp. A separately
+  signed observation still reconciles current state. The digest is an envelope
+  replay key. It supplies no provider event identity or ordering.
+
+### Mutation evidence
+
+Each code mutant ran on a disposable copy. The command was
+`devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test FILE:LINE --seed 0`.
+Each run exited 2 on the assertion below. The changes were reverted in the
+copy after each run.
+
+- M2, `delivery_recovery_test.exs`, signed human takeover. The state assertion
+  expected UNKNOWN after the authorized send was fenced.
+- M5, `workflow_test.exs`, locked-session clock. The returned timestamp
+  preceded the fake clock advance during the lock wait.
+- M7, `workflow_test.exs`, changed return epoch. The return succeeded where
+  the test required `:scope_denied`.
+- M9, `delivery_recovery_test.exs`, legacy reopened generation. The input was
+  covered where the test required triage with `:awaiting_operator`.
+- M11, the same legacy-generation test. The next input was covered after
+  abandonment where the test required triage with `:scope_denied`.
+- MED2 mint check, `delivery_recovery_test.exs`, untrusted caller. The direct
+  storage call reached Ash where the test required denial at minting.
+- MED2 policy check, the same untrusted-caller test. Ash accepted a forged
+  actor where the test required `Ash.Error.Forbidden`.
+- MED3 source-state guard, `delivery_recovery_test.exs`, Ash action guards.
+  The SENT abandonment changeset lacked its rejection.
+- MED3 no-dispatch retry guard, the same Ash test. The authorized SENDING
+  retry changeset lacked its rejection.
+- MED3 destination-state change, the same Ash test. The legal abandonment
+  changeset left the state UNKNOWN.
+- MED3 accepted fields, the same Ash test. The abandonment changeset accepted
+  an attempt-count change.
+- MED3 PostgreSQL triggers. On disposable PG18, the terminal UPDATE for each
+  table exited 1 in `psql` with its trigger enabled. Disabling that one trigger
+  inside a transaction let the identical UPDATE exit 0. Each transaction
+  rolled back. The unmodified ExUnit test requires both constraint names.
+
+### Local command results
+
+The following commands exited 0 unless noted. Mix output was captured in
+temporary logs and removed after summarizing.
+
+- `git fetch origin`, `git merge --ff-only origin/feat/vgas-002b-signed-flow`.
+  The named branch was in use in another worktree. This isolated branch tracked
+  its remote ref.
+- `devcore-project plan`, `devcore-project activate`, `devcore-project doctor`.
+- Separate `mise exec -- mix deps.get --check-locked` and
+  `mise exec -- mix hex.audit` invocations. Hex reported no retired or
+  advisory packages.
+- `mise exec -- mix format --check-formatted`.
+- `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix compile --warnings-as-errors`.
+- `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix ash.codegen --check`.
+- `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix ecto.migrate --strict-version-order`.
+- `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix ecto.migrations`.
+  Migration `20261126000422` was up.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai_web/chatwoot_webhook_test.exs test/voelgoed_ai/support --seed 0`
+  and the same command with `--seed 103`. 110 passed on each seed.
+- `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --seed 0`
+  and the same command with `--seed 103`. 357 passed, 5 skipped and 2 excluded on each seed.
+- `python3 .github/scripts/plan_tests.py` emitted eight shards.
+- `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='24453be..HEAD'`
+  reported no leaks.
+- `git diff --check 24453be..HEAD`.
+- `git diff --exit-code 24453be..HEAD -- mix.exs mix.lock`.
+- `rg -n 'authorize\?: false' lib` exited 1 with no matches.
+- `PORT=4191 devcore-project run dev -- env -u OPENAI_API_KEY mise exec -- mix phx.server`.
+  `curl --fail -sS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:4191/health`
+  returned HTTP 200. The server exited 143 on SIGTERM.
+- `ss -ltn '( sport = :4191 or sport = :55434 )'` showed no listeners.
+
+Disposable PG18/pgvector rehearsals on 55434 exited 0 for each command:
+
+1. Fresh `MIX_ENV=test mise exec -- mix ecto.migrate --strict-version-order`.
+   Verified pgvector and both terminal-state triggers.
+2. Predecessor `MIX_ENV=test mise exec -- mix ecto.migrate --migrations-path
+   "$scratch/priv/repo/migrations" --strict-version-order` from a
+   `git archive 24453be priv/repo/migrations` export. Seeded the PR A
+   assistant and binding plus the VGAS-001 staff audit fixture.
+3. Upgrade `MIX_ENV=test mise exec -- mix ecto.migrate --strict-version-order`,
+   rollback `MIX_ENV=test mise exec -- mix ecto.rollback --step 1`, and reapply
+   with the strict-order migration command. The fixtures survived each step.
+   Both triggers disappeared on rollback and returned on reapply.
+
+### Follow-ups
+
+The circuit's read-only probe still cancels the handoff intent that triggered
+it. The operator's manual recovery path remains available. Retry or intent
+replacement after a probe needs a separate recovery decision. Sweep can
+enqueue another Deliver job while one is available. The one-attempt rule
+and durable claim still prevent another POST. The shared staff bootstrap can
+cascade after a failed fixture cleanup. The final suites used serial
+execution on DevCore TEST.
+
+F07 and isolated real inbox validation remain open. This follow-up used the
+fake adapter and carries no staging or exact-head independent review evidence.
