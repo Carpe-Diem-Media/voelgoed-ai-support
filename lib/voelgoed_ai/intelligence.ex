@@ -9,5 +9,6 @@ defmodule VoelgoedAi.Intelligence do
   resources do
     resource(VoelgoedAi.Intelligence.Assistant)
     resource(VoelgoedAi.Intelligence.AssistantRevision)
+    resource(VoelgoedAi.Intelligence.AssistantKnowledgeGrant)
   end
 end

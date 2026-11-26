@@ -6,6 +6,7 @@ config :voelgoed_ai,
     VoelgoedAi.Accounts,
     VoelgoedAi.Governance,
     VoelgoedAi.Intelligence,
+    VoelgoedAi.Knowledge,
     VoelgoedAi.Support
   ]
 

@@ -22,6 +22,8 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
   ]
   @audit_actions [
     append: :create,
+    append_knowledge: :create,
+    knowledge_rows: :read,
     append_support_operator: :create,
     append_system: :create,
     staff_security_history: :read,
@@ -30,6 +32,7 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
   @operational_actions [
     append_operational: :create,
     operational_history: :action,
+    knowledge_history: :action,
     operational_rows: :read,
     system_history: :action
   ]
@@ -67,6 +70,7 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
             nil,
             session,
             Map.from_struct(session),
+            %VoelgoedAi.Knowledge.Storage{ref: make_ref()},
             %VoelgoedAi.Support.WorkStore{ref: make_ref()},
             %Scope{action: wrong_action, target: context.target.id},
             %Scope{action: action, target: Ash.UUIDv7.generate()}
@@ -155,6 +159,23 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
       correlation_id: Ash.UUIDv7.generate()
     }
   end
+
+  defp arguments(:append_knowledge, %{session: session}) do
+    %{
+      actor_kind: :staff,
+      actor_staff_id: session.id,
+      target_kind: :knowledge_revision,
+      article_revision_target_id: Ash.UUIDv7.generate(),
+      event: :approve,
+      reason_code: :source_verified,
+      operational_before: %{status: :in_review},
+      operational_after: %{status: :approved},
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:knowledge_rows, _),
+    do: %{id: Ash.UUIDv7.generate(), target_kind: :knowledge_revision}
 
   defp arguments(:append_system, _) do
     %{

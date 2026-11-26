@@ -31,7 +31,7 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
     check_constraints do
       check_constraint(:status, "assistant_revisions_lifecycle",
         check: """
-        revision_number > 0 AND locale IN ('af', 'en') AND response_policy IN ('fixed_reply', 'handoff') AND
+        revision_number > 0 AND config_hash_version IN (1, 2) AND locale IN ('af', 'en') AND response_policy IN ('fixed_reply', 'handoff') AND
         char_length(workflow_version) BETWEEN 1 AND 64 AND char_length(template_version) BETWEEN 1 AND 64 AND
         ((status IN ('draft', 'discarded') AND published_at IS NULL AND published_by_id IS NULL AND config_hash IS NULL) OR
          (status IN ('published', 'superseded') AND published_at IS NOT NULL AND published_by_id IS NOT NULL
@@ -62,6 +62,13 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
     )
 
     attribute(:config_hash, :string, constraints: [match: ~r/\A[a-f0-9]{64}\z/])
+
+    attribute(:config_hash_version, :integer,
+      allow_nil?: false,
+      default: 1,
+      constraints: [min: 1, max: 2]
+    )
+
     attribute(:published_at, :utc_datetime_usec)
 
     create_timestamp(:inserted_at)
@@ -114,6 +121,18 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
       run(Configuration)
     end
 
+    action :grant_collection, :map do
+      argument(:id, :uuid, allow_nil?: false)
+      argument(:collection_id, :uuid, allow_nil?: false)
+      run(Configuration)
+    end
+
+    action :remove_collection, :map do
+      argument(:id, :uuid, allow_nil?: false)
+      argument(:collection_id, :uuid, allow_nil?: false)
+      run(Configuration)
+    end
+
     action :read_configuration, :map do
       argument(:id, :uuid, allow_nil?: false)
       run(Configuration)
@@ -155,6 +174,7 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
         :locale,
         :response_policy,
         :config_hash,
+        :config_hash_version,
         :published_by_id,
         :published_at
       ])
@@ -162,7 +182,14 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
   end
 
   policies do
-    policy action([:create_draft, :edit_draft, :discard, :publish]) do
+    policy action([
+             :create_draft,
+             :edit_draft,
+             :discard,
+             :publish,
+             :grant_collection,
+             :remove_collection
+           ]) do
       authorize_if(ActionScope.Admin)
     end
 
