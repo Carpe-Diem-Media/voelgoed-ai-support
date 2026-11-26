@@ -213,6 +213,34 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     end)
   end
 
+  test "a valid pin without a grant finds nothing and replacement invalidates the old claim" do
+    ctx = setup_search(%{}, grant?: false)
+    admin = ctx.knowledge.admin
+    fixture(%{wire: fn _ -> flunk("query transport reached without a grant") end})
+    assert {:ok, %{status: :no_evidence, evidence: []}} = search(ctx.claim)
+
+    draft = VoelgoedAi.SupportFixtures.draft(admin, ctx.support.assistant)
+
+    assert {:ok, _} =
+             invoke(
+               AssistantRevision,
+               :grant_collection,
+               %{id: draft.id, collection_id: ctx.collection.id},
+               admin
+             )
+
+    assert {:ok, _} =
+             invoke(
+               AssistantRevision,
+               :publish,
+               %{id: draft.id, expected_active_revision_id: ctx.support.revision.id},
+               admin
+             )
+
+    assert {:error, :denied} = search(ctx.claim)
+    assert query_rows(ctx) == []
+  end
+
   test "publication, active vector, audience and temporal gates deny before transport" do
     ctx = setup_search()
     parent = self()
@@ -260,9 +288,29 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       collection
     ])
 
+    for {field, bad, good} <- [
+          {"profile_id", "wrong", profile},
+          {"content_hash", String.duplicate("c", 64), ctx.revision.content_hash},
+          {"generation", 2, 1}
+        ] do
+      statement =
+        "UPDATE article_embeddings SET #{field} = $2 WHERE revision_id = $1 AND locale = 'en-ZA'"
+
+      SQL.query!(Repo, statement, [id, bad])
+      assert {:ok, %{status: :no_evidence}} = search(ctx.claim)
+      SQL.query!(Repo, statement, [id, good])
+    end
+
+    %{rows: [[vector]]} =
+      SQL.query!(
+        Repo,
+        "SELECT vector FROM article_embeddings WHERE revision_id = $1 AND locale = 'en-ZA'",
+        [id]
+      )
+
     SQL.query!(
       Repo,
-      "UPDATE article_embeddings SET profile_id = 'wrong' WHERE revision_id = $1 AND locale = 'en-ZA'",
+      "UPDATE article_embeddings SET state = 'invalidated', vector = NULL WHERE revision_id = $1 AND locale = 'en-ZA'",
       [id]
     )
 
@@ -272,8 +320,8 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
 
     SQL.query!(
       Repo,
-      "UPDATE article_embeddings SET profile_id = $2 WHERE revision_id = $1 AND locale = 'en-ZA'",
-      [id, profile]
+      "UPDATE article_embeddings SET state = 'ready', vector = $2 WHERE revision_id = $1 AND locale = 'en-ZA'",
+      [id, vector]
     )
 
     assert {:ok, %{status: :evidence}} = search(ctx.claim)
@@ -682,7 +730,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     ]
   end
 
-  defp setup_search(scope \\ %{}) do
+  defp setup_search(scope \\ %{}, opts \\ []) do
     knowledge = setup_knowledge(%{embedding_index: true})
     collection = collection(knowledge)
     fixture(%{})
@@ -720,13 +768,15 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       SupportDBCase.setup(
         staff: {knowledge, knowledge.admin, nil},
         before_publish: fn admin, rev ->
-          assert {:ok, _} =
-                   invoke(
-                     AssistantRevision,
-                     :grant_collection,
-                     %{id: rev.id, collection_id: collection.id},
-                     admin
-                   )
+          if Keyword.get(opts, :grant?, true) do
+            assert {:ok, _} =
+                     invoke(
+                       AssistantRevision,
+                       :grant_collection,
+                       %{id: rev.id, collection_id: collection.id},
+                       admin
+                     )
+          end
         end
       )
 
