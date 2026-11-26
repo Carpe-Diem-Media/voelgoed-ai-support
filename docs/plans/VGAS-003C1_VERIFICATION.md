@@ -185,13 +185,91 @@ The implementation was committed before mutation. Each target was run as `mise e
 - Six extra telemetry subscriptions were tested one at a time in `test/voelgoed_ai_web/staff_knowledge_auth_test.exs:18`. The allowlist rejected a handler on each of `socket_connected`, `endpoint/start`, `router_dispatch/exception`, `error_rendered`, `channel_joined` and `channel_handled_in`. Each run had one failure and six exclusions.
 - The original transport log mutation and an upload join log mutation each failed the privacy capture at `test/voelgoed_ai_web/staff_knowledge_live_test.exs:130`. Each run had one failure and 11 exclusions.
 
-## Completion assessment
+## Review 1 completion assessment
 
 BUG_FIX. Author self-assessment for VGAS-003 C1 Review 1, tracked in Plane VGAS-14. Four of four corrections passed. The debug captures verified crash redaction, the HTTP, TLS and connected mount tests verified current wrong-role denial, the expanded telemetry tripwire and flow capture verified the logging criterion, and the port and origin tests verified both transport guards. Zero corrections failed, remained unverified or were left incomplete. The seven C1 criteria remain the scope of the local handoff. The earlier visual and migration-upgrade evidence applies to the same staff page markup, assets and schema.
 
 Implementation score is **9/10**. Requirements 4/4, observed verification 2/3, correctness and risk 2/2, and handoff 1/1. Hosted exact-head CI accounts for the verification deduction. Confidence is **90%**, based on three channel crash tests, real TLS requests, the targeted mutations, and both full local seeds. The transient indexing-status failure and reliance on pinned report shapes limit confidence.
 
 Verification status is **VERIFIED** for the local C1 Review 1 corrections. Merge status is `NOT_VERIFIED_FOR_MERGE`. The orchestrator owns hosted CI and independent review on the pushed head. The VGAS-9 decisions still govern staff use.
+
+## Review 2 corrections
+
+### HTTP and channel logging
+
+The primary logger filter replaces Bandit crash reports whose original `Plug.Conn.path_info` begins with `"staff"`. That prefix covers staff pages, the socket upgrade and the assets. The replacement carries a fixed notice and the OTP time, process and group leader metadata.
+
+- Bandit 1.15.0 passes the original conn and plug to `handle_error/7` after conn construction. It unwraps `Plug.Conn.WrapperError` and logs the formatted exception with `domain: [:bandit]` and `crash_reason`. Elixir 1.20.5 prepends `:elixir` to that domain before the primary filters see it. See `deps/bandit/lib/bandit/{pipeline,logger}.ex` and Elixir's `Logger.add_elixir_domain/1`. Bandit is the configured adapter. The lockfile has no Plug.Cowboy package.
+- Phoenix 1.8.17 wraps the endpoint at compile time and emits `[:phoenix, :error_rendered]` before re-raising. Its logger prints the exception module for a struct exception and can inspect a thrown or exited reason. The endpoint marks the staff request process so the primary filter can drop that Phoenix log, which carries no conn metadata. The successful endpoint call clears the marker. On failure the marker survives until the Phoenix log is filtered, and a subsequent non-staff call clears any remainder. Bandit supplies the fixed crash notice. See `deps/phoenix/lib/phoenix/{endpoint.ex,endpoint/render_errors.ex,logger.ex}`. The configured JSON error response uses the status template.
+- Phoenix overwrites route `metadata.log` with the route's `:log` option or its enclosing scope's setting. The staff knowledge scope now uses `log: false`. See `deps/phoenix/lib/phoenix/router/scope.ex:52` and `:173`.
+- OTP 29.1.2 removes any primary filter that raises. The filter catches unexpected failures and redacts them when it can identify the staff request or process without relying on the malformed report. Other events proceed through the normal logger filters. The regression sends a malformed report through OTP and checks the filter is still registered. See OTP `kernel/src/logger_backend.erl:122`.
+
+The TLS tests cover a dead render raising after actor assignment, a dead render throwing a synthetic reason, a non-staff HTTP crash, a malformed join before the channel is labelled and a connected mount crash after actor assignment. The debug captures include logger metadata and check synthetic exception data, staff IDs, the session binding, cookies and signed LiveView tokens. The staff flow capture rejects router dispatch output. The indexing test checks both retry embeddings are ready before finalization.
+
+### Review checks
+
+Code and tests were verified at `04aba359789d37624dad5d232a77f2ad54899c80`. The starting PR head was `7a4ee5df10f043b3a15fca59bb1947436717cd58` and the base was `e1040b8eaa9e5074bfed3e07d16ce93eab68dbbe`. The disposable helper ran with `MIX_ENV=test` on PostgreSQL 18.7 and vector 0.8.7 at port 55434. It used `bash /home/jcschoeman96/.t3/userdata/attachments/vgas_disposable_pg.sh "$PWD" "$steps" 55434`. The helper and each of these steps exited 0.
+
+```sh
+mise exec -- mix format --check-formatted
+mise exec -- mix compile --warnings-as-errors
+ELIXIR_ERL_OPTIONS="+S 1" mise exec -- mix compile --warnings-as-errors --force
+ELIXIR_ERL_OPTIONS="+S 2" mise exec -- mix compile --warnings-as-errors --force
+mise exec -- mix ash.codegen --check
+mise exec -- mix ecto.migrate --strict-version-order
+mise exec -- mix test test/voelgoed_ai_web/staff_knowledge_{auth,live,crash_log,crash_filter}_test.exs test/voelgoed_ai_web/staff_auth_test.exs --seed 0
+mise exec -- mix test test/voelgoed_ai_web/staff_knowledge_{auth,live,crash_log,crash_filter}_test.exs test/voelgoed_ai_web/staff_auth_test.exs --seed 8125
+mise exec -- mix test test/voelgoed_ai_web/staff_knowledge_{auth,live,crash_log,crash_filter}_test.exs test/voelgoed_ai_web/staff_auth_test.exs --seed 43117
+mise exec -- mix test --seed 0
+mise exec -- mix test --seed 8125
+```
+
+Each focused run passed 58 tests. Each full run passed 467 tests with 5 skipped and 1 excluded. Both full runs reached the expected synthetic reserve-commit failure in its rollback fixture. The earlier Hallmark and upgrade evidence applies to the same page templates, assets and schema.
+
+```sh
+mise exec -- mix deps.get --check-locked
+mise exec -- mix hex.audit
+python3 .github/scripts/plan_tests.py
+git diff --exit-code e1040b8 -- mix.exs mix.lock priv/repo/migrations priv/resource_snapshots
+git diff --check
+git diff --check e1040b8
+mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='e1040b8..HEAD' --no-banner .
+```
+
+All commands exited 0. Hex reported zero retired packages or advisories. Gitleaks found zero leaks.
+
+### Review mutations
+
+Each mutation was applied to the committed code and restored with `git checkout -- lib test config` after its test. For each target below the command was `mise exec -- mix test test/voelgoed_ai_web/<target> --seed 0`. All 11 mutations compiled and were killed by test failures.
+
+| Mutation | Target | Exit | Passed / run | Excluded |
+| --- | --- | ---: | ---: | ---: |
+| MA, filter installation skipped | `staff_knowledge_crash_log_test.exs` | 2 | 1/7 | 0 |
+| MB, ancestry fallback disabled | `staff_knowledge_crash_log_test.exs:83` | 2 | 0/1 | 6 |
+| MC, transport join redaction removed | `staff_knowledge_crash_log_test.exs:87` | 2 | 0/1 | 6 |
+| Bandit HTTP redaction removed | `staff_knowledge_crash_log_test.exs:22` | 2 | 0/1 | 6 |
+| Phoenix error logging suppression removed | `staff_knowledge_crash_log_test.exs:22` | 2 | 0/1 | 6 |
+| F3, ineffective route metadata restored | `staff_knowledge_live_test.exs:130` | 2 | 0/1 | 11 |
+| F5, filter error boundary removed | `staff_knowledge_crash_filter_test.exs` | 2 | 0/1 | 0 |
+| M11, any staff role admitted | `staff_knowledge_auth_test.exs:87` | 2 | 0/1 | 6 |
+| M8, effective port ignored | `staff_knowledge_auth_test.exs:122` | 2 | 0/1 | 6 |
+| M12, early endpoint guard removed | `staff_knowledge_auth_test.exs:122` | 2 | 0/1 | 6 |
+| M13, socket Origin check removed | `staff_knowledge_auth_test.exs:146` | 2 | 0/1 | 6 |
+
+The mutation lane's migration and final `git diff --exit-code -- lib test config` each exited 0. The helper itself returned 1 because its summary grep found no output for the final, clean diff. After restoration, the migration and focused seed 0 ran again on a fresh disposable database. Both steps and the helper exited 0, with 58 tests passed. The lanes removed their disposable containers and volumes. Both ports were free before and after verification.
+
+### Follow-ups
+
+- F4, C2. A task started under a staff LiveView may emit a `{Task.Supervisor, :terminating}` report with sensitive data. C1 starts no LiveView tasks. Before using `start_async` or `assign_async` in the staff views, C2 must extend redaction to task termination reports and verify it, or avoid async work in those views.
+- N3, VGAS-8. Production compile with `--warnings-as-errors` has inherited warnings outside C1, as recorded by Review 2. The verification here uses the TEST compile.
+
+### Completion assessment
+
+BUG_FIX. Author self-assessment for VGAS-003 C1 Review 2, tracked in Plane VGAS-14. Seven of seven review items passed within their assigned scope. F1 passed the dead-render, thrown-reason and public control TLS cases. F2 passed both TLS join cases and the MA, MB and MC mutation checks. F3 passed the router privacy capture and its mutation. F5 passed the OTP registration check and its mutation. F6 passed the embedding readiness assertion across the focused and full runs. F4 and N3 are recorded as follow-ups. Zero items failed, remain unverified or were left incomplete in this review scope.
+
+Implementation score is **9/10**. Requirements 4/4, observed verification 2/3, correctness and risk 2/2, and handoff 1/1. Hosted exact-head CI accounts for the verification deduction. Confidence is **90%**, based on the debug captures, 11 killed mutations and two full local seeds. Redaction depends on the pinned framework report shapes. The cause of the earlier indexing-status flake remains unconfirmed.
+
+Verification status is **VERIFIED** for the local Review 2 corrections. Merge status is `NOT_VERIFIED_FOR_MERGE`. The orchestrator owns hosted CI and independent review on the pushed head.
 
 ## Files changed
 
@@ -201,4 +279,4 @@ Verification status is **VERIFIED** for the local C1 Review 1 corrections. Merge
 - Transport and routing in `lib/voelgoed_ai_web/{endpoint,router,staff_live_socket,staff_session}.ex`.
 - Staff HTML and authorization in `lib/voelgoed_ai_web/knowledge_live/{article,auth,components,denial_controller,index,revision}.ex`.
 - First-party assets in `priv/static/staff/{knowledge.css,knowledge.js}`.
-- Test fixture and checks in `test/support/staff_knowledge_fixture.ex` and `test/voelgoed_ai_web/{staff_knowledge_auth,staff_knowledge_live,staff_knowledge_crash_log}_test.exs`.
+- Test fixture and checks in `test/support/staff_knowledge_fixture.ex` and `test/voelgoed_ai_web/staff_knowledge_{auth,live,crash_log,crash_filter}_test.exs`.
