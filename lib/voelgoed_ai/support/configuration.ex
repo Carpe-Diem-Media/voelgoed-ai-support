@@ -75,12 +75,8 @@ defmodule VoelgoedAi.Support.Configuration do
     with :ok <- lock_grant_control(action),
          {:ok, candidate} <- get(AssistantRevision, id),
          {:ok, assistant} <- get(Assistant, candidate.assistant_id, :for_update),
-         :ok <- editable_assistant(assistant),
-         {:ok, %{status: :draft} = revision} <- get(AssistantRevision, id, :for_update) do
-      revision_transition(revision, assistant, action, args, admin)
-    else
-      {:ok, _} -> {:error, :invalid_transition}
-      error -> error
+         :ok <- editable_assistant(assistant) do
+      locked_revision_action(assistant, action, args, admin)
     end
   end
 
@@ -145,6 +141,49 @@ defmodule VoelgoedAi.Support.Configuration do
   defp editable_assistant(%{status: :retired}), do: {:error, :invalid_transition}
   defp editable_assistant(_assistant), do: :ok
 
+  defp locked_revision_action(assistant, :publish, args, admin) do
+    prior_id = assistant.active_revision_id
+
+    with :ok <- expected_pointer(assistant, Map.fetch(args, :expected_active_revision_id)),
+         {:ok, rows} <- lock_publication_revisions(assistant, args.id),
+         %{status: :draft} = draft <- Map.fetch!(rows, args.id) do
+      publish_revision(draft, Map.get(rows, prior_id), assistant, admin)
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :invalid_transition}
+    end
+  end
+
+  defp locked_revision_action(assistant, action, %{id: id} = args, admin) do
+    with {:ok, %{status: :draft} = revision} <- lock_owned_revision(assistant, id) do
+      revision_transition(revision, assistant, action, args, admin)
+    else
+      {:ok, _} -> {:error, :invalid_transition}
+      error -> error
+    end
+  end
+
+  defp lock_publication_revisions(assistant, candidate_id) do
+    [candidate_id, assistant.active_revision_id]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.reduce_while({:ok, %{}}, fn id, {:ok, rows} ->
+      case lock_owned_revision(assistant, id) do
+        {:ok, row} -> {:cont, {:ok, Map.put(rows, id, row)}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp lock_owned_revision(assistant, id) do
+    case get(AssistantRevision, id, :for_update) do
+      {:ok, %{assistant_id: owner} = row} when owner == assistant.id -> {:ok, row}
+      {:ok, _} -> {:error, :invalid_revision_pointer}
+      error -> error
+    end
+  end
+
   defp revision_transition(revision, assistant, action, %{collection_id: id}, admin)
        when action in @grant_actions do
     with {:ok, %KnowledgeCollection{} = collection} <- collection(id, :for_update),
@@ -169,13 +208,12 @@ defmodule VoelgoedAi.Support.Configuration do
   defp revision_transition(revision, _assistant, :discard, _args, admin),
     do: transition(revision, %{status: :discarded}, :discard, admin)
 
-  defp revision_transition(revision, assistant, :publish, args, admin) do
-    with :ok <- expected_pointer(assistant, Map.fetch(args, :expected_active_revision_id)),
-         {:ok, grants} <- grants(revision.id),
+  defp publish_revision(revision, previous, assistant, admin) do
+    with {:ok, grants} <- grants(revision.id),
          :ok <- validate_grants(assistant, grants),
          collection_ids = Enum.map(grants, & &1.collection_id),
          {:ok, hash} <- fixture_hash(%{revision | config_hash_version: 2}, collection_ids),
-         :ok <- supersede(assistant.active_revision_id, admin),
+         :ok <- supersede(previous, admin),
          {:ok, published} <-
            change(
              revision,
@@ -292,15 +330,11 @@ defmodule VoelgoedAi.Support.Configuration do
 
   defp supersede(nil, _admin), do: :ok
 
-  defp supersede(id, admin) do
-    with {:ok, %{status: :published} = revision} <- get(AssistantRevision, id, :for_update),
-         {:ok, _} <- change(revision, %{status: :superseded}, :supersede, admin) do
-      :ok
-    else
-      {:ok, _} -> {:error, :invalid_revision_pointer}
-      error -> error
-    end
+  defp supersede(%{status: :published} = revision, admin) do
+    with {:ok, _} <- change(revision, %{status: :superseded}, :supersede, admin), do: :ok
   end
+
+  defp supersede(_, _), do: {:error, :invalid_revision_pointer}
 
   defp binding_transition(%{status: status} = binding, :enable, _args)
        when status in [:draft, :disabled] do

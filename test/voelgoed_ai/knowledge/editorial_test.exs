@@ -420,6 +420,59 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     assert {:error, _} = invoke(AssistantRevision, :remove_collection, args, ctx.admin)
   end
 
+  test "assistant publication locks its previous revision before collections", ctx do
+    public = collection(ctx)
+    assistant = create(ctx.admin, ctx.slug)
+    allow_fixture(assistant)
+    first = draft(ctx.admin, assistant)
+
+    assert {:ok, _} =
+             invoke(
+               AssistantRevision,
+               :publish,
+               %{id: first.id, expected_active_revision_id: nil},
+               ctx.admin
+             )
+
+    next = draft(ctx.admin, assistant)
+
+    assert {:ok, _} =
+             invoke(
+               AssistantRevision,
+               :grant_collection,
+               %{id: next.id, collection_id: public.id},
+               ctx.admin
+             )
+
+    assert {:ok, task} =
+             Repo.transact(fn ->
+               SQL.query!(Repo, "SELECT id FROM assistant_revisions WHERE id = $1 FOR UPDATE", [
+                 Ecto.UUID.dump!(first.id)
+               ])
+
+               task =
+                 blocked_task(fn ->
+                   invoke(
+                     AssistantRevision,
+                     :publish,
+                     %{id: next.id, expected_active_revision_id: first.id},
+                     ctx.admin
+                   )
+                 end)
+
+               assert %{num_rows: 1} =
+                        SQL.query!(
+                          Repo,
+                          "SELECT id FROM knowledge_collections WHERE id = $1 FOR UPDATE NOWAIT",
+                          [Ecto.UUID.dump!(public.id)]
+                        )
+
+               {:ok, task}
+             end)
+
+    assert {:ok, %{status: :published}} = Task.await(task, 5_000)
+  end
+
   test "portable import rejects tampering, PII and collisions and round trips a draft", ctx do
     collection = collection(ctx)
     args = draft_args(ctx, collection)
