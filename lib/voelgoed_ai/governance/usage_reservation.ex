@@ -68,7 +68,8 @@ defmodule VoelgoedAi.Governance.UsageReservation do
           :invalid_vector,
           :amount_overflow,
           :over_reserve,
-          :conservative_closure
+          :conservative_closure,
+          :admission_denied
         ]
       ]
     )

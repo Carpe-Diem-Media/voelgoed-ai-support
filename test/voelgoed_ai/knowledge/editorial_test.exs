@@ -536,6 +536,32 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
   @tag :requires_pgvector
   @tag :embedding_index
+  test "an inhibit committed after the reservation stops dispatch and releases the hold",
+       ctx do
+    {_collection, revision} = approved(ctx)
+    parent = self()
+
+    fixture(%{
+      wire: fn request ->
+        send(parent, :wire_hit)
+        EmbeddingTransport.fixture_wire(request)
+      end,
+      after_claim: fn _ ->
+        SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = true")
+        :ok
+      end
+    })
+
+    [id, _] = request_index(ctx, revision)
+    assert :ok = Embedding.index(id)
+    assert [["rejected", false, "released", 81_920, nil]] = reservation_rows(id)
+    assert [] == ledger_rows(id)
+    assert [["failed", nil]] = vector_rows(id)
+    refute_receive :wire_hit, 50
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
   test "settlement uses frozen trusted usage and inhibits admission on excess", ctx do
     {_collection, revision} = approved(ctx)
     parent = self()
