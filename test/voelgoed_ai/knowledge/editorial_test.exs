@@ -29,7 +29,9 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
         [ctx.slug]
       )
 
-      SQL.query(Repo, "DELETE FROM article_revisions WHERE created_by_id::text = $1", [editor.id])
+      SQL.query(Repo, "DELETE FROM article_revisions WHERE created_by_id::text = ANY($1)", [
+        [editor.id, reviewer.id]
+      ])
 
       SQL.query(Repo, "DELETE FROM articles WHERE owner_id::text = ANY($1)", [
         [editor.id, reviewer.id]
@@ -71,8 +73,8 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
   test "review guards the exact snapshot and rollback keeps the prior state", ctx do
     collection = collection(ctx)
     revision = draft_revision(ctx, collection)
-    args = snapshot(revision)
     submitted = review(ctx, revision)
+    args = snapshot(submitted)
 
     assert {:error, _} =
              invoke(
@@ -129,6 +131,16 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     rev = draft_revision(ctx, collection)
     read = %{id: rev.id}
 
+    assert {:ok, second} =
+             invoke(
+               ArticleRevision,
+               :create_draft,
+               %{article_id: rev.article_id, content: payload()},
+               ctx.editor
+             )
+
+    reviewed = review(ctx, second)
+
     for {resource, action, args, wrong_role} <- [
           {Article, :create_draft, draft_args(ctx, collection), ctx.reviewer},
           {ArticleRevision, :create_draft, %{article_id: rev.article_id, content: payload()},
@@ -136,9 +148,10 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
           {ArticleRevision, :edit_draft, Map.put(snapshot(rev), :content, payload()),
            ctx.reviewer},
           {ArticleRevision, :submit_review, snapshot(rev), ctx.reviewer},
-          {ArticleRevision, :request_changes, Map.put(snapshot(rev), :reason, :source_correction),
+          {ArticleRevision, :request_changes,
+           Map.put(snapshot(reviewed), :reason, :source_correction), ctx.editor},
+          {ArticleRevision, :approve, Map.put(attest(snapshot(reviewed)), :self_approval, true),
            ctx.editor},
-          {ArticleRevision, :approve, attest(snapshot(rev)), ctx.editor},
           {ArticleRevision, :withdraw, Map.put(snapshot(rev), :reason, :withdrawn_by_staff), nil},
           {Article, :archive, %{id: rev.article_id, reason: :obsolete}, ctx.editor},
           {ArticleRevision, :read_revision, read, nil}
@@ -148,6 +161,7 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
             ctx.admin,
             wrong_role,
             %{ctx.editor | generation: ctx.editor.generation + 1},
+            %{ctx.reviewer | generation: ctx.reviewer.generation + 1},
             struct(VoelgoedAi.Support.ActionScope.Processing,
               action: action,
               resource: resource,
@@ -273,6 +287,17 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     equivalent_time = %{reversed | "effective_from" => "2026-01-01T02:00:00+02:00"}
     assert {:ok, equivalent} = Content.parse(equivalent_time)
     assert Content.hash(equivalent) == hash
+    scope = %{"product" => ["synthetic-z", "synthetic-a"]}
+    assert {:ok, scoped} = Content.parse(%{payload() | "applicability" => scope})
+
+    assert {:ok, reversed_scope} =
+             Content.parse(%{
+               payload()
+               | "applicability" => %{"product" => Enum.reverse(scope["product"])}
+             })
+
+    assert Content.hash(scoped) == Content.hash(reversed_scope)
+    refute Content.hash(scoped) == hash
 
     assert {:ok, changed} =
              Content.parse(
@@ -469,7 +494,21 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
                )
              )
 
-    assert {:ok, %{articles: [%{outcome: :create}]}} = invoke_import.(:apply_import, doc)
+    canonical = elem(Content.parse(payload()), 1)
+
+    pii =
+      put_in(
+        canonical,
+        ["localized_content", Access.at(0), "approved_answer"],
+        "Contact customer@example.test"
+      )
+
+    pii_entry = %{entry | "content" => pii, "source_content_hash" => Content.hash(pii)}
+    assert {:error, _} = invoke_import.(:apply_import, %{doc | "articles" => [pii_entry]})
+
+    assert {:ok, %{articles: [%{outcome: :create, revision_id: revision_id}]}} =
+             invoke_import.(:apply_import, doc)
+
     assert {:ok, %{articles: [%{outcome: :existing}]}} = invoke_import.(:apply_import, doc)
 
     assert {:error, _} =
@@ -494,6 +533,53 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
     assert Jason.decode!(exported) ==
              put_in(doc, ["articles", Access.at(0), "content"], elem(Content.parse(payload()), 1))
+
+    assert {:ok, %{articles: [%{outcome: :existing}]}} =
+             invoke_import.(:apply_import, Jason.decode!(exported))
+
+    assert {:ok, original} =
+             invoke(ArticleRevision, :read_revision, %{id: revision_id}, ctx.reviewer)
+
+    reviewed = review(ctx, original)
+
+    assert {:ok, %{status: :approved}} =
+             invoke(ArticleRevision, :approve, attest(snapshot(reviewed)), ctx.reviewer)
+
+    changed =
+      put_in(
+        canonical,
+        ["localized_content", Access.at(0), "approved_answer"],
+        "Nuwe sintetiese antwoord."
+      )
+
+    changed_entry = %{
+      entry
+      | "content" => changed,
+        "source_content_hash" => Content.hash(changed)
+    }
+
+    changed_doc = %{doc | "articles" => [changed_entry]}
+    assert {:error, _} = invoke_import.(:apply_import, changed_doc)
+
+    assert {:ok, %{articles: [%{outcome: :new_revision, revision_id: new_id}]}} =
+             invoke(
+               KnowledgeCollection,
+               :apply_import,
+               %{
+                 id: collection.id,
+                 document: Jason.encode!(changed_doc),
+                 new_revision_for: original.article_id
+               },
+               ctx.editor
+             )
+
+    assert {:ok, %{revision_number: 2, status: :draft}} =
+             invoke(ArticleRevision, :read_revision, %{id: new_id}, ctx.editor)
+
+    assert {:ok, %{status: :approved, content_hash: hash}} =
+             invoke(ArticleRevision, :read_revision, %{id: original.id}, ctx.reviewer)
+
+    assert hash == original.content_hash
 
     assert {:ok, collection_other} =
              invoke(
