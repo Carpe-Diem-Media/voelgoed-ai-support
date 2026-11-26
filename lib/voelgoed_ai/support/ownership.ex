@@ -188,9 +188,7 @@ defmodule VoelgoedAi.Support.Ownership do
 
   @doc false
   def human_takeover(%{state: state} = session, attrs, now)
-      when state in [:unverified, :bot_active, :handoff_pending] do
-    # The signed takeover fences a staged handoff like any other unsent work.
-    # A consumed dispatch remains uncertain until independently reconciled.
+      when state in [:unverified, :bot_active] do
     with :ok <- fence(session, now, :human_takeover),
          {:ok, updated} <-
            store_update(
@@ -208,6 +206,15 @@ defmodule VoelgoedAi.Support.Ownership do
   def human_takeover(%{state: :closed} = session, _attrs, _now), do: {:ok, session}
 
   def human_takeover(session, attrs, _now), do: store_update(session, :verify_owner, attrs)
+
+  @doc false
+  def signed_handoff_takeover_attributes(%{state: :handoff_pending} = session, now) do
+    # Signed ingress fences the intent in the same transaction as takeover.
+    # A consumed dispatch stays uncertain until independently reconciled.
+    with :ok <- fence(session, now, :human_takeover) do
+      {:ok, next_epoch(session)}
+    end
+  end
 
   @doc false
   def close_locked(session, observation, now) do

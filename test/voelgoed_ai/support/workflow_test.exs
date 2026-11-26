@@ -467,6 +467,57 @@ defmodule VoelgoedAi.Support.WorkflowTest do
     end
   end
 
+  for change <- [%{contact: 6}, %{status: :open, assignee: :human}, %{status: :resolved}] do
+    test "an overdue receipt with #{inspect(change)} does not stage a handoff", ctx do
+      SupportDBCase.prepare_reply(ctx)
+      receipt = next_input(ctx)
+
+      Agent.update(ctx.fake, fn fake ->
+        %{fake | observation: struct!(fake.observation, unquote(Macro.escape(change)))}
+      end)
+
+      # Start the receipt GET with time left, then cross the cutoff while
+      # the fake holds its response. A GET started at cutoff returns unavailable.
+      SupportDBCase.block_next_conversation(ctx, self())
+      task = Task.async(fn -> RunProcessing.process_event(receipt) end)
+      assert_receive {:chatwoot_read, worker}, 1_000
+      SupportDBCase.advance_clock(ctx, 45)
+      send(worker, :resume_chatwoot_read)
+      assert :ok = Task.await(task)
+
+      assert_overdue_without_handoff(ctx, receipt)
+    end
+  end
+
+  test "an overdue shadow receipt cannot stage a handoff for a disabled binding", ctx do
+    SupportDBCase.prepare_reply(ctx)
+    receipt = next_input(ctx)
+
+    for {action, attrs} <- [change_mode: %{operating_mode: :shadow}, disable: %{}] do
+      assert {:ok, _} =
+               VoelgoedAi.SupportFixtures.invoke(
+                 InboxBinding,
+                 action,
+                 Map.put(attrs, :id, ctx.binding_id),
+                 ctx.admin
+               )
+    end
+
+    SupportDBCase.advance_clock(ctx, 45)
+    assert :ok = RunProcessing.process_event(receipt)
+    assert_overdue_without_handoff(ctx, receipt)
+  end
+
+  defp assert_overdue_without_handoff(ctx, receipt) do
+    assert [["support_worker", "inbound_event", "missed_deadline", "deadline"]] =
+             SupportDBCase.audit_rows(:event_target_id, receipt)
+
+    assert %{rows: [["public_reply", "pending"]]} =
+             SupportDBCase.delivery_rows(ctx, "purpose, state")
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   test "an overdue shadow route records an inhibit and never posts a reply or status", ctx do
     reply = SupportDBCase.prepare_reply(ctx)
 
@@ -624,11 +675,16 @@ defmodule VoelgoedAi.Support.WorkflowTest do
   end
 
   defp overdue_input(ctx) do
+    receipt = next_input(ctx)
+    SupportDBCase.advance_clock(ctx, 45)
+    receipt
+  end
+
+  defp next_input(ctx) do
     now = VoelgoedAi.Support.ChatwootAdapter.now()
     message = ctx.event.message_id + 1
     SupportDBCase.append_public_input(ctx, message)
     assert {:ok, receipt} = Ingress.accept(%{ctx.event | message_id: message, received_at: now})
-    SupportDBCase.advance_clock(ctx, 45)
     receipt
   end
 

@@ -133,7 +133,7 @@ defmodule VoelgoedAi.Support.Ingress do
   defp signed_human_inhibit(%{kind: :human_outbound} = event, config) do
     with {:ok, session} <- Ownership.ensure_session(config, event),
          true <- session.contact_id == event.contact_id do
-      Ownership.human_takeover(session, %{}, ChatwootAdapter.now())
+      apply_signed_human_reply(session, ChatwootAdapter.now())
     else
       false -> {:error, :scope_denied}
       error -> error
@@ -141,6 +141,14 @@ defmodule VoelgoedAi.Support.Ingress do
   end
 
   defp signed_human_inhibit(_, _), do: {:ok, nil}
+
+  defp apply_signed_human_reply(%{state: :handoff_pending} = session, now) do
+    with {:ok, attrs} <- Ownership.signed_handoff_takeover_attributes(session, now) do
+      store_update(session, :observe_signed_handoff_takeover, attrs)
+    end
+  end
+
+  defp apply_signed_human_reply(session, now), do: Ownership.human_takeover(session, %{}, now)
 
   defp dispatch(event, attrs) do
     job =

@@ -189,12 +189,19 @@ defmodule VoelgoedAi.Support.SupportSession do
       require_atomic?(false)
       accept([:ownership_epoch, :observed_status, :observed_assignee, :observed_at])
 
-      validate(
-        {VoelgoedAi.Support.FromState, states: [:unverified, :bot_active, :handoff_pending]}
-      )
+      validate({VoelgoedAi.Support.FromState, states: [:unverified, :bot_active]})
 
       change(set_attribute(:state, :human_active))
       change(set_attribute(:human_inhibit, true))
+    end
+
+    update :observe_signed_handoff_takeover do
+      transaction?(false)
+      require_atomic?(false)
+      accept([:ownership_epoch])
+
+      validate({VoelgoedAi.Support.FromState, states: [:handoff_pending]})
+      change(set_attribute(:state, :human_active))
     end
 
     update :request_handoff do
@@ -276,6 +283,7 @@ defmodule VoelgoedAi.Support.SupportSession do
              :register,
              :activate_bot,
              :observe_human_takeover,
+             :observe_signed_handoff_takeover,
              :request_handoff,
              :confirm_handoff,
              :return_to_bot,

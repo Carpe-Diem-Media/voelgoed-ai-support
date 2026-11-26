@@ -856,6 +856,28 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert [_] = SupportDBCase.writes(ctx)
   end
 
+  test "abandoning an unknown reply preserves the pending handoff", ctx do
+    reply = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :timeout)
+    assert :ok = Delivery.deliver(reply)
+    assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+
+    assert {:ok, _} = Support.request_handoff(ctx.operator, SupportDBCase.session_id(ctx))
+    assert %{rows: [[handoff, "pending"]]} = handoff_rows(ctx, "id::text, state")
+
+    assert {:ok, %{state: :abandoned}} =
+             Support.abandon_delivery(ctx.operator, reply, :acknowledge_uncertainty)
+
+    assert %{rows: [["pending", 0]]} = handoff_rows(ctx, "state, attempt_count")
+    assert_handoff_inhibited(ctx)
+    assert :ok = Delivery.deliver(handoff)
+
+    assert %{rows: [["sent", "accepted", 1]]} =
+             handoff_rows(ctx, "state, reason_code, attempt_count")
+
+    assert [{:reply, _, _, _}, {:handoff, _, _}] = SupportDBCase.writes(ctx)
+  end
+
   test "an untrusted caller cannot mint or forge operator storage authority", ctx do
     alias VoelgoedAi.Support.{Ownership, WorkStore}
 
@@ -939,6 +961,7 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
 
     for {module, resource, action} <- [
           {Support, OutboundDelivery, :abandon},
+          {Ingress, SupportSession, :observe_signed_handoff_takeover},
           {Support, SupportSession, :return_to_bot},
           {Support, AuditEvent, :append_support_operator},
           {Delivery, OutboundDelivery, :authorize_dispatch},
@@ -949,6 +972,8 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
 
     for {module, resource, action} <- [
           {Ingress, SupportSession, :return_to_bot},
+          {Ownership, SupportSession, :observe_signed_handoff_takeover},
+          {Support, SupportSession, :observe_signed_handoff_takeover},
           {Delivery, OutboundDelivery, :abandon},
           {Recovery, OutboundDelivery, :authorize_dispatch},
           {RunProcessing, OutboundDelivery, :confirm_sent},
@@ -969,6 +994,8 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
           {%OutboundDelivery{state: :unknown}, :safe_retry, %{claim_generation: 1}, :state},
           {%SupportRun{state: :completed}, :claim, %{}, :state},
           {%SupportSession{state: :closed}, :return_to_bot, %{}, :state},
+          {%SupportSession{state: :handoff_pending}, :observe_human_takeover,
+           %{ownership_epoch: 1}, :state},
           {%InboundEvent{state: :dispatched}, :dispatch, %{}, :state},
           {%InboundEvent{state: :dispatched, disposition: :covered}, :record_disposition,
            %{disposition: :triage}, :disposition},
@@ -1173,6 +1200,11 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
       &%{&1 | observation: %{&1.observation | status: :open, assignee: :human}}
     )
 
+    process_conversation_observation(ctx, "conversation_updated")
+    assert_handoff_inhibited(ctx)
+    assert %{rows: [["human"]]} = session_state(ctx, "observed_assignee")
+    assert %{rows: [["pending", 0]]} = handoff_rows(ctx, "state, attempt_count")
+
     assert :ok = Delivery.deliver(id)
 
     assert %{rows: [["sent", "already_human", 0, nil, %NaiveDateTime{}]]} =
@@ -1254,14 +1286,20 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
 
   defp observe_resolution(ctx) do
     Agent.update(ctx.fake, &put_in(&1.observation.status, :resolved))
+    process_conversation_observation(ctx, "conversation_status_changed")
+  end
 
-    assert SupportDBCase.signed_request(ctx, &Map.put(&1, "event", "conversation_updated")).status ==
+  defp process_conversation_observation(ctx, event_type) do
+    assert SupportDBCase.signed_request(ctx, &Map.put(&1, "event", event_type)).status ==
              204
 
     assert %{rows: [[receipt]]} =
              SQL.query!(
                Repo,
-               "SELECT id::text FROM inbound_events WHERE conversation_id = $1 AND message_id IS NULL",
+               """
+               SELECT id::text FROM inbound_events
+               WHERE conversation_id = $1 AND message_id IS NULL AND disposition = 'pending'
+               """,
                [ctx.event.conversation_id]
              )
 
