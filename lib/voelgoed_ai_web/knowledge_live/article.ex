@@ -3,6 +3,7 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Article do
   use Phoenix.LiveView, layout: false, log: false
 
   import VoelgoedAiWeb.KnowledgeLive.Components
+  import VoelgoedAiWeb.KnowledgeLive.Forms
   alias VoelgoedAi.Knowledge.{Article, ArticleRevision}
   alias VoelgoedAiWeb.KnowledgeLive.Auth
 
@@ -18,9 +19,32 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Article do
   end
 
   @impl true
+  def handle_event("archive", params, socket) do
+    article = socket.assigns.page.article
+
+    with true <- submitted?(params, socket) and confirmed?(params),
+         true <- article.action_hints.archive and params["reason"] == "obsolete",
+         {:ok, _} <-
+           run(Article, :archive, %{id: article.id, reason: :obsolete}, Auth.actor(socket)) do
+      {:noreply, socket |> Auth.reload() |> assign(:notice, "Article archived.")}
+    else
+      _ ->
+        {:noreply,
+         assign(
+           socket,
+           :notice,
+           "The article could not be archived. Reload to confirm its state."
+         )}
+    end
+  end
+
+  def handle_event(_, _, socket), do: {:noreply, socket}
+
+  @impl true
   def render(%{status: :ready} = assigns) do
     ~H"""
     <.sheet title={@page.article.slug} back={"/staff/knowledge/collections/#{@page.article.collection_id}"} back_text="Collection">
+      <.feedback id="article-feedback" notice={@notice} />
       <dl class="metadata">
         <div><dt>Reference</dt><dd>{@page.article.article_ref}</dd></div>
         <div><dt>State</dt><dd>{label(@page.article.status)}</dd></div>
@@ -45,6 +69,11 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Article do
         </tbody>
       </table>
       <.pagination page={@page.list} path={"/staff/knowledge/articles/#{@page.article.id}"} cursor={@page.cursor} />
+      <div :if={@page.article.action_hints.create_draft} class="form-links">
+        <a href={"/staff/knowledge/articles/#{@page.article.id}/revisions/new"}>New revision</a>
+      </div>
+      <.decision :if={@page.article.action_hints.archive} id="archive" event="archive"
+        title="Archive article" reasons={[:obsolete]} token={@form_token} connected={@connected} />
     </.sheet>
     """
   end

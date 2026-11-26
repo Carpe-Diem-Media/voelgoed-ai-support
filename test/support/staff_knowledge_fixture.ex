@@ -89,6 +89,36 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
     request_status(:https, path, [{"Host", @host}, {"Connection", "close"} | headers])
   end
 
+  def https_post_status(path, cookie, body) do
+    headers = [
+      {"Host", @host},
+      {"Connection", "close"},
+      {"Cookie", "_vgas_staff=" <> cookie},
+      {"Content-Type", "application/x-www-form-urlencoded"},
+      {"Content-Length", Integer.to_string(byte_size(body))}
+    ]
+
+    {:ssl, socket} = connect(:https)
+
+    try do
+      :ok =
+        :ssl.send(socket, [
+          "POST ",
+          path,
+          " HTTP/1.1\r\n",
+          for({name, value} <- headers, do: [name, ": ", value, "\r\n"]),
+          "\r\n",
+          body
+        ])
+
+      {:ok, status} = :ssl.recv(socket, 0, 5_000)
+      [_, code | _] = String.split(status, " ", parts: 3)
+      String.to_integer(code)
+    after
+      :ssl.close(socket)
+    end
+  end
+
   def upgrade(transport, cookie, csrf, origin, header_overrides \\ []) do
     {path, headers} = upgrade_request(cookie, csrf, origin)
     request_status(transport, path, Map.merge(headers, Map.new(header_overrides)))

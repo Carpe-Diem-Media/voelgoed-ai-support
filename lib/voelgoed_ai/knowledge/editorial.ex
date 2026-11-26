@@ -199,8 +199,15 @@ defmodule VoelgoedAi.Knowledge.Editorial do
          do: history_scope(:knowledge_article, row.article_id, staff)
   end
 
-  defp collection_action(collection, :read_collection, _args, _staff),
-    do: {:ok, collection_view(collection)}
+  defp collection_action(collection, :read_collection, _args, staff),
+    do:
+      {:ok,
+       Map.put(collection_view(collection), :action_hints, %{
+         manage: :admin in staff.roles,
+         create_draft: collection.status == :active and scoped?(collection.id, staff, @editor),
+         import: collection.status == :active and scoped?(collection.id, staff, @editor),
+         export: collection.status == :active and scoped?(collection.id, staff, @reviewer)
+       })}
 
   defp collection_action(collection, action, args, staff)
        when action in [:preview_import, :apply_import, :export_articles] do
@@ -220,8 +227,15 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   defp collection_state(:disabled, :retire), do: {:ok, :retired}
   defp collection_state(_, _), do: {:error, :invalid_transition}
 
-  defp article_action(_collection, article, :read_article, _args, _staff),
-    do: {:ok, article_view(article)}
+  defp article_action(collection, article, :read_article, _args, staff) do
+    {:ok,
+     Map.put(article_view(article), :action_hints, %{
+       create_draft:
+         collection.status == :active and article.status == :active and
+           scoped?(collection.id, staff, @editor),
+       archive: article.status == :active and scoped?(collection.id, staff, @reviewer)
+     })}
+  end
 
   defp article_action(_collection, article, :archive, args, staff) do
     with :ok <- active(article),
@@ -271,17 +285,9 @@ defmodule VoelgoedAi.Knowledge.Editorial do
         |> Map.merge(%{
           updated_at: row.updated_at,
           self_approval_required: self_approval?,
-          index_status: locale_status(row, active_index, pending_index),
-          action_hints: %{
-            edit_draft:
-              row.status == :draft and collection.status == :active and
-                article.status == :active and scoped?(collection.id, staff, @editor),
-            approve:
-              row.status == :in_review and collection.status == :active and
-                article.status == :active and scoped?(collection.id, staff, @reviewer) and
-                row.content["sensitive"] != true
-          }
+          index_status: locale_status(row, active_index, pending_index)
         })
+        |> Map.merge(revision_controls(collection, article, row, staff))
 
       {:ok, view}
     end
@@ -385,6 +391,79 @@ defmodule VoelgoedAi.Knowledge.Editorial do
       {:ok, revision_view(result)}
     end
   end
+
+  # These hints control affordances. The actions repeat their own guards under lock.
+  defp revision_controls(collection, article, row, staff) do
+    active? = collection.status == :active and article.status == :active
+    editor? = scoped?(collection.id, staff, @editor)
+    reviewer? = scoped?(collection.id, staff, @reviewer)
+
+    public? =
+      collection.audience == :public and row.content["sensitive"] != true and
+        row.content["response_mode"] != "escalate_only"
+
+    index_args = %{
+      expected_generation: row.active_index_generation,
+      expected_index_epoch: row.index_epoch,
+      expected_hash: row.content_hash
+    }
+
+    current_index? =
+      reviewer? and row.status == :published and
+        current_index(collection, article, row, index_args) == :ok
+
+    publication_candidate? =
+      active? and reviewer? and public? and row.status in [:approved, :publish_failed]
+
+    deadline =
+      if publication_candidate? or current_index?, do: Embedding.publication_deadline(row.content)
+
+    can_publish? = match?({:ok, _}, deadline)
+
+    %{
+      action_hints: %{
+        edit_draft: active? and editor? and row.status == :draft,
+        submit_review: active? and editor? and row.status == :draft,
+        withdraw: active? and (editor? or reviewer?) and row.status in [:draft, :in_review],
+        request_changes: active? and reviewer? and row.status == :in_review,
+        approve:
+          active? and reviewer? and row.status == :in_review and row.content["sensitive"] != true,
+        request_publish: publication_candidate? and row.status == :approved and can_publish?,
+        retry_publication:
+          publication_candidate? and row.status == :publish_failed and can_publish?,
+        request_reindex: current_index? and can_publish?,
+        # Rollback reuses a retained index without requesting embeddings.
+        request_index_rollback:
+          current_index? and Publication.rollback_available() == :ok and
+            is_integer(row.retained_index_generation),
+        revoke:
+          article.status == :active and reviewer? and
+            row.status in [:approved, :publishing, :publish_failed, :published]
+      },
+      publication_blocker:
+        if(publication_candidate?, do: publication_blocker(deadline, row.content))
+    }
+  end
+
+  # The deadline decides eligibility. Dates only explain a refusal to the reviewer.
+  defp publication_blocker({:error, :stale_request}, content) do
+    now = Embedding.now()
+
+    cond do
+      content_date_order(content["effective_from"], now) == :gt -> :not_yet_effective
+      content_date_order(content["expires_at"], now) in [:lt, :eq] -> :expired
+      true -> :unavailable
+    end
+  end
+
+  defp publication_blocker({:error, _}, _), do: :unavailable
+  defp publication_blocker({:ok, _}, _), do: nil
+
+  defp content_date_order(value, now) when is_binary(value) do
+    with {:ok, date, 0} <- DateTime.from_iso8601(value), do: DateTime.compare(date, now)
+  end
+
+  defp content_date_order(nil, _), do: nil
 
   defp current_index(collection, article, row, args) do
     with :ok <- active(collection),
