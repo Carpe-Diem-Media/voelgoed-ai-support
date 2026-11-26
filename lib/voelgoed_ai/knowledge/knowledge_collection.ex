@@ -74,6 +74,16 @@ defmodule VoelgoedAi.Knowledge.KnowledgeCollection do
       run(Editorial)
     end
 
+    action :list_collections, :map do
+      description(
+        "List permitted collections in ascending ID order. Pass the returned cursor to continue."
+      )
+
+      argument(:after_id, :uuid)
+      argument(:limit, :integer, allow_nil?: false, default: 50, constraints: [min: 1, max: 50])
+      run(Editorial)
+    end
+
     action :read_collection, :map do
       argument(:id, :uuid, allow_nil?: false)
       run(Editorial)
@@ -115,6 +125,8 @@ defmodule VoelgoedAi.Knowledge.KnowledgeCollection do
       run(Editorial)
     end
 
+    read(:editorial_page)
+
     read :storage_row do
       argument(:id, :uuid, allow_nil?: false)
       filter(expr(id == ^arg(:id)))
@@ -139,6 +151,7 @@ defmodule VoelgoedAi.Knowledge.KnowledgeCollection do
              :disable,
              :retire,
              :read_collection,
+             :list_collections,
              :export_articles,
              :preview_import,
              :apply_import
@@ -147,6 +160,10 @@ defmodule VoelgoedAi.Knowledge.KnowledgeCollection do
     end
 
     policy action([:insert_row, :change_row]) do
+      authorize_if(Storage)
+    end
+
+    policy action(:editorial_page) do
       authorize_if(Storage)
     end
 

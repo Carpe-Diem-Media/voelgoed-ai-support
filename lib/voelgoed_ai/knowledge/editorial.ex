@@ -9,6 +9,8 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   use Ash.Resource.Actions.Implementation
   use Ash.Policy.SimpleCheck
 
+  require Ash.Query
+
   alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Accounts.StaffAccess.Session
   alias VoelgoedAi.Governance.AuditEvent
@@ -30,7 +32,15 @@ defmodule VoelgoedAi.Knowledge.Editorial do
 
   @editor :knowledge_editor
   @reviewer :knowledge_reviewer
-  @read_actions [:read_collection, :read_article, :read_revision, :knowledge_history]
+  @read_actions [
+    :read_collection,
+    :read_article,
+    :read_revision,
+    :knowledge_history,
+    :list_collections,
+    :list_articles,
+    :list_revisions
+  ]
   @collection_admin [:create, :enable, :disable, :retire]
   @editor_actions [:create_draft, :edit_draft, :submit_review, :preview_import, :apply_import]
   @reviewer_actions [
@@ -75,6 +85,20 @@ defmodule VoelgoedAi.Knowledge.Editorial do
          do: {:ok, collection_view(row)}
   end
 
+  defp execute(KnowledgeCollection, :list_collections, args, staff) do
+    cond do
+      :admin in staff.roles ->
+        page(KnowledgeCollection, args, [], &collection_view/1)
+
+      Enum.any?([@editor, @reviewer], &(&1 in staff.roles)) ->
+        ids = for {id, _} <- fixture_scope(), editorial_scope?(id, staff), do: id
+        page(KnowledgeCollection, args, [id: [in: ids]], &collection_view/1)
+
+      true ->
+        {:error, :denied}
+    end
+  end
+
   defp execute(KnowledgeCollection, action, %{id: id} = args, staff) do
     with {:ok, collection} <- get(KnowledgeCollection, id, :for_update),
          :ok <- authorize_collection(collection, staff, action) do
@@ -93,6 +117,13 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     end
   end
 
+  defp execute(Article, :list_articles, %{collection_id: id} = args, staff) do
+    with {:ok, collection} <- get(KnowledgeCollection, id, :for_update),
+         :ok <- authorize_collection(collection, staff, :list_articles) do
+      page(Article, args, [collection_id: id], &article_view/1)
+    end
+  end
+
   defp execute(Article, action, %{id: id} = args, staff) do
     with {:ok, collection, article} <- lock_article(id, staff, action) do
       article_action(collection, article, action, args, staff)
@@ -106,6 +137,18 @@ defmodule VoelgoedAi.Knowledge.Editorial do
          {:ok, content} <- Content.parse(args.content),
          {:ok, row} <- create_revision(article, content, staff) do
       {:ok, revision_view(row)}
+    end
+  end
+
+  defp execute(ArticleRevision, :list_revisions, %{article_id: id} = args, staff) do
+    with {:ok, _collection, article} <- lock_article(id, staff, :list_revisions) do
+      page(ArticleRevision, args, [article_id: article.id], &revision_summary/1, [
+        :id,
+        :article_id,
+        :revision_number,
+        :status,
+        :updated_at
+      ])
     end
   end
 
@@ -216,8 +259,33 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     end
   end
 
-  defp revision_action(_collection, _article, row, :read_revision, _args, _staff),
-    do: {:ok, revision_view(row)}
+  defp revision_action(collection, article, row, :read_revision, _args, staff) do
+    with {:ok, active_index} <- index_rows(row.id, row.active_index_generation),
+         {:ok, pending_index} <- index_rows(row.id, pending_generation(row)) do
+      self_approval? = contributor?(row, staff)
+
+      view =
+        row
+        |> revision_view()
+        |> Map.drop([:created_by_id, :approved_by_id, :publication_requested_by_id])
+        |> Map.merge(%{
+          updated_at: row.updated_at,
+          self_approval_required: self_approval?,
+          index_status: locale_status(row, active_index, pending_index),
+          action_hints: %{
+            edit_draft:
+              row.status == :draft and collection.status == :active and
+                article.status == :active and scoped?(collection.id, staff, @editor),
+            approve:
+              row.status == :in_review and collection.status == :active and
+                article.status == :active and scoped?(collection.id, staff, @reviewer) and
+                row.content["sensitive"] != true
+          }
+        })
+
+      {:ok, view}
+    end
+  end
 
   defp revision_action(collection, article, row, action, args, staff)
        when action in [:request_publish, :retry_publication] do
@@ -481,7 +549,7 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   end
 
   defp revision_transition(%{status: :in_review} = row, :approve, args, staff) do
-    self? = staff.id in row.contributor_ids
+    self? = contributor?(row, staff)
 
     with :ok <- review_snapshot(row),
          true <-
@@ -504,6 +572,8 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   defp revision_transition(_, _, _, _), do: {:error, :invalid_transition}
 
   # The revision stays locked through the transition and its audit write.
+  defp contributor?(row, staff), do: staff.id in row.contributor_ids
+
   defp record_contributor(row, staff), do: Enum.uniq([staff.id | row.contributor_ids])
 
   defp review_snapshot(%{review_hash: hash, content_hash: hash}) when is_binary(hash), do: :ok
@@ -528,6 +598,9 @@ defmodule VoelgoedAi.Knowledge.Editorial do
         Enum.any?(roles, &scoped?(row.id, staff, &1))
     )
   end
+
+  defp editorial_scope?(id, staff),
+    do: scoped?(id, staff, @editor) or scoped?(id, staff, @reviewer)
 
   defp scoped?(id, staff, role) do
     key = if role == @editor, do: :editors, else: :reviewers
@@ -748,6 +821,77 @@ defmodule VoelgoedAi.Knowledge.Editorial do
       error -> error
     end
   end
+
+  defp page(resource, args, filters, project, fields \\ nil) do
+    storage(resource, :editorial_page, fn actor ->
+      query =
+        resource
+        |> Ash.Query.for_read(:editorial_page, %{}, actor: actor)
+        |> Ash.Query.filter(^filters)
+        |> Ash.Query.sort(:id)
+        |> Ash.Query.limit(args.limit + 1)
+
+      after_id = Map.get(args, :after_id)
+      query = if after_id, do: Ash.Query.filter(query, id > ^after_id), else: query
+      query = if fields, do: Ash.Query.select(query, fields), else: query
+
+      with {:ok, rows} <- Ash.read(query) do
+        {items, extra} = Enum.split(rows, args.limit)
+        next_after_id = if extra != [], do: List.last(items).id
+        {:ok, %{items: Enum.map(items, project), next_after_id: next_after_id}}
+      end
+    end)
+  end
+
+  defp revision_summary(row),
+    do: Map.take(row, [:id, :article_id, :revision_number, :status, :updated_at])
+
+  defp pending_generation(row) do
+    if Publication.pending?(row) or not is_nil(row.publication_reason),
+      do: row.publication_generation
+  end
+
+  defp index_rows(_id, nil), do: {:ok, []}
+
+  defp index_rows(id, generation) do
+    storage(ArticleEmbedding, :generation_rows, fn actor ->
+      ArticleEmbedding
+      |> Ash.Query.for_read(:generation_rows, %{revision_id: id, generation: generation},
+        actor: actor
+      )
+      |> Ash.Query.select([:locale, :state])
+      |> Ash.read()
+    end)
+  end
+
+  defp locale_status(row, active, pending) do
+    present = Enum.map(row.content["localized_content"], & &1["locale"])
+
+    Map.new(["af-ZA", "en-ZA"], fn locale ->
+      status =
+        if locale in present do
+          %{
+            active:
+              if(Enum.any?(active, &(&1.locale == locale and &1.state == :ready)),
+                do: :active,
+                else: :not_indexed
+              ),
+            pending:
+              pending_status(Enum.find(pending, &(&1.locale == locale)), row.publication_reason)
+          }
+        else
+          %{active: :absent, pending: :absent}
+        end
+
+      {locale, status}
+    end)
+  end
+
+  defp pending_status(%{state: :failed}, _reason), do: :failed
+  defp pending_status(_row, reason) when not is_nil(reason), do: :failed
+  defp pending_status(%{state: :ready}, _reason), do: :ready_to_activate
+  defp pending_status(%{state: state}, _reason) when state in [:queued, :running], do: :pending
+  defp pending_status(_, _), do: :not_indexed
 
   defp get(resource, id, lock \\ nil) do
     case one(resource, :storage_row, %{id: id}, lock) do

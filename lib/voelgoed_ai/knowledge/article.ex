@@ -89,10 +89,23 @@ defmodule VoelgoedAi.Knowledge.Article do
       run(Editorial)
     end
 
+    action :list_articles, :map do
+      description(
+        "List permitted articles in ascending ID order. Pass the returned cursor to continue."
+      )
+
+      argument(:collection_id, :uuid, allow_nil?: false)
+      argument(:after_id, :uuid)
+      argument(:limit, :integer, allow_nil?: false, default: 50, constraints: [min: 1, max: 50])
+      run(Editorial)
+    end
+
     action :read_article, :map do
       argument(:id, :uuid, allow_nil?: false)
       run(Editorial)
     end
+
+    read(:editorial_page)
 
     read :storage_row do
       argument(:id, :uuid, allow_nil?: false)
@@ -144,7 +157,7 @@ defmodule VoelgoedAi.Knowledge.Article do
   end
 
   policies do
-    policy action([:create_draft, :archive, :read_article]) do
+    policy action([:create_draft, :archive, :read_article, :list_articles]) do
       authorize_if(Editorial)
     end
 
@@ -156,6 +169,10 @@ defmodule VoelgoedAi.Knowledge.Article do
              :for_export,
              :selected_for_export
            ]) do
+      authorize_if(Storage)
+    end
+
+    policy action(:editorial_page) do
       authorize_if(Storage)
     end
 
