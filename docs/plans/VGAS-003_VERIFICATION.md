@@ -109,4 +109,117 @@ reported PostgreSQL 18.7 and vector 0.8.7. No shared extension was modified.
 - Export supports a selection of up to ten active articles for a scoped reviewer. It includes the latest local snapshot, including drafts, as portable content. It carries source revision metadata. Imports require at least one article and always create drafts or return an existing matching draft.
 - Confirm production collection assignments, approved source owners and FAQ coverage, permitted category and applicability identifiers, public link rules, and the independent sensitive-content review policy. Real staging material stays behind VGAS-11 and the staff Entra gate.
 - PR B adds accounted indexing, publication, evidence retrieval and revalidation. Provider entitlement, verified bounds, budgets, retry policy and ranking thresholds still require owner evidence. PR C adds staff routes, LiveView socket and forms, and Hallmark and accessibility verification. No frontend or Compose files changed in PR A.
+- PR B or C should revisit the global `AutomationControl` row lock on
+  read-only editorial actions. It serializes those reads with support ingress.
+  The current order is staff, then control, then targets.
+- Editors declare sensitivity pending the owner decision on the sensitive
+  review policy. The PII numeric pattern `(?:\+?\d[ .()\-]?){10,}` can reject
+  date and time text. Both are follow-ups.
+- Removed the unused private `KnowledgeCollection.collection_by_slug` action
+  after confirming it had no callers.
 - The orchestrator owns independent review, PR creation and exact-head CI. VGAS-004 owns wiring evidence into support decisions. The fixed-reply support path remains in use.
+
+## Review 1 fixes
+
+Review 1 assessed `0f1eaa0b60b343ac94cc74593d08e8bca6996d8a`. The new
+tested application and test head is `f0b06c90022542fab4d590cfed88a49278193541`.
+The commit containing this section changes only the verification record.
+
+1. A revision now records the staff IDs that created, edited or submitted it.
+   Import uses the same creation path and records the importing staff member.
+   Edit and submit update the set under the revision lock in the same transaction
+   as the audit. The tests reject an editor or submitter who attempts to approve
+   without attesting. They also verify the `self_approval_attested` reason for
+   an editor and importer, and the `source_verified` reason for an uninvolved
+   reviewer. The original creator self-approval test still passes.
+2. The configuration test stores a published v1 revision with a hash computed
+   using the predecessor field order and encoding. It verifies
+   `Configuration.current_revision/1` and `render_fixed_reply/3`.
+3. A published v2 revision with one grant verifies successfully. A second grant
+   inserted directly through SQL makes the same revision fail with `stale_policy`.
+4. Tests confirm that a disabled collection returns `inactive_scope` when
+   creating an article or adding a draft revision, and when editing,
+   submitting or approving a revision.
+5. The import test changes only the hash of a valid document and expects
+   `invalid_portable_document`.
+6. Knowledge history returns the newest 100 events, ordered by occurrence
+   time and then ID, both descending. The test inserts 101 newer events and
+   checks the exact IDs and order. There is no new index for the three
+   knowledge target columns. PR A has a bounded staff preview workload and
+   no measured evidence of query latency that warrants an index.
+
+The corrected pre-fix regression run exited 2 on seed 0. It reproduced the two
+attestation bypasses and the audit history ordering failure. The tests for
+existing hash, import and inactive-scope behavior passed on the original code.
+The combined editorial and configuration test files passed after the fix
+and again after restoring the mutants.
+
+### Mutation results
+
+The reviewer mutations B4, B5, B6, B11 and B12 ran individually after the fix and
+tests were committed. Each run used `mix test <test-file> --seed 0`. The
+configuration file was the target for the v1 case. All other runs targeted the
+editorial file. Source was restored after every run.
+
+| Change to the committed code | Failing assertion | Exit |
+| --- | --- | --- |
+| Use the v2 encoding for the v1 hash | The legacy revision must verify against its published hash | 2 |
+| Omit grants when verifying a v2 hash | The intact revision with a grant must verify | 2 |
+| Remove the collection-active check from revision transitions | Editing a draft in a disabled collection must fail | 2 |
+| Remove the collection-active check from article creation | Creating a draft article in a disabled collection must fail | 2 |
+| Accept any string as an import hash | A valid document with a wrong hash must be rejected | 2 |
+| Use creator-only self-approval detection | An editor or submitter cannot approve without attesting | 2 |
+| Restore oldest-first history | The returned IDs must match the newest 100 in order | 2 |
+
+### Commands and results for review 1
+
+Mix commands ran serially against DevCore TEST through
+`devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix`.
+The migration rehearsal used its own loopback PostgreSQL. Mix logs were
+filtered and deleted. Elixir 1.20.5 and Erlang/OTP 29 were used.
+
+| Command | Exit | Observed result |
+| --- | --- | --- |
+| `devcore-project plan`, `devcore-project activate`, `devcore-project doctor` | 0 each | Rendered the checkout's ignored environment and verified both allocations. Used TEST on port 55433 for application database checks. |
+| `mix ash.codegen vgas_003_editorial_contributors` | 0 | Generated the additive migration and article revision snapshot. |
+| `mix format --check-formatted`, `mix compile --warnings-as-errors` | 0 each | Formatting and TEST compilation passed. |
+| `mix ash.codegen --check`, `mix ecto.migrate --strict-version-order` | 0 each | Snapshots match and the shared TEST schema is current. |
+| `mix test test/voelgoed_ai/knowledge/editorial_test.exs --seed 0`, `--seed 103` | 0 each | 17 passed on each seed. |
+| `mix test --seed 0`, `mix test --seed 103` | 0 each | 378 passed, 5 skipped and 2 excluded on each seed. The two optional database probes ran on the disposable target. |
+| `mix test test/voelgoed_ai/knowledge/editorial_test.exs test/voelgoed_ai/support/configuration_test.exs --seed 0` | 0 | 28 passed after restoring all mutants. |
+| `mix deps.get --check-locked`, `mix hex.audit` | 0 each | Separate invocations. Dependencies match the lockfile and the audit passed. |
+| `python3 .github/scripts/plan_tests.py` | 0 | The test shard plan generated successfully. |
+| `git diff --check 4e5feb4 HEAD`, `git diff --exit-code 4e5feb4 HEAD -- mix.exs mix.lock` | 0 each | No whitespace errors or dependency file changes. |
+| `mise exec gitleaks@8.30.1 -- gitleaks git --redact=100 --log-opts='4e5feb4..HEAD'` | 0 | No leaks found. |
+| `rg 'authorize\?: false' lib` | 1 | No matches. |
+
+### Migration rehearsal for review 1
+
+[The contributor migration](../../priv/repo/migrations/20261126060400_vgas_003_editorial_contributors.exs)
+is additive so checkouts with the original PR A migration already applied can
+upgrade normally. It adds a non-null UUID array with an empty default and
+backfills creator, editor and submitter IDs from the revision and its audit
+events. The original PR A rollback guard remains in place. The new migration
+also refuses to drop contributor history after a revision exists.
+
+The disposable `devcore-postgres:18.7-vector0.8.7` container bound only to
+`127.0.0.1:55434` and reported PostgreSQL 18.7 and vector 0.8.7.
+
+1. Fresh `mix ecto.migrate --strict-version-order` and `mix ecto.migrations`
+   exited 0. `VGAS_VERIFY_PGVECTOR=true mix test test/voelgoed_ai/repo_foundation_test.exs --only requires_pgvector --seed 0`
+   exited 0 on the fresh database.
+2. Upgrade from migrations extracted from `4e5feb4`, with both predecessor
+   fixtures loaded, exited 0. The staff, assistant, active pointer, v1 hash,
+   binding, session, support run and three audit records matched before and
+   after the upgrade. The hash version was 1.
+   `VGAS_VERIFY_PGVECTOR=true VGAS_VERIFY_VGAS001_UPGRADE=true mix test test/voelgoed_ai/repo_foundation_test.exs --seed 0`
+   exited 0 on the upgraded database.
+3. `mix ecto.rollback --step 2` and `mix ecto.migrate --strict-version-order`
+   both exited 0 before editorial use. Both predecessor fixtures matched at
+   each step.
+4. A separate pre-use `mix ecto.rollback --step 1` exited 0. After inserting
+   a revision and prior edit and submit audit events in that schema, the
+   additive migration exited 0 and recovered the three distinct staff IDs.
+   A subsequent `mix ecto.rollback --step 1` exited 1 with the contributor
+   history guard. The contributor IDs survived and the container was removed.
+   Port 55434 was free after cleanup.
