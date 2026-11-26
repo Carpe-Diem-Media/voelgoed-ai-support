@@ -102,6 +102,12 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Revision do
 
   defp show_decision?(row, action), do: row.action_hints[action]
 
+  defp publication_message(%{publication_blocker: :not_yet_effective, content: content}),
+    do: "This revision takes effect on #{content_date(content["effective_from"])}."
+
+  defp publication_message(%{publication_blocker: :expired}), do: "This revision has expired."
+  defp publication_message(%{publication_blocker: :unavailable}), do: "Publishing is unavailable."
+
   defp content_date(value) do
     case DateTime.from_iso8601(value) do
       {:ok, datetime, _} -> timestamp(datetime)
@@ -152,6 +158,9 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Revision do
       </section>
       <section :if={Enum.any?(@decisions, fn {action, _, _} -> show_decision?(@revision, action) end) or @revision.action_hints.edit_draft} aria-labelledby="revision-actions">
         <h2 id="revision-actions" class="section-heading">Editorial actions</h2>
+        <p :if={@revision.publication_blocker} id="publication-notice" class="notice" role="status">
+          {publication_message(@revision)}
+        </p>
         <div :if={@revision.action_hints.edit_draft} class="form-links">
           <a href={"/staff/knowledge/articles/#{@page.article.id}/revisions/#{@revision.id}/edit"}>Edit draft</a>
         </div>

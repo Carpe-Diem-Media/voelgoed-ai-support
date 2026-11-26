@@ -30,7 +30,12 @@ Open `/staff/knowledge` from the registered HTTPS origin.
    generation before activation. **Refresh status** checks both locale
    indexes. For a failed publish, read the displayed reason and confirm
    **Retry publication** against the current snapshot. A stale confirmation
-   requires a reload. Reindex applies to the current eligible revision.
+   requires a reload. Publication and retry are refused before
+   `effective_from`, at or after `expires_at`, or when the embedding gate is
+   closed. In place of the control, the revision page shows the effective
+   date, says the revision has expired, or says publishing is unavailable
+   when the gate is closed. Reindex applies to the current eligible
+   revision and requires an open embedding gate.
 5. A scoped reviewer can revoke an approved or published revision, or archive
    the article when it is obsolete. Read the affected revision or article
    before confirming. Index rollback in the UI is limited to the supported

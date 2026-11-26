@@ -36,6 +36,7 @@ defmodule VoelgoedAiWeb.StaffKnowledgePortableTest do
     refute export(ctx.editor, row.id, [draft.article_id]).status == 200
     refute export(ctx.admin, row.id, [draft.article_id]).status == 200
     assert export(ctx.reviewer, row.id, []).status == 400
+    assert export(ctx.reviewer, row.id, [draft.article_id, draft.article_id]).status == 400
 
     assert export(ctx.reviewer, row.id, Enum.map(1..11, fn _ -> Ash.UUIDv7.generate() end)).status ==
              400
@@ -128,6 +129,39 @@ defmodule VoelgoedAiWeb.StaffKnowledgePortableTest do
 
     assert {:ok, %{items: [%{status: :draft}]}} =
              invoke(ArticleRevision, :list_revisions, %{article_id: article_id}, ctx.editor)
+  end
+
+  test "the token from before preview cannot apply the import", ctx do
+    row = collection(ctx)
+    assert {:ok, view, _} = open_import(ctx, row)
+    old_token = token(view, "#import-upload")
+
+    assert render_upload(upload(view, document(row)), "draft.json") =~ "Preview file"
+    assert render_submit(form(view, "#import-upload")) =~ "Import preview"
+    refute token(view, "#apply-import") == old_token
+
+    reply =
+      render_submit(view, "apply_import", %{"form_token" => old_token, "confirm" => "true"})
+
+    assert {:ok, %{items: []}} =
+             invoke(Article, :list_articles, %{collection_id: row.id}, ctx.editor)
+
+    assert reply =~ "Preview a file"
+  end
+
+  test "upload progress for a replacement file clears the previous preview", ctx do
+    row = collection(ctx)
+    assert {:ok, view, _} = open_import(ctx, row)
+    assert render_upload(upload(view, document(row)), "draft.json") =~ "Preview file"
+    assert render_submit(form(view, "#import-upload")) =~ "Import preview"
+
+    replacement =
+      file_input(view, "#import-upload", :document, [
+        %{name: "replacement.json", type: "application/json", content: "{}"}
+      ])
+
+    assert render_upload(replacement, "replacement.json", 50) =~ "Uploading 50%"
+    refute has_element?(view, "#apply-import")
   end
 
   test "require explicit scoped selection when importing a new revision", ctx do

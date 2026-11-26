@@ -74,6 +74,7 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Import do
 
   def handle_event("apply_import", params, socket) do
     with true <- submitted?(params, socket) and confirmed?(params),
+         [] <- socket.assigns.uploads.document.entries,
          %{articles: [_ | _]} <- socket.assigns.preview,
          %{document: _, new_revision_for: _} = args <- socket.private[:import_document] do
       result = run(KnowledgeCollection, :apply_import, args, Auth.actor(socket))
@@ -95,7 +96,10 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Import do
 
   def handle_event(_, _, socket), do: {:noreply, socket}
 
-  defp upload_progress(:document, _entry, socket), do: {:noreply, Auth.recheck(socket)}
+  defp upload_progress(:document, _entry, socket) do
+    socket = Auth.recheck(socket)
+    {:noreply, if(socket.private[:import_document], do: clear_document(socket), else: socket)}
+  end
 
   defp preview(socket, bytes, selection) do
     args = %{id: socket.assigns.page.collection.id, document: bytes, new_revision_for: selection}

@@ -11,7 +11,9 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
   import VoelgoedAi.SupportFixtures, only: [invoke: 4]
 
   alias VoelgoedAi.{Accounts, StaffFixtures}
-  alias VoelgoedAi.Knowledge.ArticleRevision
+  alias VoelgoedAi.Intelligence.Embedding
+  alias VoelgoedAi.Knowledge.{Article, ArticleRevision}
+  alias VoelgoedAi.Knowledge.Workers.FinalizePublication
 
   setup :setup_knowledge
 
@@ -68,6 +70,23 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
 
     assert {:ok, %{status: :in_review, self_approval_required: true}} =
              invoke(ArticleRevision, :read_revision, %{id: reviewed.id}, actor)
+  end
+
+  test "a decision from before a refresh cannot submit the refreshed draft", ctx do
+    draft = draft_revision(ctx, collection(ctx))
+    assert {:ok, view, _} = live(connected_page(ctx.editor, path(draft)))
+    old_token = form_token(view, "#submit-review")
+
+    render_click(view, "refresh")
+    refute form_token(view, "#submit-review") == old_token
+
+    reply =
+      render_submit(view, "submit_review", %{"form_token" => old_token, "confirm" => "true"})
+
+    assert {:ok, %{status: :draft}} =
+             invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.editor)
+
+    assert reply =~ "Reload"
   end
 
   @tag :embedding_index
@@ -149,6 +168,103 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
 
     assert {:ok, %{status: :approved, publication_generation: 0}} =
              invoke(ArticleRevision, :read_revision, %{id: approved.id}, ctx.reviewer)
+  end
+
+  @tag :embedding_index
+  test "an approved revision cannot be published before it is effective", ctx do
+    fixture(%{clock: fn -> ~U[2026-11-26 00:00:00Z] end})
+    approved = approve_content(ctx, Map.put(payload(), "effective_from", "2099-01-01T00:00:00Z"))
+    assert {:ok, view, html} = live(connected_page(ctx.reviewer, path(approved)))
+
+    refute has_element?(view, "#request-publish")
+    assert html =~ "This revision takes effect on 01 Jan 2099, 00:00 UTC."
+
+    assert {:ok, %{status: :approved, publication_generation: 0}} =
+             invoke(ArticleRevision, :read_revision, %{id: approved.id}, ctx.reviewer)
+  end
+
+  @tag :embedding_index
+  test "a failed publication cannot be retried when the revision expires", ctx do
+    now = DateTime.utc_now()
+    expires = DateTime.add(now, 60, :second)
+    fixture(%{clock: fn -> now end})
+
+    revision =
+      approve_content(ctx, Map.put(payload(), "expires_at", DateTime.to_iso8601(expires)))
+
+    request_index(ctx, revision)
+
+    fixture(%{clock: fn -> expires end})
+    assert :ok = finalize(revision)
+    assert {:ok, view, html} = live(connected_page(ctx.reviewer, path(revision)))
+
+    refute has_element?(view, "#retry-publication")
+    assert html =~ "This revision has expired."
+
+    assert {:ok, %{status: :publish_failed, publication_generation: 1}} =
+             invoke(ArticleRevision, :read_revision, %{id: revision.id}, ctx.reviewer)
+  end
+
+  @tag :embedding_index
+  test "an approved revision cannot be published with the embedding gate closed", ctx do
+    {_collection, approved} = approved(ctx)
+    fixture(%{enabled: false})
+    assert {:ok, view, html} = live(connected_page(ctx.reviewer, path(approved)))
+
+    refute has_element?(view, "#request-publish")
+    assert html =~ "Publishing is unavailable."
+  end
+
+  @tag :embedding_index
+  test "a current published revision cannot be reindexed with the embedding gate closed", ctx do
+    {_collection, approved} = approved(ctx)
+
+    for id <- request_index(ctx, approved) do
+      assert :ok = Embedding.index(id)
+    end
+
+    assert :ok = finalize(approved)
+    assert {:ok, view, _} = live(connected_page(ctx.reviewer, path(approved)))
+    assert has_element?(view, "#request-reindex")
+
+    fixture(%{enabled: false})
+    render_click(view, "refresh")
+    refute has_element?(view, "#request-reindex")
+
+    assert {:ok, %{status: :published, publication_generation: 1}} =
+             invoke(ArticleRevision, :read_revision, %{id: approved.id}, ctx.reviewer)
+  end
+
+  defp approve_content(ctx, content) do
+    assert {:ok, %{revision: draft}} =
+             invoke(
+               Article,
+               :create_draft,
+               %{draft_args(ctx, collection(ctx)) | content: content},
+               ctx.editor
+             )
+
+    assert {:ok, approved} =
+             invoke(ArticleRevision, :approve, attest(snapshot(review(ctx, draft))), ctx.reviewer)
+
+    approved
+  end
+
+  defp finalize(revision) do
+    FinalizePublication.perform(%Oban.Job{
+      args: %{"revision_id" => revision.id, "generation" => 1}
+    })
+  end
+
+  defp form_token(view, selector) do
+    [token] =
+      view
+      |> render()
+      |> LazyHTML.from_fragment()
+      |> LazyHTML.query(selector <> " [name=form_token]")
+      |> LazyHTML.attribute("value")
+
+    token
   end
 
   defp connected_page(actor, path) do
