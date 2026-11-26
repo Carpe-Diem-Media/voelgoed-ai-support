@@ -24,6 +24,9 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
     append: :create,
     append_knowledge: :create,
     append_publication_failure: :create,
+    append_publication_transition: :create,
+    append_rollback_request: :create,
+    rollback_request: :read,
     knowledge_rows: :read,
     append_support_operator: :create,
     append_system: :create,
@@ -72,6 +75,10 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
             session,
             Map.from_struct(session),
             %VoelgoedAi.Knowledge.Storage{ref: make_ref()},
+            %VoelgoedAi.Knowledge.Storage{
+              ref: make_ref(),
+              owner: VoelgoedAi.Knowledge.Publication
+            },
             %VoelgoedAi.Support.WorkStore{ref: make_ref()},
             %Scope{action: wrong_action, target: context.target.id},
             %Scope{action: action, target: Ash.UUIDv7.generate()}
@@ -187,6 +194,35 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
       correlation_id: Ash.UUIDv7.generate()
     }
   end
+
+  defp arguments(:append_publication_transition, _) do
+    %{
+      actor_kind: :publisher,
+      target_kind: :knowledge_revision,
+      article_revision_target_id: Ash.UUIDv7.generate(),
+      event: :activate,
+      reason_code: :index_ready,
+      operational_before: %{status: :publishing},
+      operational_after: %{status: :published},
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:append_rollback_request, %{session: session}) do
+    %{
+      actor_kind: :staff,
+      actor_staff_id: session.id,
+      target_kind: :knowledge_revision,
+      article_revision_target_id: Ash.UUIDv7.generate(),
+      event: :request_index_rollback,
+      reason_code: :source_verified,
+      operational_before: %{status: :published, index_generation: 2, index_epoch: 2},
+      operational_after: %{status: :published, index_generation: 1},
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:rollback_request, _), do: %{id: Ash.UUIDv7.generate()}
 
   defp arguments(:knowledge_rows, _),
     do: %{id: Ash.UUIDv7.generate(), target_kind: :knowledge_revision}

@@ -89,6 +89,12 @@ defmodule VoelgoedAi.Knowledge.ArticleEmbedding do
       prepare(build(sort: [:id]))
     end
 
+    read :revision_rows do
+      argument(:revision_ids, {:array, :uuid}, allow_nil?: false)
+      filter(expr(revision_id in ^arg(:revision_ids)))
+      prepare(build(sort: [:id]))
+    end
+
     create :insert_row do
       transaction?(false)
       accept([:revision_id, :locale, :profile_id, :content_hash, :generation, :deadline_at])
@@ -102,7 +108,7 @@ defmodule VoelgoedAi.Knowledge.ArticleEmbedding do
   end
 
   policies do
-    policy action([:storage_row, :insert_row, :change_row, :generation_rows]) do
+    policy action([:storage_row, :insert_row, :change_row, :generation_rows, :revision_rows]) do
       authorize_if(Storage)
     end
   end

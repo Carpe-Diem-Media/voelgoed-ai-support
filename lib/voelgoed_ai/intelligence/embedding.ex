@@ -20,6 +20,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     ArticleRevision,
     Content,
     KnowledgeCollection,
+    Publication,
     Storage
   }
 
@@ -279,16 +280,14 @@ defmodule VoelgoedAi.Intelligence.Embedding do
 
   defp eligible(%{row: row, revision: revision, article: article, collection: collection}, now) do
     cond do
-      revision.status != :publishing or collection.status != :active or
-        collection.audience != :public or article.status != :active ->
+      not Publication.pending?(revision) or
+          not Publication.request_matches?(collection, article, revision) ->
         {:error, :stale_request}
 
       row.generation != revision.publication_generation or
         row.content_hash != revision.content_hash or row.profile_id != EmbeddingProfile.id() or
         row.profile_id != revision.publication_profile_id or
         row.deadline_at != revision.publication_deadline_at or
-        collection.security_epoch != revision.publication_collection_epoch or
-        article.current_revision_id != revision.expected_current_revision_id or
         revision.content_hash != revision.review_hash or
           revision.content_hash != Content.hash(revision.content) ->
         {:error, :stale_request}
@@ -301,7 +300,8 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     end
   end
 
-  defp eligible_content(content, now) do
+  @doc false
+  def eligible_content(content, now) do
     with false <- content["sensitive"] == true or content["response_mode"] == "escalate_only",
          {:ok, starts, 0} <- DateTime.from_iso8601(content["effective_from"]),
          true <- DateTime.compare(now, starts) != :lt,
@@ -490,8 +490,14 @@ defmodule VoelgoedAi.Intelligence.Embedding do
 
   defp apply_result(%{row: %{state: :running} = row} = context, now, {:ok, vector}) do
     case eligible(context, now) do
-      :ok -> change(row, %{state: :ready, vector: vector})
-      {:error, reason} -> fail_publication(context, failure_reason(reason))
+      :ok ->
+        with {:ok, _} <- change(row, %{state: :ready, vector: vector}),
+             :ok <- finalise_ready_generation(context) do
+          {:ok, :ready}
+        end
+
+      {:error, reason} ->
+        fail_publication(context, failure_reason(reason))
     end
   end
 
@@ -499,6 +505,15 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     do: fail_publication(context, :invalid_vector)
 
   defp apply_result(_, _, _), do: {:ok, :noop}
+
+  defp finalise_ready_generation(%{generation: rows, revision: revision, row: row}) do
+    if Enum.all?(rows, &(&1.id == row.id or &1.state == :ready)) do
+      # A failed insert aborts the READY write and financial settlement.
+      with {:ok, _} <- Publication.enqueue_finalisation(revision), do: :ok
+    else
+      :ok
+    end
+  end
 
   defp hold(control, context, attempt, reservation, now, reason) do
     with {:ok, _} <- change(attempt, %{state: :unknown, finished_at: now, reason_code: reason}),
@@ -531,19 +546,22 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     end
   end
 
-  defp fail_publication(
-         %{revision: %{status: :publishing} = revision, row: row, generation: rows},
-         reason
-       )
-       when revision.publication_generation == row.generation do
-    with {:ok, _} <- change(revision, %{status: :publish_failed, publication_reason: reason}),
-         {:ok, _} <- append_failure(revision, reason),
-         :ok <- fail_variants(rows, row.id, reason) do
-      {:ok, :failed}
+  defp fail_publication(%{revision: revision, row: row, generation: rows}, reason) do
+    if Publication.pending?(revision) and revision.publication_generation == row.generation do
+      attrs =
+        if revision.status == :publishing,
+          do: %{status: :publish_failed, publication_reason: reason},
+          else: %{reindex_base_generation: nil, publication_reason: reason}
+
+      with {:ok, failed} <- change(revision, attrs),
+           {:ok, _} <- append_failure(revision, failed, reason),
+           :ok <- fail_variants(rows, row.id, reason) do
+        {:ok, :failed}
+      end
+    else
+      {:ok, :noop}
     end
   end
-
-  defp fail_publication(_, _), do: {:ok, :noop}
 
   defp fail_variants(rows, failed_id, reason) do
     Enum.reduce_while(rows, :ok, fn row, :ok ->
@@ -557,16 +575,16 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     end)
   end
 
-  defp append_failure(revision, reason) do
+  defp append_failure(revision, failed, reason) do
     attrs = %{
       actor_kind: :embedding_worker,
       target_kind: :knowledge_revision,
-      event: :fail_publication,
+      event: if(revision.status == :publishing, do: :fail_publication, else: :fail_reindex),
       article_revision_target_id: revision.id,
       correlation_id: Ash.UUIDv7.generate(),
       reason_code: reason,
-      operational_before: %{status: :publishing, content_hash: revision.content_hash},
-      operational_after: %{status: :publish_failed, content_hash: revision.content_hash}
+      operational_before: %{status: revision.status, content_hash: revision.content_hash},
+      operational_after: %{status: failed.status, content_hash: revision.content_hash}
     }
 
     storage(
@@ -702,13 +720,13 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     end
 
     defp closure_approved?(id), do: fixture()[:closure_approved_by] == id
-    defp now, do: Map.get(fixture(), :clock, &DateTime.utc_now/0).()
+    def now, do: Map.get(fixture(), :clock, &DateTime.utc_now/0).()
     defp hook(stage, attempt), do: Map.get(fixture(), stage, fn _ -> :ok end).(attempt)
     defp consume(fence), do: Map.get(fixture(), :consume_dispatch, fn fun -> fun.() end).(fence)
   else
     defp gate, do: {:error, :disabled}
     defp closure_approved?(_id), do: false
-    defp now, do: DateTime.utc_now()
+    def now, do: DateTime.utc_now()
     defp hook(_, _), do: :ok
     defp consume(fence), do: fence.()
   end

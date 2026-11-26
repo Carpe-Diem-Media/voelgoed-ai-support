@@ -56,8 +56,11 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     :request_publish,
     :retry_publication,
     :revoke,
+    :request_reindex,
     :archive
   ]
+  @publication_events [:activate, :supersede, :expire, :switch_index, :rollback_index]
+  @publication_reasons [:index_ready, :replaced, :deadline, :evaluated]
   @knowledge_reasons [
     :local_admin,
     :local_editor,
@@ -100,7 +103,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           :publishing,
           :publish_failed,
           :withdrawn,
-          :revoked
+          :revoked,
+          :expired
         ]
       ]
     ],
@@ -120,6 +124,11 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     config_hash_version: [type: :integer, constraints: [min: 1, max: 2]],
     collection_id: [type: :uuid],
     content_hash: [type: :string, constraints: [max_length: 64]],
+    index_generation: [type: :integer, constraints: [min: 1]],
+    index_epoch: [type: :integer, constraints: [min: 1]],
+    collection_epoch: [type: :integer, constraints: [min: 0]],
+    deadline_us: [type: :integer, constraints: [min: 1]],
+    content_profile_id: [type: :string, constraints: [max_length: 128]],
     edit_version: [type: :integer, constraints: [min: 1]],
     installation_ref: [type: :string, constraints: [max_length: 64]],
     external_account_id: [type: :integer, constraints: [min: 1]],
@@ -168,7 +177,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         check: """
         (actor_kind = 'bootstrap' AND actor_staff_id IS NULL AND operator_ref = 'staff-bootstrap' AND operator_ref IS NOT NULL)
         OR (actor_kind = 'staff' AND actor_staff_id IS NOT NULL AND operator_ref IS NULL)
-        OR (actor_kind IN ('support_worker','embedding_worker') AND actor_staff_id IS NULL AND operator_ref IS NULL)
+        OR (actor_kind IN ('support_worker','embedding_worker','publisher') AND actor_staff_id IS NULL AND operator_ref IS NULL)
         """
       )
 
@@ -197,9 +206,13 @@ defmodule VoelgoedAi.Governance.AuditEvent do
                 OR (event = 'request_changes' AND reason_code IN ('source_correction','content_correction'))
                 OR (event = 'approve' AND reason_code IN ('source_verified','self_approval_attested'))
                 OR (event = 'withdraw' AND reason_code = 'withdrawn_by_staff')
-                OR (event IN ('request_publish','retry_publication') AND reason_code = 'source_verified')
+                OR (event IN ('request_publish','retry_publication','request_reindex','request_index_rollback') AND reason_code = 'source_verified')
                 OR (event = 'revoke' AND reason_code = 'obsolete')
-                OR (event = 'fail_publication' AND reason_code IN ('deadline','stale_request','transport_unknown','invalid_vector','admission_denied'))
+                OR (event IN ('fail_publication','fail_reindex') AND reason_code IN ('deadline','stale_request','transport_unknown','invalid_vector','admission_denied'))
+                OR (event IN ('activate','switch_index') AND reason_code = 'index_ready')
+                OR (event = 'supersede' AND reason_code = 'replaced')
+                OR (event = 'expire' AND reason_code = 'deadline')
+                OR (event = 'rollback_index' AND reason_code = 'evaluated')
                 OR (event = 'archive' AND reason_code = 'obsolete')))
             OR (target_kind = 'support_session' AND session_target_id IS NOT NULL
               AND event IN ('request_handoff','return_to_bot','close_session'))
@@ -216,13 +229,23 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           (target_kind = 'staff_user' AND actor_kind IN ('staff','bootstrap') AND after_state IS NOT NULL
             AND operational_before IS NULL AND operational_after IS NULL)
           OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL
-            AND event NOT IN ('delivery_unknown','missed_deadline','handoff_failed','fail_publication')
+            AND event NOT IN ('delivery_unknown','missed_deadline','handoff_failed','fail_publication','fail_reindex','expire','switch_index','rollback_index')
+            AND (target_kind <> 'knowledge_revision' OR event NOT IN ('activate','supersede'))
             AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')
               OR (target_kind IN ('knowledge_collection','knowledge_article','knowledge_revision'))
               OR (target_kind NOT IN ('staff_user','support_session','outbound_delivery','knowledge_collection','knowledge_article','knowledge_revision') AND reason_code = 'local_admin')))
           OR (actor_kind = 'embedding_worker' AND target_kind = 'knowledge_revision'
-            AND event = 'fail_publication' AND before_state IS NULL AND after_state IS NULL
+            AND event IN ('fail_publication','fail_reindex') AND before_state IS NULL AND after_state IS NULL
             AND operational_before IS NOT NULL AND operational_after IS NOT NULL)
+          OR (actor_kind = 'publisher' AND target_kind = 'knowledge_revision'
+            AND before_state IS NULL AND after_state IS NULL AND
+            (CASE event
+              WHEN 'activate' THEN operational_before->>'status' = 'publishing' AND operational_after->>'status' = 'published'
+              WHEN 'supersede' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'superseded'
+              WHEN 'expire' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'expired'
+              WHEN 'switch_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              WHEN 'rollback_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              ELSE false END) IS TRUE)
           OR (actor_kind = 'support_worker' AND before_state IS NULL AND after_state IS NULL
             AND operational_before IS NULL AND operational_after IS NULL
             AND ((event = 'delivery_unknown' AND reason_code IN (#{@system_reason_sql}))
@@ -238,7 +261,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
 
     attribute(:actor_kind, :atom,
       allow_nil?: false,
-      constraints: [one_of: [:staff, :bootstrap, :support_worker, :embedding_worker]]
+      constraints: [one_of: [:staff, :bootstrap, :support_worker, :embedding_worker, :publisher]]
     )
 
     attribute(:operator_ref, :string, constraints: [match: ~r/\Astaff-bootstrap\z/])
@@ -258,8 +281,11 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       allow_nil?: false,
       constraints: [
         one_of: [
-          :fail_publication
-          | @staff_events ++
+          :fail_publication,
+          :fail_reindex,
+          :request_index_rollback
+          | @publication_events ++
+              @staff_events ++
               @operational_events ++ @support_events ++ @system_events ++ @knowledge_events
         ]
       ]
@@ -278,6 +304,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           ] ++
             ReasonCode.values() ++
             @knowledge_reasons ++
+            @publication_reasons ++
             [:stale_request, :transport_unknown, :invalid_vector, :admission_denied]
       ]
     )
@@ -388,8 +415,61 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         :correlation_id
       ])
 
-      validate(attribute_equals(:event, :fail_publication))
+      validate(attribute_in(:event, [:fail_publication, :fail_reindex]))
       validate(attribute_equals(:actor_kind, :embedding_worker))
+    end
+
+    create :append_publication_transition do
+      transaction?(false)
+
+      accept([
+        :article_revision_target_id,
+        :event,
+        :actor_kind,
+        :target_kind,
+        :reason_code,
+        :operational_before,
+        :operational_after,
+        :correlation_id
+      ])
+
+      validate(attribute_equals(:actor_kind, :publisher))
+      validate(attribute_equals(:target_kind, :knowledge_revision))
+      validate(attribute_in(:event, @publication_events))
+      validate(attribute_in(:reason_code, @publication_reasons))
+    end
+
+    create :append_rollback_request do
+      transaction?(false)
+
+      accept([
+        :article_revision_target_id,
+        :actor_staff_id,
+        :event,
+        :actor_kind,
+        :target_kind,
+        :reason_code,
+        :operational_before,
+        :operational_after,
+        :correlation_id
+      ])
+
+      validate(attribute_equals(:actor_kind, :staff))
+      validate(attribute_equals(:target_kind, :knowledge_revision))
+      validate(attribute_equals(:event, :request_index_rollback))
+      validate(attribute_equals(:reason_code, :source_verified))
+      validate(present([:operational_before, :operational_after]))
+    end
+
+    read :rollback_request do
+      argument(:id, :uuid, allow_nil?: false)
+
+      filter(
+        expr(
+          id == ^arg(:id) and event == :request_index_rollback and
+            actor_kind == :staff and target_kind == :knowledge_revision
+        )
+      )
     end
 
     action :knowledge_history, {:array, :map} do
@@ -515,7 +595,12 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   end
 
   policies do
-    policy action(:append_publication_failure) do
+    policy action([
+             :append_publication_failure,
+             :append_publication_transition,
+             :append_rollback_request,
+             :rollback_request
+           ]) do
       authorize_if(Storage)
     end
 

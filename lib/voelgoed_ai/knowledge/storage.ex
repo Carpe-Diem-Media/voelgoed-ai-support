@@ -2,7 +2,7 @@ defmodule VoelgoedAi.Knowledge.Storage do
   @moduledoc false
   use Ash.Policy.SimpleCheck
 
-  alias VoelgoedAi.Knowledge.Editorial
+  alias VoelgoedAi.Knowledge.{Editorial, Publication}
   alias VoelgoedAi.Intelligence.Embedding
   alias VoelgoedAi.Governance.EmbeddingAccounting
   alias VoelgoedAi.Repo
@@ -15,7 +15,7 @@ defmodule VoelgoedAi.Knowledge.Storage do
 
   @impl true
   def match?(%__MODULE__{ref: ref, owner: owner}, %{subject: subject}, _opts)
-      when is_reference(ref) and owner in [Editorial, Embedding, EmbeddingAccounting] do
+      when is_reference(ref) and owner in [Editorial, Publication, Embedding, EmbeddingAccounting] do
     Repo.in_transaction?() and
       Process.get({owner, :storage}) == {ref, subject.resource, subject.action.name}
   end
