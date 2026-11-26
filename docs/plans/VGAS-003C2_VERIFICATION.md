@@ -336,8 +336,9 @@ gate isolates the missing condition.
 The browser capture read the authenticated revision routes with scripts
 disabled and with LiveView connected. It verified HTTP 200, the synthetic
 English FAQ, each notice and the absence of its publish or retry control.
-The keyboard refresh retained visible focus and restored its normal
-label. The capture checked 320 px and 1280 px with reduced motion and
+The refresh button had visible focus before Enter and restored its
+normal label when the request finished. The capture checked 320 px and
+1280 px with reduced motion and
 removed scripts, CSRF and LiveView tokens, hidden inputs and answer text
 before saving HTML with the copied staff CSS.
 
