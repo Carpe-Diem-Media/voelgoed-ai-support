@@ -27,6 +27,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     @inbox_keys [:installation_ref, :external_account_id, :external_inbox_id]
     @manifest_key {__MODULE__, :manifest}
     @query_key {__MODULE__, :query}
+    @rank_measurement_key {__MODULE__, :rank_measurement}
 
     # All entry points use this CTE. Control is locked before it runs, and
     # editorial and grant changes take the same lock before writing.
@@ -139,6 +140,22 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
 
     def with_fixture(_, _), do: {:error, :denied}
 
+    @doc false
+    def with_rank_measurement(callback, operation)
+        when is_function(callback, 3) and is_function(operation, 0) do
+      previous = Process.put(@rank_measurement_key, callback)
+
+      try do
+        operation.()
+      after
+        if previous do
+          Process.put(@rank_measurement_key, previous)
+        else
+          Process.delete(@rank_measurement_key)
+        end
+      end
+    end
+
     defp authority, do: Process.get(@fixture_key)
 
     @impl Ash.Resource.Actions.Implementation
@@ -223,20 +240,17 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
 
     defp rank(context, lexemes, vector) do
       qualified(context, fn config, run, revision, now, _ ->
-        with {:ok, %{rows: rows}} <-
-               sql(
-                 @eligible <> @rank,
-                 params(context, config, run, now) ++ [lexemes, vector]
-               ) do
+        statement = @eligible <> @rank
+        bindings = params(context, config, run, now) ++ [lexemes, vector]
+        result = sql(statement, bindings)
+
+        if callback = Process.get(@rank_measurement_key),
+          do: callback.(statement, bindings, result)
+
+        with {:ok, %{rows: rows}} <- result do
           evidence =
             rows
-            |> Enum.map(fn row ->
-              {data, [semantic, lexical]} = Enum.split(row, -2)
-              {hd(data), rrf(semantic, lexical), data}
-            end)
-            |> Enum.sort(fn {left_id, {ln, ld}, _}, {right_id, {rn, rd}, _} ->
-              ln * rd > rn * ld or (ln * rd == rn * ld and left_id <= right_id)
-            end)
+            |> sort_ranked()
             |> Enum.flat_map(fn {_, _, row} ->
               case project(row, context, run, revision, Ash.UUIDv7.generate()) do
                 {:ok, item} -> [item]
@@ -247,6 +261,20 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
 
           {:ok, evidence}
         end
+      end)
+    end
+
+    @doc false
+    def sort_fixture_ranks(rows), do: sort_ranked(rows)
+
+    defp sort_ranked(rows) do
+      rows
+      |> Enum.map(fn row ->
+        {data, [semantic, lexical]} = Enum.split(row, -2)
+        {hd(data), rrf(semantic, lexical), data}
+      end)
+      |> Enum.sort(fn {left_id, {ln, ld}, _}, {right_id, {rn, rd}, _} ->
+        ln * rd > rn * ld or (ln * rd == rn * ld and left_id <= right_id)
       end)
     end
 
@@ -388,9 +416,10 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       with {:ok, _} <-
              SQL.query(Repo, "SET LOCAL statement_timeout = '750ms'", [],
                log: false,
+               telemetry_event: nil,
                timeout: 1_000
              ) do
-        SQL.query(Repo, statement, params, log: false, timeout: 1_000)
+        SQL.query(Repo, statement, params, log: false, telemetry_event: nil, timeout: 1_000)
       end
     end
 
