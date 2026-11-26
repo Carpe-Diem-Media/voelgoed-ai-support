@@ -7,6 +7,7 @@ defmodule VoelgoedAi.Intelligence do
   end
 
   resources do
+    resource(VoelgoedAi.Intelligence.InferenceRun)
     resource(VoelgoedAi.Intelligence.Assistant)
     resource(VoelgoedAi.Intelligence.AssistantRevision)
     resource(VoelgoedAi.Intelligence.AssistantKnowledgeGrant)

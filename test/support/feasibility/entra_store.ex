@@ -5,7 +5,13 @@ defmodule VoelgoedAi.Feasibility.EntraStore do
   alias VoelgoedAi.Repo
 
   def create_schema! do
-    55433 = Keyword.fetch!(Repo.config(), :port)
+    config = Repo.config()
+    port = Keyword.fetch!(config, :port)
+
+    true =
+      port == 55433 or
+        (port == 55434 and config[:hostname] == "127.0.0.1" and
+           System.get_env("VGAS_VERIFY_PGVECTOR") == "true")
 
     %{rows: [["vgas_test", "vgas_test"]]} =
       Repo.query!("SELECT current_database(), current_user")

@@ -6,11 +6,20 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.{Accounts, Repo}
   alias VoelgoedAi.Governance.AuditEvent
-  alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
+
+  alias VoelgoedAi.Intelligence.{
+    Assistant,
+    AssistantRevision,
+    Embedding,
+    EmbeddingTransport,
+    InferenceRun
+  }
+
   alias VoelgoedAi.Knowledge.{Article, ArticleRevision, Content, KnowledgeCollection}
+  alias VoelgoedAi.Knowledge.Workers.IndexArticle
   alias VoelgoedAi.Support.Configuration
 
-  setup do
+  setup tags do
     ctx = VoelgoedAi.SupportFixtures.setup()
     admin = bootstrap_admin(ctx.admin)
     assert {:ok, editor} = Accounts.provision(admin, ctx.invited, [:knowledge_editor])
@@ -18,7 +27,20 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     assert {:ok, reviewer} = Accounts.provision(admin, ctx.other, [:knowledge_reviewer])
     assert {:ok, reviewer} = authenticate(reviewer.id)
 
+    original_inhibit =
+      if tags[:embedding_index] do
+        %{rows: [[value]]} =
+          SQL.query!(Repo, "SELECT embedding_inhibited FROM automation_controls")
+
+        value
+      end
+
     on_exit(fn ->
+      if tags[:embedding_index] do
+        delete_embedding_fixture(editor.id, original_inhibit)
+        fixture(%{})
+      end
+
       SQL.query(
         Repo,
         "DELETE FROM audit_events WHERE actor_staff_id::text = ANY($1) AND target_kind LIKE 'knowledge_%'",
@@ -47,6 +69,644 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     end)
 
     Map.merge(ctx, %{admin: admin, editor: editor, reviewer: reviewer})
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "publication is separate from approval and only a reviewer can queue the locales", ctx do
+    collection = collection(ctx)
+    reviewed = review(ctx, draft_revision(ctx, collection))
+    args = Map.put(snapshot(reviewed), :expected_current_revision_id, nil)
+
+    assert {:error, _} = invoke(ArticleRevision, :request_publish, args, ctx.reviewer)
+    assert {:ok, _} = invoke(ArticleRevision, :approve, attest(snapshot(reviewed)), ctx.reviewer)
+    assert {:error, _} = invoke(ArticleRevision, :request_publish, args, ctx.editor)
+
+    assert {:error, _} =
+             invoke(
+               ArticleRevision,
+               :request_publish,
+               %{args | expected_current_revision_id: Ash.UUIDv7.generate()},
+               ctx.reviewer
+             )
+
+    assert {:ok, %{status: :publishing}} =
+             invoke(ArticleRevision, :request_publish, args, ctx.reviewer)
+
+    assert %{rows: [["af-ZA", "queued"], ["en-ZA", "queued"]]} =
+             SQL.query!(
+               Repo,
+               "SELECT locale, state FROM article_embeddings WHERE revision_id = $1 ORDER BY locale",
+               [Ecto.UUID.dump!(reviewed.id)]
+             )
+
+    assert %{rows: [[worker, 2, true, 2], [recovery, 2, true, 2]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT worker, count(*), bool_and(args - 'embedding_id' = '{}'::jsonb),
+                      count(DISTINCT args->>'embedding_id')
+               FROM oban_jobs WHERE args->>'embedding_id' IN
+                 (SELECT id::text FROM article_embeddings WHERE revision_id = $1)
+               GROUP BY worker ORDER BY worker
+               """,
+               [Ecto.UUID.dump!(reviewed.id)]
+             )
+
+    assert worker == inspect(IndexArticle)
+    assert recovery == "VoelgoedAi.Knowledge.Workers.RecoverIndexing"
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "dispatch follows committed reservation and only one worker per locale reaches the wire",
+       ctx do
+    {_collection, revision} = approved(ctx)
+    [id, other] = request_index(ctx, revision)
+    parent = self()
+
+    wire = fn request ->
+      send(parent, {:wire, self(), reservation_rows(id), request.body})
+
+      receive do
+        :respond -> EmbeddingTransport.fixture_wire(request)
+      end
+    end
+
+    fixture(%{
+      wire: wire,
+      after_claim: fn _ -> send(parent, :probe_claim) end,
+      after_dispatch: fn _ -> send(parent, :probe_dispatch) end,
+      consume_dispatch: fn take ->
+        results = [Task.async(take), Task.async(take)] |> Task.await_many()
+        send(parent, {:fence_results, Enum.map(results, &elem(&1, 0)) |> Enum.sort()})
+        Enum.find(results, &match?({:ok, _, _}, &1))
+      end
+    })
+
+    task = Task.async(fn -> Embedding.index(id) end)
+
+    assert_receive :probe_claim, 5_000
+    assert_receive {:fence_results, [:error, :ok]}, 5_000
+    assert_receive :probe_dispatch, 5_000
+    assert_receive {:wire, wire_pid, [["running", true, "reserved", 81_920, nil]], body}, 7_000
+    body = if is_map(body), do: body, else: Jason.decode!(IO.iodata_to_binary(body))
+    assert body["model"] == "text-embedding-3-small"
+    assert body["dimensions"] == 1536
+    assert byte_size(Jason.encode!(body["input"])) > 0
+    refute Jason.encode!(body["input"]) =~ "synthetic-faq-v1"
+    assert :ok = Embedding.index(id)
+    refute_receive {:wire, _, _, _}, 50
+
+    send(wire_pid, :respond)
+    assert :ok = Task.await(task)
+    assert [["succeeded", true, "settled", 81_920, 8]] = reservation_rows(id)
+
+    assert {:error, :proof_rolled_back} =
+             Repo.transact(fn ->
+               assert {:error,
+                       %Postgrex.Error{
+                         postgres: %{
+                           code: :unique_violation,
+                           constraint: "usage_ledger_entries_entry_key_index"
+                         }
+                       }} =
+                        SQL.query(
+                          Repo,
+                          """
+                          INSERT INTO usage_ledger_entries
+                          SELECT (jsonb_populate_record(NULL::usage_ledger_entries,
+                            to_jsonb(l) || jsonb_build_object('id', uuidv7()))).*
+                          FROM usage_ledger_entries l
+                          JOIN inference_runs i ON i.id = l.inference_run_id WHERE i.article_embedding_id = $1
+                          """,
+                          [Ecto.UUID.dump!(id)]
+                        )
+
+               {:error, :proof_rolled_back}
+             end)
+
+    assert [["ready", 1536]] = vector_rows(id)
+
+    fixture(%{})
+    assert :ok = Oban.Testing.perform_job(IndexArticle, %{"embedding_id" => other}, repo: Repo)
+    assert [["ready", 1536]] = vector_rows(other)
+
+    assert {:ok, %{status: :publishing}} =
+             invoke(ArticleRevision, :read_revision, %{id: revision.id}, ctx.reviewer)
+
+    assert {:ok, %{current_revision_id: nil}} =
+             invoke(Article, :read_article, %{id: revision.article_id}, ctx.reviewer)
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "503 and timeout each hit the actual adapter once and keep the cost held", ctx do
+    {_collection, revision} = approved(ctx)
+    parent = self()
+
+    for {fault, action} <- [
+          {:service_unavailable, :request_publish},
+          {:timeout, :retry_publication}
+        ] do
+      [id, sibling] = request_index(ctx, revision, action)
+
+      wire = fn request ->
+        send(parent, {:wire_fault, fault})
+
+        case fault do
+          :service_unavailable ->
+            {request,
+             Req.Response.new(
+               status: 503,
+               headers: [{"retry-after", "0"}],
+               body: %{"error" => %{"message" => "fixture"}}
+             )}
+
+          :timeout ->
+            {request, %Req.TransportError{reason: :timeout}}
+        end
+      end
+
+      fixture(%{wire: wire})
+      assert :ok = Embedding.index(id)
+      assert_receive {:wire_fault, ^fault}
+      refute_receive {:wire_fault, ^fault}, 50
+      assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+      assert [["invalidated", nil]] = vector_rows(sibling)
+      assert :ok = Embedding.index(id)
+      assert :ok = Embedding.index(sibling)
+      refute_receive {:wire_fault, ^fault}, 50
+    end
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "outstanding spend crosses UTC rollover and a late result settles to the origin window",
+       ctx do
+    {_collection, revision} = approved(ctx)
+    parent = self()
+    origin = ~U[2027-01-31 23:59:50.000000Z]
+    {:ok, clock} = Agent.start_link(fn -> origin end)
+
+    fixture(%{
+      clock: fn -> Agent.get(clock, & &1) end,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      wire: fn request ->
+        send(parent, {:wire_rollover, self()})
+
+        receive do
+          :complete -> EmbeddingTransport.fixture_wire(request)
+        end
+      end
+    })
+
+    [id, other] = request_index(ctx, revision)
+    task = Task.async(fn -> Embedding.index(id) end)
+    assert_receive {:wire_rollover, wire}, 3_000
+    Agent.update(clock, fn _ -> DateTime.add(origin, 15) end)
+
+    assert :ok = Embedding.index(other)
+    refute_receive {:wire_rollover, _}, 50
+    assert [] == reservation_rows(other)
+    assert [["failed", nil]] = vector_rows(other)
+
+    send(wire, :complete)
+    assert :ok = Task.await(task)
+    assert [["succeeded", true, "settled", 81_920, 8]] = reservation_rows(id)
+    assert [["invalidated", nil]] = vector_rows(id)
+
+    assert [["day", ~D[2027-01-31], 8], ["month", ~D[2027-01-01], 8]] =
+             SQL.query!(
+               Repo,
+               "SELECT kind, window_start, settled_nano_usd FROM spend_windows WHERE settled_nano_usd > 0 AND window_start IN ('2027-01-31','2027-01-01','2027-02-01') ORDER BY kind"
+             ).rows
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "disable fences a pre-dispatch claim and revoke cancels the generation", ctx do
+    {collection, revision} = approved(ctx)
+    [id, sibling] = request_index(ctx, revision)
+    parent = self()
+
+    fixture(%{
+      after_claim: fn _ ->
+        send(parent, {:claimed, self()})
+
+        receive do
+          :continue -> :ok
+        end
+      end,
+      wire: fn request ->
+        send(parent, :stale_wire)
+        EmbeddingTransport.fixture_wire(request)
+      end
+    })
+
+    task = Task.async(fn -> Embedding.index(id) end)
+    assert_receive {:claimed, worker}, 3_000
+    assert {:ok, _} = invoke(KnowledgeCollection, :disable, %{id: collection.id}, ctx.admin)
+    assert {:ok, _} = invoke(KnowledgeCollection, :enable, %{id: collection.id}, ctx.admin)
+    send(worker, :continue)
+    assert :ok = Task.await(task)
+    refute_receive :stale_wire, 50
+    assert [["rejected", false, "released", 81_920, nil]] = reservation_rows(id)
+    assert [["invalidated", nil]] = vector_rows(sibling)
+
+    args = Map.put(snapshot(revision), :reason, :obsolete)
+    assert {:ok, %{status: :revoked}} = invoke(ArticleRevision, :revoke, args, ctx.reviewer)
+    assert :ok = Embedding.index(sibling)
+    refute_receive :stale_wire, 50
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "revoke clears ready and queued vectors and the shape check rejects unusable vectors",
+       ctx do
+    {_collection, revision} = approved(ctx)
+    [id, sibling] = request_index(ctx, revision)
+    parent = self()
+
+    fixture(%{
+      wire: fn request ->
+        send(parent, :wire)
+        EmbeddingTransport.fixture_wire(request)
+      end
+    })
+
+    assert :ok = Embedding.index(id)
+    assert_receive :wire
+    assert [["ready", 1536]] = vector_rows(id)
+    assert [["queued", nil]] = vector_rows(sibling)
+
+    # Retrieval reads embedding rows directly, so the stored shape must hold
+    # without relying on application checks.
+    for sql <- [
+          "UPDATE article_embeddings SET vector = NULL WHERE id = $1",
+          "UPDATE article_embeddings SET vector = array_fill(0::real, ARRAY[1536])::vector WHERE id = $1"
+        ] do
+      assert {:error, %Postgrex.Error{postgres: %{constraint: "article_embeddings_shape"}}} =
+               SQL.query(Repo, sql, [Ecto.UUID.dump!(id)])
+    end
+
+    # Worker rechecks are a second fence; revocation itself must clear the rows.
+    args = Map.put(snapshot(revision), :reason, :obsolete)
+    assert {:ok, %{status: :revoked}} = invoke(ArticleRevision, :revoke, args, ctx.reviewer)
+    assert [["invalidated", nil]] = vector_rows(id)
+    assert [["invalidated", nil]] = vector_rows(sibling)
+    assert :ok = Embedding.index(sibling)
+    refute_receive :wire, 50
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "an early recovery run waits for the queued deadline", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, _sibling] = request_index(ctx, revision)
+    fixture(%{})
+
+    assert {:snooze, wait} = Embedding.recover(id)
+    assert wait in 1..60
+    assert [["queued", nil]] = vector_rows(id)
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "archive clears ready vectors of a publishing revision", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, sibling] = request_index(ctx, revision)
+    fixture(%{})
+    assert :ok = Embedding.index(id)
+    assert [["ready", 1536]] = vector_rows(id)
+
+    assert {:ok, %{status: :archived}} =
+             invoke(
+               Article,
+               :archive,
+               %{id: revision.article_id, reason: :obsolete},
+               ctx.reviewer
+             )
+
+    assert [["invalidated", nil]] = vector_rows(id)
+    assert [["invalidated", nil]] = vector_rows(sibling)
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "missing gate, price, cap or reservation storage denies before the adapter", ctx do
+    {_collection, revision} = approved(ctx)
+    parent = self()
+    [first, _] = request_index(ctx, revision)
+
+    wire = fn request ->
+      send(parent, :unexpected_wire)
+      EmbeddingTransport.fixture_wire(request)
+    end
+
+    fixture(%{enabled: false, wire: wire})
+    assert :ok = Embedding.index(first)
+    assert [] == reservation_rows(first)
+
+    for settings <- [%{price: nil}, %{day_cap: nil}, %{month_cap: 81_919}] do
+      fixture(%{wire: wire})
+      [id, _] = request_index(ctx, revision, :retry_publication)
+      fixture(Map.put(settings, :wire, wire))
+      assert :ok = Embedding.index(id)
+      assert [] == reservation_rows(id)
+      assert [["failed", nil]] = vector_rows(id)
+    end
+
+    fixture(%{wire: wire})
+    [id, _] = request_index(ctx, revision, :retry_publication)
+
+    SQL.query!(Repo, """
+    CREATE FUNCTION fail_b1_reserve() RETURNS trigger LANGUAGE plpgsql AS
+    $$ BEGIN RAISE EXCEPTION 'synthetic reserve commit failure'; END; $$
+    """)
+
+    try do
+      SQL.query!(Repo, """
+      CREATE CONSTRAINT TRIGGER fail_b1_reserve AFTER INSERT ON usage_reservations
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_b1_reserve()
+      """)
+
+      assert {:error, :indexing_storage} = Embedding.index(id)
+      assert [] == reservation_rows(id)
+      refute_receive :unexpected_wire, 50
+    after
+      SQL.query!(Repo, "DROP TRIGGER IF EXISTS fail_b1_reserve ON usage_reservations")
+      SQL.query!(Repo, "DROP FUNCTION fail_b1_reserve()")
+    end
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "committed dispatch risk survives recovery and an authorized closure gets one late correction",
+       ctx do
+    {_collection, revision} = approved(ctx)
+    parent = self()
+    origin = ~U[2027-01-31 23:59:50.000000Z]
+    {:ok, clock} = Agent.start_link(fn -> origin end)
+
+    fixture(%{
+      clock: fn -> Agent.get(clock, & &1) end,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      closure_approved_by: ctx.admin.id,
+      before_settlement: fn attempt ->
+        send(parent, {:settlement, self(), attempt.id})
+
+        receive do
+          :complete -> :ok
+        end
+      end
+    })
+
+    [id, _] = request_index(ctx, revision)
+    task = Task.async(fn -> Embedding.index(id) end)
+    assert_receive {:settlement, worker, attempt_id}, 8_000
+    Agent.update(clock, fn _ -> DateTime.add(origin, 65) end)
+
+    assert :ok = Embedding.recover(id)
+    assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+    assert :ok = Embedding.index(id)
+
+    [candidate, _] = request_index(ctx, revision, :retry_publication)
+    assert :ok = Embedding.index(candidate)
+    assert [] == reservation_rows(candidate)
+
+    args = %{id: attempt_id, reason: :conservative_closure}
+    assert {:error, _} = invoke(InferenceRun, :close_unknown_embedding, args, ctx.reviewer)
+
+    assert {:ok, %{state: :abandoned}} =
+             invoke(InferenceRun, :close_unknown_embedding, args, ctx.admin)
+
+    assert {:ok, %{state: :abandoned}} =
+             invoke(InferenceRun, :close_unknown_embedding, args, ctx.admin)
+
+    assert [["abandoned", true, "conservatively_settled", 81_920, 81_920]] = reservation_rows(id)
+
+    send(worker, :complete)
+    assert :ok = Task.await(task)
+    assert [["settlement", 81_920, nil, admin], ["correction", -81_912, 3, nil]] = ledger_rows(id)
+    assert admin == ctx.admin.id
+    assert [["failed", nil]] = vector_rows(id)
+    assert [["day", ~D[2027-01-31], 8], ["month", ~D[2027-01-01], 8]] == origin_windows()
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "a lost process releases only a pre-dispatch reservation and holds after the fence", ctx do
+    {_collection, revision} = approved(ctx)
+    now = ~U[2027-01-31 23:58:00.000000Z]
+    {:ok, clock} = Agent.start_link(fn -> now end)
+    parent = self()
+
+    base = %{
+      clock: fn -> Agent.get(clock, & &1) end,
+      wire: fn request ->
+        send(parent, :wire_hit)
+        EmbeddingTransport.fixture_wire(request)
+      end
+    }
+
+    fixture(base)
+
+    for {stage, action, attempt_state, reserve_state, dispatched} <- [
+          {:after_claim, :request_publish, "rejected", "released", false},
+          {:after_dispatch, :retry_publication, "unknown", "unknown", true},
+          {:before_settlement, :retry_publication, "unknown", "unknown", true}
+        ] do
+      [id, _] = request_index(ctx, revision, action)
+      fixture(Map.put(base, stage, fn _ -> exit(:synthetic_crash) end))
+      {pid, ref} = spawn_monitor(fn -> Embedding.index(id) end)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :synthetic_crash}, 5_000
+      Agent.update(clock, &DateTime.add(&1, 61))
+      assert :ok = Embedding.recover(id)
+      assert :ok = Embedding.recover(id)
+      assert :ok = Embedding.index(id)
+      assert [[^attempt_state, ^dispatched, ^reserve_state, 81_920, nil]] = reservation_rows(id)
+      assert [] == ledger_rows(id)
+      if stage == :before_settlement, do: assert_receive(:wire_hit)
+      refute_receive :wire_hit, 50
+    end
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "an inhibit committed after the reservation stops dispatch and releases the hold",
+       ctx do
+    {_collection, revision} = approved(ctx)
+    parent = self()
+
+    fixture(%{
+      wire: fn request ->
+        send(parent, :wire_hit)
+        EmbeddingTransport.fixture_wire(request)
+      end,
+      after_claim: fn _ ->
+        SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = true")
+        :ok
+      end
+    })
+
+    [id, _] = request_index(ctx, revision)
+    assert :ok = Embedding.index(id)
+    assert [["rejected", false, "released", 81_920, nil]] = reservation_rows(id)
+    assert [] == ledger_rows(id)
+    assert [["failed", nil]] = vector_rows(id)
+    refute_receive :wire_hit, 50
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "settlement uses frozen trusted usage and inhibits admission on excess", ctx do
+    {_collection, revision} = approved(ctx)
+    parent = self()
+
+    wire = fn request ->
+      send(parent, {:pricing_wire, self()})
+
+      receive do
+        :complete -> response(request, 40_000)
+      end
+    end
+
+    fixture(%{wire: wire})
+    [id, sibling] = request_index(ctx, revision)
+    task = Task.async(fn -> Embedding.index(id) end)
+    assert_receive {:pricing_wire, wire_pid}, 8_000
+
+    fixture(%{
+      wire: wire,
+      price: %{
+        version: "fixture-change",
+        rate_nano_usd: 99,
+        token_unit: 1,
+        max_input_tokens: 32_768
+      }
+    })
+
+    send(wire_pid, :complete)
+    assert :ok = Task.await(task)
+    assert [["succeeded", true, "settled", 81_920, 100_000]] = reservation_rows(id)
+    assert [["settlement", 100_000, 40_000, nil]] = ledger_rows(id)
+
+    assert %{rows: [["embedding-fixture-v1", 5, 2, "over_reserve"]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT price_version, rate_nano_usd, token_unit, reason_code FROM usage_ledger_entries
+               WHERE inference_run_id IN (SELECT id FROM inference_runs WHERE article_embedding_id = $1)
+               """,
+               [Ecto.UUID.dump!(id)]
+             )
+
+    assert :ok = Embedding.index(id)
+    assert :ok = Embedding.index(sibling)
+    assert [] == reservation_rows(sibling)
+    refute_receive {:pricing_wire, _}, 50
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "malformed usage or cost overflow holds risk and invalid vectors charge known usage",
+       ctx do
+    {_collection, revision} = approved(ctx)
+
+    for {tokens, vector, action, attempt_state, reservation_state, actual} <- [
+          {3.0, :valid, :request_publish, "unknown", "unknown", nil},
+          {3, :zero, :retry_publication, "failed", "settled", 8},
+          {9_223_372_036_854_775_807, :valid, :retry_publication, "unknown", "unknown", nil}
+        ] do
+      [id, _] = request_index(ctx, revision, action)
+      fixture(%{wire: fn request -> response(request, tokens, vector) end})
+      assert :ok = Embedding.index(id)
+      assert [[^attempt_state, true, ^reservation_state, 81_920, ^actual]] = reservation_rows(id)
+      assert [["failed", nil]] = vector_rows(id)
+    end
+
+    assert %{rows: [[true]]} =
+             SQL.query!(Repo, "SELECT embedding_inhibited FROM automation_controls")
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "the control lock precedes variant and reservation writes at the spend cap", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, sibling] = request_index(ctx, revision)
+    parent = self()
+
+    fixture(%{
+      day_cap: 81_920,
+      month_cap: 81_920,
+      after_claim: fn _ ->
+        send(parent, {:held, self()})
+
+        receive do
+          :continue -> :ok
+        end
+      end
+    })
+
+    assert {:ok, worker} =
+             Repo.transact(fn ->
+               SQL.query!(Repo, "SELECT id FROM automation_controls FOR UPDATE")
+               worker = blocked_task(fn -> Embedding.index(id) end)
+
+               assert %{num_rows: 1} =
+                        SQL.query!(
+                          Repo,
+                          "SELECT id FROM article_embeddings WHERE id = $1 FOR UPDATE NOWAIT",
+                          [Ecto.UUID.dump!(id)]
+                        )
+
+               {:ok, worker}
+             end)
+
+    assert_receive {:held, worker_pid}, 5_000
+    assert :ok = Embedding.index(sibling)
+    assert [] == reservation_rows(sibling)
+    send(worker_pid, :continue)
+    assert :ok = Task.await(worker)
+    assert [["rejected", false, "released", 81_920, nil]] = reservation_rows(id)
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "archiving during the wire call preserves settlement and prevents a ready write", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, sibling] = request_index(ctx, revision)
+    parent = self()
+
+    fixture(%{
+      before_settlement: fn _ ->
+        send(parent, {:wire_complete, self()})
+
+        receive do
+          :settle -> :ok
+        end
+      end
+    })
+
+    task = Task.async(fn -> Embedding.index(id) end)
+    assert_receive {:wire_complete, worker}, 8_000
+
+    assert {:ok, %{status: :archived}} =
+             invoke(
+               Article,
+               :archive,
+               %{id: revision.article_id, reason: :obsolete},
+               ctx.reviewer
+             )
+
+    send(worker, :settle)
+    assert :ok = Task.await(task)
+    assert [["succeeded", true, "settled", 81_920, 8]] = reservation_rows(id)
+    assert [["invalidated", nil]] = vector_rows(id)
+    assert [["invalidated", nil]] = vector_rows(sibling)
   end
 
   test "collection lifecycle requires live ADMIN authority and advances epochs", ctx do
@@ -837,6 +1497,154 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
              invoke(ArticleRevision, :approve, %{args | self_approval: true}, importer)
 
     assert approval_reason(imported.id) == "self_approval_attested"
+  end
+
+  defp fixture(settings),
+    do: Application.put_env(:voelgoed_ai, :embedding_fixture, Map.put(settings, :mode, :fixture))
+
+  defp approved(ctx) do
+    collection = collection(ctx)
+    reviewed = review(ctx, draft_revision(ctx, collection))
+
+    assert {:ok, revision} =
+             invoke(ArticleRevision, :approve, attest(snapshot(reviewed)), ctx.reviewer)
+
+    {collection, revision}
+  end
+
+  defp request_index(ctx, revision, action \\ :request_publish) do
+    args = Map.put(snapshot(revision), :expected_current_revision_id, nil)
+
+    assert {:ok, %{status: :publishing, publication_generation: generation}} =
+             invoke(ArticleRevision, action, args, ctx.reviewer)
+
+    assert %{rows: [[first], [second]]} =
+             SQL.query!(
+               Repo,
+               "SELECT id::text FROM article_embeddings WHERE revision_id = $1 AND generation = $2 ORDER BY locale",
+               [Ecto.UUID.dump!(revision.id), generation]
+             )
+
+    [first, second]
+  end
+
+  defp reservation_rows(id) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT i.state, i.dispatched_at IS NOT NULL, r.state, r.reserved_nano_usd, r.actual_nano_usd
+      FROM inference_runs i JOIN usage_reservations r ON r.inference_run_id = i.id
+      WHERE i.article_embedding_id = $1 ORDER BY i.ordinal
+      """,
+      [Ecto.UUID.dump!(id)]
+    ).rows
+  end
+
+  defp ledger_rows(id) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT entry_kind, amount_nano_usd, input_tokens, closure_approved_by_id::text
+      FROM usage_ledger_entries
+      WHERE inference_run_id IN (SELECT id FROM inference_runs WHERE article_embedding_id = $1)
+      ORDER BY inserted_at, id
+      """,
+      [Ecto.UUID.dump!(id)]
+    ).rows
+  end
+
+  defp origin_windows do
+    SQL.query!(Repo, """
+    SELECT kind, window_start, settled_nano_usd FROM spend_windows
+    WHERE settled_nano_usd > 0 AND window_start IN ('2027-01-31', '2027-01-01', '2027-02-01')
+    ORDER BY kind
+    """).rows
+  end
+
+  defp response(request, tokens, vector \\ :valid) do
+    {request, response} = EmbeddingTransport.fixture_wire(request)
+    body = Map.put(response.body, "usage", %{"prompt_tokens" => tokens, "total_tokens" => tokens})
+
+    body =
+      if vector == :zero,
+        do: put_in(body, ["data", Access.at(0), "embedding"], List.duplicate(0.0, 1536)),
+        else: body
+
+    {request, %{response | body: body}}
+  end
+
+  defp vector_rows(id) do
+    SQL.query!(Repo, "SELECT state, vector_dims(vector) FROM article_embeddings WHERE id = $1", [
+      Ecto.UUID.dump!(id)
+    ]).rows
+  end
+
+  defp delete_embedding_fixture(editor_id, original_inhibit) do
+    params = [Ecto.UUID.dump!(editor_id)]
+    revision = "SELECT id FROM article_revisions WHERE created_by_id = $1"
+    embedding = "SELECT id FROM article_embeddings WHERE revision_id IN (#{revision})"
+    attempt = "SELECT id FROM inference_runs WHERE article_embedding_id IN (#{embedding})"
+
+    SQL.query!(
+      Repo,
+      "DELETE FROM audit_events WHERE actor_kind = 'embedding_worker' AND article_revision_target_id IN (#{revision})",
+      params
+    )
+
+    SQL.query!(
+      Repo,
+      "DELETE FROM oban_jobs WHERE (args->>'embedding_id')::uuid IN (#{embedding})",
+      params
+    )
+
+    SQL.query!(
+      Repo,
+      """
+      WITH charges AS (
+        SELECT r.day_window, r.month_window, l.amount_nano_usd
+        FROM usage_ledger_entries l JOIN usage_reservations r ON r.id = l.reservation_id
+        WHERE l.inference_run_id IN (#{attempt})
+      ), deltas AS (
+        SELECT 'day' AS kind, day_window AS window_start, sum(amount_nano_usd) AS amount
+        FROM charges GROUP BY day_window
+        UNION ALL
+        SELECT 'month', month_window, sum(amount_nano_usd)
+        FROM charges GROUP BY month_window
+      )
+      UPDATE spend_windows w SET settled_nano_usd = w.settled_nano_usd - d.amount
+      FROM deltas d WHERE d.kind = w.kind AND d.window_start = w.window_start
+      """,
+      params
+    )
+
+    SQL.query!(
+      Repo,
+      "DELETE FROM usage_ledger_entries WHERE corrects_id IS NOT NULL AND inference_run_id IN (#{attempt})",
+      params
+    )
+
+    SQL.query!(
+      Repo,
+      "DELETE FROM usage_ledger_entries WHERE inference_run_id IN (#{attempt})",
+      params
+    )
+
+    SQL.query!(
+      Repo,
+      "DELETE FROM usage_reservations WHERE inference_run_id IN (#{attempt})",
+      params
+    )
+
+    SQL.query!(
+      Repo,
+      "UPDATE article_embeddings SET last_attempt_id = NULL, attempt_count = 0, state = 'invalidated', vector = NULL WHERE id IN (#{embedding})",
+      params
+    )
+
+    SQL.query!(Repo, "DELETE FROM inference_runs WHERE id IN (#{attempt})", params)
+    SQL.query!(Repo, "DELETE FROM article_embeddings WHERE id IN (#{embedding})", params)
+
+    SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = $1", [original_inhibit])
   end
 
   defp compete(operation) do

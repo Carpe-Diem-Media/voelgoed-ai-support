@@ -1,3 +1,9 @@
+Postgrex.Types.define(
+  VoelgoedAi.PostgresTypes,
+  [AshPostgres.Extensions.Vector] ++ Ecto.Adapters.Postgres.extensions(),
+  []
+)
+
 defmodule VoelgoedAi.Repo do
   @moduledoc "The AshPostgres repository for application data."
   use AshPostgres.Repo, otp_app: :voelgoed_ai
