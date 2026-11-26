@@ -13,13 +13,16 @@ defmodule VoelgoedAi.Support.Configuration do
   alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Accounts.StaffAccess.Session
   alias VoelgoedAi.Governance.{AuditEvent, AutomationControl}
-  alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
+  alias VoelgoedAi.Intelligence.{Assistant, AssistantKnowledgeGrant, AssistantRevision}
+  alias VoelgoedAi.Knowledge.KnowledgeCollection
   alias VoelgoedAi.Repo
   alias VoelgoedAi.Support.{ActionScope, InboxBinding}
   alias VoelgoedAi.Support.ActionScope.Storage
 
   @revision_fields [:workflow_version, :template_version, :locale, :response_policy]
   @inbox_fields [:installation_ref, :external_account_id, :external_inbox_id]
+  @grant_limit 20
+  @grant_actions [:grant_collection, :remove_collection]
   @routing_fields [:credential_ref, :handoff_team_id]
 
   @impl true
@@ -69,7 +72,8 @@ defmodule VoelgoedAi.Support.Configuration do
   defp execute(AssistantRevision, action, %{id: id} = args, admin) do
     # Read the immutable parent key first. Every draft operation then locks the
     # assistant before locking or changing any of its revisions.
-    with {:ok, candidate} <- get(AssistantRevision, id),
+    with :ok <- lock_grant_control(action),
+         {:ok, candidate} <- get(AssistantRevision, id),
          {:ok, assistant} <- get(Assistant, candidate.assistant_id, :for_update),
          :ok <- editable_assistant(assistant),
          {:ok, %{status: :draft} = revision} <- get(AssistantRevision, id, :for_update) do
@@ -141,6 +145,20 @@ defmodule VoelgoedAi.Support.Configuration do
   defp editable_assistant(%{status: :retired}), do: {:error, :invalid_transition}
   defp editable_assistant(_assistant), do: :ok
 
+  defp revision_transition(revision, assistant, action, %{collection_id: id}, admin)
+       when action in @grant_actions do
+    with {:ok, %KnowledgeCollection{} = collection} <- collection(id, :for_update),
+         {:ok, grants} <- grants(revision.id),
+         {:ok, changed?} <- change_grant(action, assistant, revision, collection, grants),
+         :ok <- audit_grant(changed?, revision, collection, action, admin),
+         {:ok, grants} <- grants(revision.id) do
+      {:ok, Map.put(projection(revision), :collection_ids, Enum.map(grants, & &1.collection_id))}
+    else
+      {:ok, nil} -> {:error, :inactive_collection}
+      error -> error
+    end
+  end
+
   defp revision_transition(revision, _assistant, :edit_draft, args, admin) do
     attrs =
       args |> Map.take(@revision_fields) |> Map.reject(fn {_key, value} -> is_nil(value) end)
@@ -153,7 +171,10 @@ defmodule VoelgoedAi.Support.Configuration do
 
   defp revision_transition(revision, assistant, :publish, args, admin) do
     with :ok <- expected_pointer(assistant, Map.fetch(args, :expected_active_revision_id)),
-         {:ok, hash} <- fixture_hash(revision),
+         {:ok, grants} <- grants(revision.id),
+         :ok <- validate_grants(assistant, grants),
+         collection_ids = Enum.map(grants, & &1.collection_id),
+         {:ok, hash} <- fixture_hash(%{revision | config_hash_version: 2}, collection_ids),
          :ok <- supersede(assistant.active_revision_id, admin),
          {:ok, published} <-
            change(
@@ -161,6 +182,7 @@ defmodule VoelgoedAi.Support.Configuration do
              %{
                status: :published,
                config_hash: hash,
+               config_hash_version: 2,
                published_by_id: admin,
                published_at: DateTime.utc_now()
              },
@@ -174,8 +196,94 @@ defmodule VoelgoedAi.Support.Configuration do
              :switch_revision,
              admin
            ) do
-      {:ok, projection(published)}
+      {:ok, Map.put(projection(published), :collection_ids, collection_ids)}
     end
+  end
+
+  defp lock_grant_control(action) when action in [:publish | @grant_actions] do
+    with {:ok, _control} <- lock_control(), do: :ok
+  end
+
+  defp lock_grant_control(_action), do: :ok
+
+  @doc false
+  def lock_control, do: get(AutomationControl, :global, :for_update)
+
+  defp change_grant(:grant_collection, assistant, revision, collection, grants) do
+    with :ok <- eligible_grant(assistant, collection) do
+      cond do
+        Enum.any?(grants, &(&1.collection_id == collection.id)) ->
+          {:ok, false}
+
+        length(grants) >= @grant_limit ->
+          {:error, :grant_limit}
+
+        true ->
+          attrs = %{assistant_revision_id: revision.id, collection_id: collection.id}
+
+          with {:ok, _} <-
+                 storage(AssistantKnowledgeGrant, :create_grant, fn actor ->
+                   Ash.create(AssistantKnowledgeGrant, attrs, action: :create_grant, actor: actor)
+                 end),
+               do: {:ok, true}
+      end
+    end
+  end
+
+  defp change_grant(:remove_collection, _assistant, _revision, collection, grants) do
+    case Enum.find(grants, &(&1.collection_id == collection.id)) do
+      nil ->
+        {:ok, false}
+
+      grant ->
+        with :ok <-
+               storage(AssistantKnowledgeGrant, :remove_grant, fn actor ->
+                 Ash.destroy(grant, action: :remove_grant, actor: actor)
+               end),
+             do: {:ok, true}
+    end
+  end
+
+  defp collection(id, lock), do: read(KnowledgeCollection, :storage_row, %{id: id}, lock)
+
+  defp grants(id) do
+    storage(AssistantKnowledgeGrant, :for_revision, fn actor ->
+      AssistantKnowledgeGrant
+      |> Ash.Query.for_read(:for_revision, %{id: id}, actor: actor)
+      |> Ash.read()
+    end)
+  end
+
+  # IDs are sorted by the storage read. Collection changes also hold control,
+  # so eligibility and membership remain stable until the pointer commits.
+  defp validate_grants(assistant, grants) when length(grants) <= @grant_limit do
+    Enum.reduce_while(grants, :ok, fn grant, :ok ->
+      case collection(grant.collection_id, :for_update) do
+        {:ok, row} ->
+          case eligible_grant(assistant, row) do
+            :ok -> {:cont, :ok}
+            error -> {:halt, error}
+          end
+
+        error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp validate_grants(_assistant, _grants), do: {:error, :grant_limit}
+
+  defp eligible_grant(%{audience: :public}, %{audience: :internal}),
+    do: {:error, :internal_collection}
+
+  defp eligible_grant(_assistant, %{status: :active}), do: :ok
+  defp eligible_grant(_assistant, _collection), do: {:error, :inactive_collection}
+
+  defp audit_grant(false, _revision, _collection, _action, _admin), do: :ok
+
+  defp audit_grant(true, revision, collection, action, admin) do
+    with {:ok, _} <- audit(revision, revision, action, admin, %{collection_id: collection.id}),
+         do: :ok
   end
 
   defp expected_pointer(%{active_revision_id: expected}, {:ok, expected}), do: :ok
@@ -284,7 +392,7 @@ defmodule VoelgoedAi.Support.Configuration do
   @doc false
   def current_revision(%Assistant{active_revision_id: id}) when is_binary(id) do
     with {:ok, %{status: :published} = revision} <- get(AssistantRevision, id),
-         {:ok, hash} <- fixture_hash(revision),
+         {:ok, hash} <- published_hash(revision),
          true <- hash == revision.config_hash do
       {:ok, revision}
     else
@@ -336,7 +444,7 @@ defmodule VoelgoedAi.Support.Configuration do
          {:ok, %{status: :published, assistant_id: owner} = revision} <-
            get(AssistantRevision, id),
          true <- owner == assistant.id,
-         {:ok, hash} <- fixture_hash(revision),
+         {:ok, hash} <- published_hash(revision),
          true <- revision.config_hash == hash do
       :ok
     else
@@ -357,11 +465,26 @@ defmodule VoelgoedAi.Support.Configuration do
     end
   end
 
-  defp fixture_hash(revision) do
+  defp published_hash(%{config_hash_version: 1} = revision), do: fixture_hash(revision, [])
+
+  defp published_hash(%{config_hash_version: 2} = revision) do
+    with {:ok, grants} <- grants(revision.id),
+         true <- length(grants) <= @grant_limit do
+      fixture_hash(revision, Enum.map(grants, & &1.collection_id))
+    else
+      _ -> {:error, :stale_policy}
+    end
+  end
+
+  defp fixture_hash(revision, collection_ids) do
     case fixture() do
       %{fixed_text: text} = fixture when is_binary(text) and byte_size(text) in 1..4096 ->
         if same_fields?(revision, fixture, [:assistant_id | @revision_fields]) do
           value = Enum.map(@revision_fields ++ [:fixed_text], &Map.fetch!(fixture, &1))
+
+          # Preserve the original fixed-reply hash for predecessor rows.
+          value =
+            if revision.config_hash_version == 2, do: [2, value, collection_ids], else: value
 
           {:ok,
            :crypto.hash(:sha256, :erlang.term_to_binary(value)) |> Base.encode16(case: :lower)}
@@ -460,6 +583,7 @@ defmodule VoelgoedAi.Support.Configuration do
         :revision_number,
         :status,
         :config_hash,
+        :config_hash_version,
         :published_at | @revision_fields
       ])
 
@@ -519,7 +643,7 @@ defmodule VoelgoedAi.Support.Configuration do
     end
   end
 
-  defp audit(before, row, event, admin) do
+  defp audit(before, row, event, admin, metadata \\ %{}) do
     {kind, foreign_key} = audit_target(row.__struct__)
 
     attrs = %{
@@ -530,7 +654,7 @@ defmodule VoelgoedAi.Support.Configuration do
       event: event,
       reason_code: :local_admin,
       operational_before: audit_state(before),
-      operational_after: audit_state(row),
+      operational_after: Map.merge(audit_state(row), metadata),
       correlation_id: Ash.UUIDv7.generate()
     }
 
