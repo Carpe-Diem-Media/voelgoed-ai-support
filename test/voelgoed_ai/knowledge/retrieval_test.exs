@@ -2,6 +2,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
   use ExUnit.Case, async: false
 
   import VoelgoedAi.KnowledgeFixtures
+  import ExUnit.CaptureLog, only: [capture_log: 1]
   import VoelgoedAi.SupportFixtures, only: [invoke: 4, blocked_task: 1]
 
   alias Ecto.Adapters.SQL
@@ -9,7 +10,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
   alias VoelgoedAi.Intelligence.{AssistantRevision, Embedding, EmbeddingTransport, InferenceRun}
   alias VoelgoedAi.Knowledge.{ArticleRevision, KnowledgeCollection, Publication, Retrieval}
   alias VoelgoedAi.Knowledge.Workers.FinalizePublication
-  alias VoelgoedAi.Support.{Ingress, RunProcessing}
+  alias VoelgoedAi.Support.{Ingress, Ownership, RunProcessing}
 
   @moduletag :requires_pgvector
   @moduletag :embedding_index
@@ -25,6 +26,76 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       assert {:error, %Ash.Error.Forbidden{}} = Ash.run_action(input)
     end
   end
+
+  test "retrieval statements and synthetic query text stay out of Repo telemetry and logs" do
+    ctx = setup_search()
+    sibling = SupportDBCase.next_conversation(ctx.support, 1)
+    {failed_claim, _} = create_run(sibling)
+    sentinel = "syntheticretrievalprivacy"
+    handler = {__MODULE__, make_ref()}
+
+    assert :ok =
+             :telemetry.attach(
+               handler,
+               [:voelgoed_ai, :repo, :query],
+               &__MODULE__.classify_query_event/4,
+               {self(), sentinel}
+             )
+
+    try do
+      logs =
+        capture_log(fn ->
+          SQL.query!(Repo, "SELECT 9123 AS harmless_query_control")
+          assert_received {:repo_query, :control}
+
+          Retrieval.with_fixture(ctx.claim, fn search, validate ->
+            assert {:ok, %{status: :evidence, evidence: [item]}} =
+                     Knowledge.search_published("FAQ " <> sentinel, actor: search)
+
+            assert {:ok, %{status: :evidence, evidence: [^item]}} =
+                     Knowledge.validate_evidence([item.citation_id], [@link], actor: validate)
+          end)
+
+          fixture(%{wire: &wire_result(&1, 503)})
+
+          Retrieval.with_fixture(failed_claim, fn search, _ ->
+            assert {:ok, %{status: :unavailable, evidence: []}} =
+                     Knowledge.search_published("FAQ " <> sentinel, actor: search)
+          end)
+        end)
+
+      refute_received {:repo_query, :retrieval}
+      refute_received {:repo_query, :sentinel}
+      refute String.contains?(logs, sentinel)
+      refute String.contains?(logs, ["WITH eligible AS MATERIALIZED", "tsvector_to_array"])
+    after
+      :telemetry.detach(handler)
+    end
+  end
+
+  @doc false
+  def classify_query_event(_, _, %{query: query} = metadata, {test, sentinel})
+      when test == self() do
+    cond do
+      query == "SELECT 9123 AS harmless_query_control" ->
+        send(test, {:repo_query, :control})
+
+      String.contains?(query, [
+        "WITH eligible AS MATERIALIZED",
+        "tsvector_to_array",
+        "SET LOCAL statement_timeout = '750ms'"
+      ]) ->
+        send(test, {:repo_query, :retrieval})
+
+      :binary.match(:erlang.term_to_binary(metadata), sentinel) != :nomatch ->
+        send(test, {:repo_query, :sentinel})
+
+      true ->
+        :ok
+    end
+  end
+
+  def classify_query_event(_, _, _, _), do: :ok
 
   test "bilingual synthetic FAQ projects exact evidence and validates only issued references" do
     ctx = setup_search()
@@ -453,6 +524,358 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     refute_received :wire
   end
 
+  for field <- [:lease_expires_at, :deadline_at], boundary <- [:rank, :validate] do
+    @cutoff_field field
+    @boundary boundary
+
+    test "#{boundary} denies at the exact #{field} while the other cutoff is future" do
+      ctx = setup_search()
+      cutoff = DateTime.add(ctx.now, 10)
+      before_cutoff = DateTime.add(cutoff, -1, :microsecond)
+      set_run_cutoff(ctx.claim, @cutoff_field, cutoff)
+      parent = self()
+
+      fixture(%{
+        clock: fn -> ctx.now end,
+        wire: fn req ->
+          send(parent, :wire)
+          EmbeddingTransport.fixture_wire(req)
+        end,
+        before_settlement: fn _ ->
+          if @boundary == :rank, do: set_support_clock(ctx, cutoff)
+        end
+      })
+
+      observe_rank = fn _, _, _ -> send(parent, :rank_executed) end
+
+      Retrieval.with_rank_measurement(observe_rank, fn ->
+        Retrieval.with_fixture(ctx.claim, fn search, validate ->
+          result = Knowledge.search_published("FAQ", actor: search)
+          assert_received :wire
+          assert query_rows(ctx) == [["succeeded", true, "settled", 8]]
+
+          case @boundary do
+            :rank ->
+              assert {:ok, %{status: :unavailable, evidence: []}} = result
+              refute_received :rank_executed
+
+            :validate ->
+              assert {:ok, %{status: :evidence, evidence: [item]}} = result
+              assert_received :rank_executed
+              set_support_clock(ctx, before_cutoff)
+
+              assert {:ok, %{status: :evidence, evidence: [^item]}} =
+                       Knowledge.validate_evidence([item.citation_id], [@link], actor: validate)
+
+              set_support_clock(ctx, cutoff)
+
+              assert {:ok, %{status: :denied, evidence: []}} =
+                       Knowledge.validate_evidence([item.citation_id], [@link], actor: validate)
+          end
+
+          refute_received :wire
+        end)
+      end)
+    end
+
+    if boundary == :rank do
+      test "rank projects evidence one microsecond before #{field}" do
+        ctx = setup_search()
+        cutoff = DateTime.add(ctx.now, 10)
+        set_run_cutoff(ctx.claim, @cutoff_field, cutoff)
+
+        fixture(%{
+          clock: fn -> ctx.now end,
+          before_settlement: fn _ ->
+            set_support_clock(ctx, DateTime.add(cutoff, -1, :microsecond))
+          end
+        })
+
+        assert {:ok, %{status: :evidence, evidence: [_]}} = search(ctx.claim)
+        assert query_rows(ctx) == [["succeeded", true, "settled", 8]]
+      end
+    end
+  end
+
+  test "embedding inhibit after the query claim releases the reservation before dispatch" do
+    ctx = setup_search()
+    parent = self()
+
+    fixture(%{
+      clock: fn -> ctx.now end,
+      after_claim: fn _ ->
+        assert %{num_rows: 1} =
+                 SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = true")
+
+        assert {:ok, :ok} =
+                 RunProcessing.with_run(ctx.claim.run_id, fn config, session, run, now ->
+                   assert Ownership.write_enabled?(config)
+                   assert RunProcessing.valid_run?(config, session, run)
+                   assert run.state == :running
+                   assert run.claim_generation == ctx.claim.claim_generation
+                   assert DateTime.before?(now, run.deadline_at)
+                   assert DateTime.before?(now, run.lease_expires_at)
+                   {:ok, :ok}
+                 end)
+      end,
+      wire: fn req ->
+        send(parent, :wire)
+        EmbeddingTransport.fixture_wire(req)
+      end
+    })
+
+    assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
+    assert query_rows(ctx) == [["rejected", false, "released", nil]]
+    refute_received :wire
+  end
+
+  defp set_run_cutoff(claim, field, cutoff) do
+    assert %{num_rows: 1} =
+             SQL.query!(Repo, "UPDATE support_runs SET #{field} = $2 WHERE id = $1", [
+               uuid(claim.run_id),
+               DateTime.to_naive(cutoff)
+             ])
+  end
+
+  defp set_support_clock(ctx, now), do: Agent.update(ctx.support.fake, &%{&1 | now: now})
+
+  for change <- [
+        :revocation,
+        :expiry,
+        :grant_withdrawal,
+        :generation,
+        :index_epoch,
+        :revision_profile,
+        :embedding_profile,
+        :ownership_epoch,
+        :human_takeover
+      ],
+      boundary <- [:rank, :validate] do
+    @change change
+    @stage boundary
+
+    test "#{boundary} requalifies after #{change}" do
+      {ctx, decoy} = evidence_fixture(@change)
+
+      case @stage do
+        :rank ->
+          assert_rank_after_change(ctx, decoy, @change)
+
+        :validate ->
+          Retrieval.with_fixture(ctx.claim, fn search, validate ->
+            assert {:ok, %{status: :evidence, evidence: items}} =
+                     Knowledge.search_published("FAQ", actor: search)
+
+            target = Enum.find(items, &(&1.revision_id == ctx.revision.id))
+            current = Enum.find(items, &(&1.revision_id == decoy))
+            assert target.links == [@link]
+
+            assert {:ok, %{status: :evidence, evidence: [^target, ^current]}} =
+                     Knowledge.validate_evidence(
+                       [target.citation_id, current.citation_id],
+                       [@link],
+                       actor: validate
+                     )
+
+            change_evidence(ctx, @change)
+
+            assert {:ok, %{status: :denied, evidence: []}} =
+                     Knowledge.validate_evidence([target.citation_id], [@link], actor: validate)
+
+            assert {:ok, %{status: :denied, evidence: []}} =
+                     Knowledge.validate_evidence(
+                       [target.citation_id, current.citation_id],
+                       [],
+                       actor: validate
+                     )
+
+            unless @change in [:grant_withdrawal, :ownership_epoch, :human_takeover] do
+              assert {:ok, %{status: :evidence, evidence: [^current]}} =
+                       Knowledge.validate_evidence([current.citation_id], [], actor: validate)
+            end
+          end)
+      end
+    end
+  end
+
+  test "rank projection holds the control row against a competing editorial revocation" do
+    {ctx, decoy} = evidence_fixture(:revocation)
+    parent = self()
+
+    observe = fn _, _, {:ok, _} ->
+      writer = blocked_task(fn -> change_evidence(ctx, :revocation) end)
+
+      probe =
+        Task.async(fn ->
+          assert {:error, %Postgrex.Error{postgres: %{pg_code: "55P03"}}} =
+                   SQL.query(Repo, "SELECT id FROM automation_controls FOR UPDATE NOWAIT")
+        end)
+
+      Task.await(probe, 2_000)
+      send(parent, {:blocked_editor, writer})
+    end
+
+    Retrieval.with_fixture(ctx.claim, fn search, validate ->
+      assert {:ok, %{status: :evidence, evidence: items}} =
+               Retrieval.with_rank_measurement(observe, fn ->
+                 Knowledge.search_published("FAQ", actor: search)
+               end)
+
+      assert_received {:blocked_editor, writer}
+      assert MapSet.new(items, & &1.revision_id) == MapSet.new([ctx.revision.id, decoy])
+      assert :ok = Task.await(writer, 5_000)
+      target = Enum.find(items, &(&1.revision_id == ctx.revision.id))
+
+      assert {:ok, %{status: :denied, evidence: []}} =
+               Knowledge.validate_evidence([target.citation_id], [@link], actor: validate)
+    end)
+  end
+
+  defp evidence_fixture(:expiry) do
+    expiry = DateTime.add(DateTime.utc_now(), 600)
+    ctx = setup_search(%{}, content: %{"expires_at" => DateTime.to_iso8601(expiry)})
+    cutoff = DateTime.add(expiry, 30)
+    set_run_cutoff(ctx.claim, :deadline_at, cutoff)
+    set_run_cutoff(ctx.claim, :lease_expires_at, cutoff)
+    {Map.put(ctx, :expiry, expiry), clone_published(ctx, 1, %{})}
+  end
+
+  defp evidence_fixture(_change) do
+    ctx = setup_search()
+    {ctx, clone_published(ctx, 1, %{})}
+  end
+
+  defp assert_rank_after_change(ctx, decoy, change) do
+    parent = self()
+    barrier = make_ref()
+
+    fixture(%{
+      clock: fn -> ctx.now end,
+      wire: fn req ->
+        send(parent, {:embedding_parked, barrier, self()})
+
+        receive do
+          {:complete_embedding, ^barrier} -> EmbeddingTransport.fixture_wire(req)
+        after
+          5_000 -> exit(:embedding_fixture_timeout)
+        end
+      end
+    })
+
+    searcher = Task.async(fn -> search(ctx.claim) end)
+    assert_receive {:embedding_parked, ^barrier, adapter}, 5_000
+
+    try do
+      change_evidence(ctx, change)
+    after
+      send(adapter, {:complete_embedding, barrier})
+    end
+
+    assert {:ok, result} = Task.await(searcher, 5_000)
+    assert query_rows(ctx) == [["succeeded", true, "settled", 8]]
+
+    case change do
+      :index_epoch ->
+        assert result.status == :evidence
+
+        assert %{index_epoch: 2} =
+                 Enum.find(result.evidence, &(&1.revision_id == ctx.revision.id))
+
+      denied when denied in [:grant_withdrawal, :ownership_epoch, :human_takeover] ->
+        assert result == %{status: :unavailable, evidence: []}
+
+      _ ->
+        assert result.status == :evidence
+        assert Enum.map(result.evidence, & &1.revision_id) == [decoy]
+    end
+  end
+
+  defp change_evidence(ctx, :revocation) do
+    args = Map.put(snapshot(ctx.revision), :reason, :obsolete)
+
+    assert {:ok, %{status: :revoked}} =
+             invoke(ArticleRevision, :revoke, args, ctx.knowledge.reviewer)
+
+    :ok
+  end
+
+  defp change_evidence(ctx, :expiry), do: set_support_clock(ctx, ctx.expiry)
+
+  defp change_evidence(ctx, :grant_withdrawal) do
+    admin = ctx.knowledge.admin
+    draft = VoelgoedAi.SupportFixtures.draft(admin, ctx.support.assistant)
+    args = %{id: draft.id, collection_id: ctx.collection.id}
+
+    assert {:ok, %{collection_ids: [_]}} =
+             invoke(AssistantRevision, :grant_collection, args, admin)
+
+    assert {:ok, %{collection_ids: []}} =
+             invoke(AssistantRevision, :remove_collection, args, admin)
+
+    assert {:ok, _} =
+             invoke(
+               AssistantRevision,
+               :publish,
+               %{id: draft.id, expected_active_revision_id: ctx.support.revision.id},
+               admin
+             )
+  end
+
+  defp change_evidence(ctx, :human_takeover) do
+    event = fn payload ->
+      Map.merge(payload, %{
+        "id" => ctx.support.event.message_id + 1,
+        "message_type" => "outgoing",
+        "sender" => %{"type" => "user", "id" => 82}
+      })
+    end
+
+    assert SupportDBCase.signed_request(ctx.support, event).status == 204
+
+    assert %{rows: [["human_active", true]]} =
+             SQL.query!(Repo, "SELECT state, human_inhibit FROM support_sessions WHERE id = $1", [
+               uuid(SupportDBCase.session_id(ctx.support))
+             ])
+  end
+
+  defp change_evidence(ctx, :ownership_epoch) do
+    assert %{num_rows: 1} =
+             SQL.query!(
+               Repo,
+               "UPDATE support_sessions SET ownership_epoch = ownership_epoch + 1 WHERE id = $1",
+               [uuid(SupportDBCase.session_id(ctx.support))]
+             )
+  end
+
+  defp change_evidence(ctx, :embedding_profile) do
+    assert %{num_rows: 1} =
+             SQL.query!(
+               Repo,
+               "UPDATE article_embeddings SET profile_id = 'different-profile' WHERE revision_id = $1 AND locale = 'en-ZA'",
+               [uuid(ctx.revision.id)]
+             )
+  end
+
+  defp change_evidence(ctx, change)
+       when change in [:generation, :index_epoch, :revision_profile] do
+    update =
+      case change do
+        :generation ->
+          "active_index_generation = active_index_generation + 1, publication_generation = publication_generation + 1"
+
+        :index_epoch ->
+          "index_epoch = index_epoch + 1"
+
+        :revision_profile ->
+          "active_index_profile_id = 'different-profile'"
+      end
+
+    assert %{num_rows: 1} =
+             SQL.query!(Repo, "UPDATE article_revisions SET #{update} WHERE id = $1", [
+               uuid(ctx.revision.id)
+             ])
+  end
+
   for loss <- [:after_claim, :after_dispatch] do
     @loss loss
     test "scope loss at #{loss} yields no evidence and retains only the applicable cost" do
@@ -624,7 +1047,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       :telemetry.attach(
         handler,
         [:voelgoed_ai, :repo, :query],
-        &__MODULE__.ranking_event/4,
+        &__MODULE__.control_lock_event/4,
         self()
       )
 
@@ -634,24 +1057,18 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       {samples, _} =
         Enum.map_reduce(1..20, {ctx.support, ctx.claim}, fn index, {support, claim} ->
           start = System.monotonic_time(:microsecond)
-          assert {:ok, %{status: :evidence, evidence: evidence}} = search(claim)
+
+          assert {:ok, %{status: :evidence, evidence: evidence}} =
+                   Retrieval.with_rank_measurement(&measure_rank_plan/3, fn -> search(claim) end)
+
           total = System.monotonic_time(:microsecond) - start
           assert length(evidence) == 4
 
           assert Enum.map(evidence, & &1.revision_id) ==
                    Enum.sort(Enum.map(evidence, & &1.revision_id))
 
-          assert_received {:ranking_sample, timing, sql, params}
-
-          plan =
-            case SQL.query(Repo, "EXPLAIN (ANALYZE, FORMAT JSON) " <> sql, params,
-                   log: false,
-                   telemetry_event: nil
-                 ) do
-              {:ok, %{rows: [[[%{"Plan" => plan}]]]}} -> plan
-            end
-
-          nodes = plan_nodes(plan)
+          assert_received {:ranking_sample, nodes}
+          assert_received {:rank_control_lock, timing}
           branches = for {"WindowAgg", rows, time} <- nodes, rows == 10, do: time
 
           if index == 1 do
@@ -688,32 +1105,35 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       end
     after
       :telemetry.detach(handler)
+      Process.delete({__MODULE__, :control_locked})
+      Process.delete({__MODULE__, :rank_measured})
     end
   end
 
+  defp measure_rank_plan(sql, params, {:ok, _}) do
+    %{rows: [[[%{"Plan" => plan}]]]} =
+      SQL.query!(Repo, "EXPLAIN (ANALYZE, FORMAT JSON) " <> sql, params,
+        log: false,
+        telemetry_event: nil
+      )
+
+    Process.put({__MODULE__, :rank_measured}, true)
+    send(self(), {:ranking_sample, plan_nodes(plan)})
+  end
+
   @doc false
-  def ranking_event(_, _, %{query: query, params: params}, test) when test == self() do
+  def control_lock_event(_, _, %{query: query}, test) when test == self() do
     key = {__MODULE__, :control_locked}
-    sample = {__MODULE__, :ranking_sql}
 
     cond do
       query =~ ~s("automation_controls") and query =~ "FOR UPDATE" ->
         Process.put(key, System.monotonic_time(:microsecond))
 
-      query =~ "semantic AS (" and query =~ "lexical AS (" ->
-        Process.put(sample, {query, params})
-
       String.downcase(query) == "commit" ->
-        case Process.delete(sample) do
-          {sql, params} ->
-            send(
-              test,
-              {:ranking_sample, System.monotonic_time(:microsecond) - Process.get(key), sql,
-               params}
-            )
+        started = Process.delete(key)
 
-          nil ->
-            :ok
+        if Process.delete({__MODULE__, :rank_measured}) && started do
+          send(test, {:rank_control_lock, System.monotonic_time(:microsecond) - started})
         end
 
       true ->
@@ -721,13 +1141,52 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     end
   end
 
-  def ranking_event(_, _, _, _), do: :ok
+  def control_lock_event(_, _, _, _), do: :ok
 
   defp plan_nodes(plan) do
     [
       {plan["Node Type"], plan["Actual Rows"], plan["Actual Total Time"]}
       | Enum.flat_map(Map.get(plan, "Plans", []), &plan_nodes/1)
     ]
+  end
+
+  test "opposite branch ranks yield an exact fused tie ordered by revision UUID" do
+    ctx = setup_search()
+    lower = clone_published(ctx, 1, %{})
+    upper = ctx.revision.id
+    assert lower < upper
+
+    {:ok, orthogonal} = Ash.Vector.new([0.0, 1.0 | List.duplicate(0.0, 1534)])
+
+    assert %{num_rows: 1} =
+             SQL.query!(
+               Repo,
+               "UPDATE article_embeddings SET vector = $2 WHERE revision_id = $1",
+               [uuid(lower), orthogonal]
+             )
+
+    observe = fn _, _, {:ok, %{rows: rows}} ->
+      ranks =
+        Map.new(rows, fn [id | columns] -> {Ecto.UUID.load!(id), Enum.take(columns, -2)} end)
+
+      orders =
+        for permutation <- [rows, Enum.reverse(rows)] do
+          for {id, score, _} <- Retrieval.sort_fixture_ranks(permutation) do
+            {Ecto.UUID.load!(id), score}
+          end
+        end
+
+      send(self(), {:fused_ranks, ranks, orders})
+    end
+
+    assert {:ok, %{status: :evidence, evidence: evidence}} =
+             Retrieval.with_rank_measurement(observe, fn -> search(ctx.claim) end)
+
+    assert Enum.map(evidence, & &1.revision_id) == [lower, upper]
+    assert_received {:fused_ranks, ranks, orders}
+    assert ranks == %{lower => [2, 1], upper => [1, 2]}
+    expected = [{lower, {123, 3_782}}, {upper, {123, 3_782}}]
+    assert orders == [expected, expected]
   end
 
   defp setup_search(scope \\ %{}, opts \\ []) do
@@ -741,6 +1200,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       |> Map.update!("source_references", fn [source] ->
         [Map.put(source, "public_link", @link)]
       end)
+      |> Map.merge(Keyword.get(opts, :content, %{}))
 
     revision = draft_revision(knowledge, collection)
 
