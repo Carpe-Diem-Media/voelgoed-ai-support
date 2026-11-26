@@ -577,9 +577,10 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
              end)
 
     assert_receive {:authorized_query, ^attempt_id}, 5_000
-    assert_receive {:embedding_parked, ^barrier, adapter, false}, 5_000
+    assert_receive {:embedding_parked, ^barrier, adapter}, 5_000
 
     try do
+      assert_backend_idle(first_backend)
       assert {:ok, %{status: :unavailable, evidence: []}} = Task.await(second, 5_000)
 
       assert [[^attempt_id, fence, 1, dispatched_at]] = query_fence(ctx)
@@ -633,7 +634,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     assert {:ok, %{status: :unavailable, evidence: []}} = Task.await(first, 5_000)
     assert query_rows(ctx) == [["succeeded", true, "settled", 8]]
     refute_received {:authorized_query, _}
-    refute_received {:embedding_parked, ^barrier, _, _}
+    refute_received {:embedding_parked, ^barrier, _}
   end
 
   test "expiry of a parked unconsumed query claim releases it and denies dispatch" do
@@ -692,6 +693,17 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
         operation.()
       end)
     end)
+  end
+
+  defp assert_backend_idle(backend) do
+    # ReqLLM runs the timed adapter in another process. Inspect the caller's
+    # checked-out PostgreSQL backend while the adapter is parked.
+    assert %{rows: [[true, "idle"]]} =
+             SQL.query!(
+               Repo,
+               "SELECT xact_start IS NULL, state FROM pg_stat_activity WHERE pid = $1",
+               [backend]
+             )
   end
 
   defp lock_query(id, lock) do
@@ -944,7 +956,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
 
   defp parking_wire(parent, barrier, respond) do
     fn req ->
-      send(parent, {:embedding_parked, barrier, self(), Repo.in_transaction?()})
+      send(parent, {:embedding_parked, barrier, self()})
 
       receive do
         {:complete_embedding, ^barrier} -> respond.(req)
@@ -962,10 +974,13 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       wire: parking_wire(self(), barrier, &EmbeddingTransport.fixture_wire/1)
     })
 
-    searcher = Task.async(fn -> search(ctx.claim) end)
-    assert_receive {:embedding_parked, ^barrier, adapter, false}, 5_000
+    searcher = on_connection(fn -> search(ctx.claim) end)
+    searcher_pid = searcher.pid
+    assert_receive {:fixture_backend, ^searcher_pid, backend}, 5_000
+    assert_receive {:embedding_parked, ^barrier, adapter}, 5_000
 
     try do
+      assert_backend_idle(backend)
       change_evidence(ctx, change)
     after
       send(adapter, {:complete_embedding, barrier})
@@ -1228,15 +1243,18 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       })
 
       worker =
-        Task.async(fn ->
+        on_connection(fn ->
           Retrieval.with_rank_measurement(fn _, _, _ -> send(owner, :query_ranked) end, fn ->
             search(ctx.claim)
           end)
         end)
 
-      assert_receive {:embedding_parked, ^barrier, adapter, false}, 5_000
+      worker_pid = worker.pid
+      assert_receive {:fixture_backend, ^worker_pid, backend}, 5_000
+      assert_receive {:embedding_parked, ^barrier, adapter}, 5_000
 
       try do
+        assert_backend_idle(backend)
         assert query_rows(ctx) == [["running", true, "reserved", nil]]
 
         if @settlement_state == :unknown do
@@ -1293,7 +1311,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
                end)
 
       assert query_spend(DateTime.add(ctx.now, 35, :day)) == []
-      refute_received {:embedding_parked, ^barrier, _, _}
+      refute_received {:embedding_parked, ^barrier, _}
     end
   end
 

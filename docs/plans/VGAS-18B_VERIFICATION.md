@@ -46,8 +46,10 @@ The test parks caller A after the committed claim. An independent
 transaction takes the inference row lock. PostgreSQL reports that A is
 blocked by the lock holder and that caller B is blocked by A. A separate
 connection attempting `FOR UPDATE NOWAIT` reports SQLSTATE `55P03`.
-After release, one authorization and one adapter entry occur, outside a
-transaction. The contender returns unavailable.
+After release, one authorization and one adapter entry occur. While
+the adapter is parked, the test queries `pg_stat_activity` for caller
+A's pinned backend PID and checks that `xact_start IS NULL` and
+`state = 'idle'`. The contender returns unavailable.
 
 A sweep before expiry leaves the attempt running. A separate lock wait
 shows that when the scan selects a due attempt and the clock is corrected
@@ -88,7 +90,70 @@ stacktrace to the test process, which raises it after the search.
 The production rescue is untouched. Both documentation corrections are
 in the [PR A record](VGAS-18A_VERIFICATION.md#corrections-from-review).
 
+## Review corrections
+
+The reviewer found that B2 sampled `Repo.in_transaction?()` inside the
+adapter. ReqLLM 1.31.0 runs the request in a separate task when
+`total_timeout` is finite, so the adapter could report false even while
+the inference worker held an open transaction. See
+`deps/req_llm/lib/req_llm/timeout_budget.ex:70,129–138`.
+
+The concurrent dispatch, split-clock settlement and rank-change tests
+now pin the search worker with `Repo.checkout` and capture its
+PostgreSQL backend PID. After the park message arrives, the test process
+queries that PID from a separate connection. PostgreSQL 18.7 reports
+`xact_start IS NULL` for an idle backend without a transaction. The
+assertion also requires `state = 'idle'`. The adapter message carries
+only the barrier reference and adapter PID.
+
+The correction started from `5ecefd44dd8469a98ceaf22ddaeea5cefae0cca2`.
+Each run below used a fresh disposable database on port 55435 and
+`mise exec -- mix test test/voelgoed_ai/knowledge/retrieval_test.exs:<lines> --seed 0`.
+All production mutations were restored after their run.
+
+- **M9 before the correction.** With the transport transaction guard
+  removed and query `invoke` wrapped in `Repo.transact`, selector
+  `527:1218` exited 0 on the reviewed head.
+- **M9 after the correction.** Selector `527:1233` exited 2, with all
+  three selected cases failing at `assert_backend_idle/1` on line 701.
+  PostgreSQL returned `[[false, "idle in transaction"]]` where the
+  assertion expected `[[true, "idle"]]`.
+- **Transaction wrapper alone.** With the guard intact, selector
+  `527:1233` exited 2. All three cases timed out waiting for
+  `{:embedding_parked, barrier, adapter}` at lines 580 and 1254.
+  The guard denied transport before the adapter could enter.
+- **M1, expose a query vector after UNKNOWN at `embedding.ex:681`.**
+  Selector `1233` exited 2. The UNKNOWN case failed the assertion
+  expecting unavailable with empty evidence at line 1287. The RUNNING
+  control passed.
+- **M3, omit the post-lock recovery deadline recheck at `embedding.ex:186`.**
+  Selector `527` exited 2. The post-lock assertion at line 612
+  found UNKNOWN and held exposure where it expected RUNNING and reserved.
+
+The disposable runner exited 0 for the pre-correction M9 run and 1
+for each intentional failure. Each database and volume was removed.
+
+The reviewer accepted these coverage rulings:
+
+- Replay and contradictory-response clauses are unreachable from the
+  current entry points. VGAS-15 must cover them when it adds a caller
+  that can deliver a second response to settlement.
+- The wrong-parent mutation remains excluded from the assertion-kill
+  count. `test/voelgoed_ai/knowledge/editorial_test.exs:571` pins the
+  correction to the original ceiling entry. The compound foreign key on
+  `(reservation_id, corrects_id)` enforces that the parent belongs to the
+  same reservation.
+- Deleting only the nested generation retry limit is equivalent for
+  the current caller because the explicit top-level zero takes precedence.
+
+The inherited isolation failure when running
+`test/voelgoed_ai/knowledge/editorial_test.exs:304` alone is tracked in
+VGAS-22.
+
 ## Mutation evidence
+
+This table records the runs on the pre-review test code. The review
+correction and its mutation reruns appear above.
 
 Each test command used `mise exec -- mix test <selector> --seed 0`
 with port 55435. The helper applied one mutation, ran ExUnit, recorded
@@ -104,7 +169,7 @@ Production file paths in the guard column are relative to
 
 | Changed guard or write | Selector | Observed assertion or exclusion | ExUnit exit |
 | --- | --- | --- | ---: |
-| Broaden the query vector clause to UNKNOWN, `intelligence/embedding.ex:681` (the old E:678 survivor) | `knowledge/retrieval_test.exs:1218` | UNKNOWN returns evidence instead of unavailable with an empty result. RUNNING control passes. | 2 |
+| Broaden the query vector clause to UNKNOWN, `intelligence/embedding.ex:681` (the old E:678 survivor) | `knowledge/retrieval_test.exs:1218` | The stale result returns evidence after recovery because the support claim still qualifies. The test expects unavailable with empty evidence. The RUNNING control passes. | 2 |
 | Mark consumed UNKNOWN exposure released, `governance/embedding_accounting.ex:115–126` | `knowledge/retrieval_test.exs:1218` | Expected UNKNOWN reservation with full ceiling and no charge. RUNNING control passes. | 2 |
 | Use the completion date for the settlement windows, `governance/embedding_accounting.ex:224` | `knowledge/retrieval_test.exs:1218` | Original day and month lack the 18 nano-USD increment. RUNNING control passes. | 2 |
 | Overwrite the original charge instead of appending the correction, `governance/embedding_accounting.ex:287–304` | `knowledge/editorial_test.exs:505` | Expected a second ledger row with the linked correction and received none. | 2 |
@@ -115,12 +180,15 @@ Production file paths in the guard column are relative to
 | Permit a second dispatch on a consumed attempt, `intelligence/embedding.ex:522` | `knowledge/retrieval_test.exs:492` | The second consumption should return unavailable and returned an authorization. | 2 |
 | Skip the deadline recheck after acquiring the recovery lock, `intelligence/embedding.ex:186` | `knowledge/retrieval_test.exs:527` | The post-lock assertion expects RUNNING and a reserved ceiling. The mutation returns UNKNOWN. | 2 |
 | Route the committed marker through release, `intelligence/embedding.ex:189–193` | `knowledge/retrieval_test.exs:527` | The at-expiry sweep should succeed. The application release guard refuses the consumed attempt, returning `:indexing_storage`. | 2 |
-| Return a stale vector after recovery, `intelligence/embedding.ex:681` | `knowledge/retrieval_test.exs:1218` | Same operator and test as the former E:678 survivor. Earlier guard checks cannot mask it because the support claim remains valid. | 2 |
 | Release the consumed decode failure, `governance/embedding_accounting.ex:115–126` | `knowledge/retrieval_test.exs --only transport_fault:true` | The malformed-JSON case finds RELEASED where UNKNOWN is required. | 2 |
 | Remove the nested embedding retry limit, `intelligence/embedding_transport.ex:31` | `knowledge/retrieval_test.exs --only retry_fault:true` | Both 503 and timeout receive a second wire message. | 2 |
 | Remove the nested embedding retry limit through article indexing | `knowledge/editorial_test.exs:237` | The article 503 case receives a second wire message. | 2 |
 | Remove only the nested generation retry limit, `test/support/feasibility/transport_evidence.ex` | `ash_ai_feasibility_test.exs:317` | All four tests pass with the top-level zero in effect. Equivalent for this caller. | 0 |
 | Restore top-level generation retries to the provider default, `test/support/feasibility/inference.ex:38` | `ash_ai_feasibility_test.exs:317` | The 503 and timeout cases receive a second provider hit. Decode cases fail the adapter option assertion. | 2 |
+
+The table records 16 cases. Fourteen fail at the expected assertions.
+The wrong-parent case is excluded and the nested generation operator
+is equivalent for the tested caller.
 
 The two generation operators were rerun against the committed test
 code. Both forced TEST compiles then exited 0 on restored source.
@@ -130,7 +198,7 @@ exited 0 with 4 passed and 14 excluded. The restored runner exited 0.
 The compound foreign key for correction parents is
 `priv/repo/migrations/20261126063108_vgas_003_embedding_accounting.exs:530–532`.
 
-## Commands on the restored candidate
+## Commands on the pre-review candidate
 
 Mise reported Erlang 29.1.2 and Elixir 1.20.5-otp-29. The lockfile and
 installed package sources agreed on ReqLLM 1.31.0, Req 0.7.5, Ash AI
@@ -206,6 +274,26 @@ Both full-suite runner invocations exited 0 and removed their
 containers and volumes. The five skips are the F04 disposable
 fixture spike tests. The one exclusion is the predecessor migration
 lane test, which the standard test helper excludes.
+
+## Verification of the review correction
+
+The disposable runner used PostgreSQL 18.7 and pgvector 0.8.7 with
+`MIX_ENV=test`. Each steps file began with
+`mise exec -- mix deps.get --check-locked`, exit 0, with
+`HEX_OFFLINE=1` set in the runner environment.
+
+- `mise exec -- mix format --check-formatted` exited 0.
+- `ELIXIR_ERL_OPTIONS="+S 1" mise exec -- mix compile --force --warnings-as-errors` exited 0.
+- `ELIXIR_ERL_OPTIONS="+S 2" mise exec -- mix compile --force --warnings-as-errors` exited 0.
+- `mise exec -- mix ecto.migrate --strict-version-order` exited 0 on fresh storage.
+- `mise exec -- mix ash.codegen --check` exited 0.
+- The focused command above exited 0 with 316 passed and zero failures
+  for each seed (`0`, `103`, `8125`) on port 55435. The runner exited 0.
+- `mise exec -- mix test --seed 103` and
+  `mise exec -- mix test --seed 8125` each exited 0 on a fresh database
+  on port 55434. Each run reported 538 passed, five skipped and one
+  excluded. Both runner invocations exited 0 and removed their containers
+  and volumes.
 
 ## Handoff
 
