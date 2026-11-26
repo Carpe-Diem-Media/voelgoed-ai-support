@@ -22,6 +22,88 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
   setup :setup_knowledge
 
+  test "a draft with a stale content hash cannot be submitted for review", ctx do
+    draft = draft_revision(ctx, collection(ctx))
+    content = Map.put(draft.content, "effective_from", "2026-02-01T00:00:00Z")
+    store_content(draft, content)
+
+    assert {:ok, %{action_hints: %{submit_review: false, edit_draft: true}}} =
+             invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.editor)
+
+    assert {:error, _} =
+             invoke(ArticleRevision, :submit_review, snapshot(draft), ctx.editor)
+  end
+
+  @tag :embedding_index
+  test "malformed stored publication dates return a revision view and fail eligibility", ctx do
+    now = ~U[2026-11-26 00:00:00Z]
+    fixture(%{clock: fn -> now end})
+    {_collection, revision} = approved(ctx)
+
+    for field <- ["effective_from", "expires_at"], value <- [42, "garbage"] do
+      assert_stored_date(ctx, revision, field, value, :unavailable, now)
+    end
+  end
+
+  @tag :embedding_index
+  test "stored offset dates are compared in UTC for notices and fail eligibility", ctx do
+    now = ~U[2026-11-26 00:00:00Z]
+    fixture(%{clock: fn -> now end})
+    {_collection, revision} = approved(ctx)
+
+    assert_stored_date(
+      ctx,
+      revision,
+      "effective_from",
+      "2026-11-25T23:30:00-01:00",
+      :not_yet_effective,
+      now
+    )
+
+    assert_stored_date(ctx, revision, "expires_at", "2026-11-26T01:00:00+02:00", :expired, now)
+
+    assert_stored_date(
+      ctx,
+      revision,
+      "effective_from",
+      "2026-11-26T01:00:00+02:00",
+      :unavailable,
+      now
+    )
+
+    assert_stored_date(
+      ctx,
+      revision,
+      "expires_at",
+      "2026-11-25T23:30:00-01:00",
+      :unavailable,
+      now
+    )
+  end
+
+  defp assert_stored_date(ctx, revision, field, value, blocker, now) do
+    content = Map.put(revision.content, field, value)
+    store_content(revision, content)
+
+    assert {:error, :stale_request} = Embedding.eligible_content(content, now)
+
+    assert {:ok,
+            %{
+              status: :approved,
+              action_hints: %{request_publish: false},
+              publication_blocker: ^blocker,
+              content: %{^field => ^value}
+            }} = invoke(ArticleRevision, :read_revision, %{id: revision.id}, ctx.reviewer)
+  end
+
+  defp store_content(revision, content) do
+    assert %{num_rows: 1} =
+             SQL.query!(Repo, "UPDATE article_revisions SET content = $1 WHERE id = $2", [
+               content,
+               Ecto.UUID.dump!(revision.id)
+             ])
+  end
+
   @tag :requires_pgvector
   @tag :embedding_index
   test "publication is separate from approval and only a reviewer can queue the locales", ctx do

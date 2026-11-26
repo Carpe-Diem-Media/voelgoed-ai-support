@@ -18,7 +18,9 @@ Open `/staff/knowledge` from the registered HTTPS origin.
    **New revision**. Enter the FAQ text, applicability, language variants,
    dates with explicit UTC offsets and source references. **Save draft**
    opens the revision. **Edit draft** changes its content, and **Submit for
-   review** freezes the displayed snapshot for review. Use **Withdraw
+   review** freezes the displayed snapshot for review. If the revision
+   asks for a source reference, use **Edit draft** to add one and save.
+   **Submit for review** appears once the draft has a source. Use **Withdraw
    revision** to end work on a draft or pending review.
 3. A scoped reviewer checks the source and displayed text. **Request
    changes** returns the revision to draft. **Approve revision** requires
