@@ -184,5 +184,72 @@ The five skips belong to the disposable F04 knowledge tests. The two excluded te
 ## Remaining authority and evidence
 
 - A-010 moves live Chatwoot and Req wire-attempt evidence to F07/VGAS-8. The real adapter remains unavailable, and the local circuit thresholds are synthetic defaults. The owner still controls staging credentials, routing, approved limits and alert destinations.
-- Local alert telemetry carries internal IDs and typed reasons. Existing durable state stores triage and uncertainty, and manual abandonment has an atomic audit row. Plan §3 also calls for separate automatic audit rows for missed deadlines, UNKNOWN and failed handoff. This pass leaves that append-only system audit work open.
+- The initial PR B pass recorded local alert telemetry and manual abandonment audit. The follow-up below adds the system audit and read projection required by plan §3.
 - Review and CI for the pushed candidate remain the responsibility of the PR orchestrator and independent reviewer.
+
+## PR B system audit follow-up
+
+The follow-up starts at PR B head `3fbb38578990031ea0c9f8155d7801853a08630a` and closes the automatic audit and read projection requirement in plan §3. The application commit is `275e71404fd26b36d0ad793658ec26f18846a0f0`. Migration `20261126000420_vgas_002_system_audit.exs` and snapshot `20261126000421.json` add restricted receipt and run references and retain the existing delivery reference. The audit treats `support_worker` as a code-owned actor. It records the event and a closed reason code separately.
+
+`AuditEvent.system_history` returns up to 100 facts for one internal target. It rechecks the current staff operator or admin role, or compares the Reconciliation actor's exact target and inbox with the qualified record. The projection includes the internal audit, target and correlation IDs, event, actor kind, reason and timestamp.
+
+### PostgreSQL cases and mutations
+
+- Six ambiguous adapter results and recovery after worker loss each produce one `delivery_unknown` fact. Delivery retries preserve the original fact and the spent attempt.
+- Overdue receipt triage under a contended lock and overdue run recovery record `missed_deadline` against their respective targets. Reprocessing records no duplicate.
+- Read exhaustion, pending handoff expiry and expiry of a claimed but undispatched handoff each record `handoff_failed`. An expired handoff already in UNKNOWN records the failure while retaining its original uncertainty.
+- Forced append failures leave receipt triage uncommitted, handoff pending, and a possibly dispatched write in SENDING with its committed dispatch marker. Recovery can then record the fact.
+- Tests check projection fields, current staff and reconciliation access, denial of raw storage calls inside a real transaction, actor-kind validation and the PostgreSQL actor reference constraint. The VGAS-001 audit action and staff lifecycle checks also run.
+
+The tests were added before implementation. The original head failed the new deadline and UNKNOWN assertions with exit 2. A separate red run for expiry of a claimed handoff also exited 2 on the missing fact. Each mutation was applied separately and restored. The five commands below use `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test <selection> --seed 0`.
+
+| Mutation | Selection | Exit and failing assertion |
+| --- | --- | --- |
+| Omit UNKNOWN append | `test/voelgoed_ai/support/delivery_recovery_test.exs:50` | 2. All six ambiguous-result tests expect one delivery fact. |
+| Omit missed-deadline append | `test/voelgoed_ai/support/workflow_test.exs:358` | 2. Recovery retries must leave one run deadline fact. |
+| Omit handoff-failure append | `test/voelgoed_ai/support/delivery_recovery_test.exs:312` | 2. Five-minute expiry must leave a handoff failure fact. |
+| Move UNKNOWN append after transaction commit | `test/voelgoed_ai/support/delivery_recovery_test.exs:67` | 2. Append failure must leave the authorized row in SENDING. |
+| Drop the append actor-kind validation | `test/voelgoed_ai/support/delivery_recovery_test.exs:91` | 2. The system append changeset must reject a staff actor kind. |
+
+### Local command results
+
+| Command | Exit | Result |
+| --- | --- | --- |
+| `git fetch origin` | 0 | Read base `24453be` and initial PR head `3fbb385`. |
+| `git merge --ff-only origin/feat/vgas-002b-signed-flow` | 0 | Used this isolated branch because the PR branch was checked out in another worktree. |
+| `devcore-project plan`, `devcore-project activate`, `devcore-project doctor` | 0 each | Confirmed PG18 and DevCore TEST on 55433. |
+| `mise exec -- mix deps.get --check-locked` | 0 | Resolved the locked dependencies. |
+| `mise exec -- mix hex.audit` | 0 | No retired or security advisory packages reported. |
+| `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix ash.codegen vgas_002_system_audit` | 0 | Generated one migration and one snapshot. |
+| `mise exec -- mix format --check-formatted` | 0 | Formatting passed. |
+| `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix compile --warnings-as-errors` | 0 | Compilation passed. |
+| `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix ash.codegen --check` | 0 | Resource snapshots matched. |
+| `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix ecto.migrate --strict-version-order` | 0 | Migration order check passed in TEST. |
+| `devcore-project run test -- env -u OPENAI_API_KEY MIX_ENV=test mise exec -- mix ecto.migrations` | 0 | All ten migrations were up. |
+| `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai_web/chatwoot_webhook_test.exs test/voelgoed_ai/support --seed 0` | 0 | Focused suite passed. |
+| `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test test/voelgoed_ai_web/chatwoot_webhook_test.exs test/voelgoed_ai/support --seed 103` | 0 | 98 passed. |
+| `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --seed 0` | 0 | Full suite passed. |
+| `devcore-project run test -- env -u OPENAI_API_KEY mise exec -- mix test --seed 103` | 0 | 345 passed, 5 skipped, 2 excluded. |
+| `python3 .github/scripts/plan_tests.py` | 0 | Generated eight shards. |
+| `git diff --check 24453be..HEAD` | 0 | Full PR diff passed the whitespace check. |
+| `git diff --exit-code 24453be..HEAD -- mix.exs mix.lock` | 0 | Both dependency files match the base. |
+| `rg -n 'authorize\?: false' lib` | 1 | No matches. |
+| `PORT=4190 devcore-project run dev -- env -u OPENAI_API_KEY mise exec -- mix phx.server` | 143 after SIGTERM | Server started and was stopped after the health check. |
+| `curl --fail -sS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:4190/health` | 0 | HTTP 200. |
+| `ss -ltn '( sport = :4190 or sport = :55434 )'` | 0 | Both ports were free after cleanup. |
+
+The first follow-up test runs exited 2. The handoff fixture initially confirmed the remote goal, which bypassed the expiry path. The full suites also exposed two legacy tests that enumerate all audit actions. The fixture and both action inventories were updated. Earlier focused retries had intermittent fixture failures. The final suites ran serially on DevCore TEST.
+
+Rehearsals used a temporary PostgreSQL 18 container with pgvector on loopback port 55434. They created the vector extension in the fresh database, verified it, and used generated credentials. The upgrade used `git archive 24453be priv/repo/migrations` and seeded one VGAS-001 staff-security fact and one PR A configuration fact. Both facts survived upgrade, rollback and reapply. The final rehearsal wrapper exited 0.
+
+| Rehearsal command | Exit |
+| --- | --- |
+| Fresh `MIX_ENV=test mise exec -- mix ecto.migrate --strict-version-order` | 0 |
+| `MIX_ENV=test mise exec -- mix ecto.migrate --migrations-path "$d/base/priv/repo/migrations" --strict-version-order` | 0 |
+| Upgrade `MIX_ENV=test mise exec -- mix ecto.migrate --strict-version-order` | 0 |
+| `MIX_ENV=test mise exec -- mix ecto.rollback --step 1` | 0 |
+| Reapply `MIX_ENV=test mise exec -- mix ecto.migrate --strict-version-order` | 0 |
+
+The first fresh rehearsal omitted the CI vector extension setup and stopped at the extension probe with exit 1. Two upgrade rehearsal attempts stopped at the synthetic seed with exit 3. The final seed supplies the required assistant audience. The rollback rehearsal used historical staff and configuration facts only. Once the new system facts exist, the predecessor audit constraints prevent a schema rollback that would discard those facts.
+
+F07/VGAS-8 still owns live Chatwoot and wire-attempt evidence. GitHub Actions and independent review must evaluate the pushed PR head.
