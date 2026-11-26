@@ -11,7 +11,7 @@ config :voelgoed_ai,
 
 config :voelgoed_ai, VoelgoedAi.Repo, log: false
 
-# Install job storage now. A later slice must explicitly configure execution.
+# Job storage is available. Execution requires a separate activation decision.
 config :voelgoed_ai, Oban,
   repo: VoelgoedAi.Repo,
   queues: false,
@@ -30,7 +30,11 @@ config :req_llm, load_dotenv: false
 config :ash, default_string_length_count: :codepoints
 
 if config_env() == :test do
-  config :voelgoed_ai, Oban, testing: :manual
+  # Oban manual mode suppresses automatic Cron insertion. Tests perform the
+  # same bounded sweep worker explicitly.
+  config :voelgoed_ai, Oban,
+    testing: :manual,
+    cron: [crontab: [{"* * * * *", VoelgoedAi.Support.Workers.Sweep}]]
 
   config :voelgoed_ai, :entra_fixture_transport, {Req.Test, VoelgoedAi.StaffEntraFixture}
 

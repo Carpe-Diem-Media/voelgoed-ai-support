@@ -62,6 +62,30 @@ defmodule VoelgoedAi.RepoFoundationTest do
              """)
   end
 
+  test "support uniqueness and qualified references are enforced in PostgreSQL" do
+    assert %{rows: [[7, true]]} =
+             SQL.query!(Repo, """
+             SELECT count(*), bool_and(indisunique AND indpred IS NOT NULL)
+             FROM pg_index
+             WHERE indexrelid::regclass::text IN (
+               'support_sessions_one_current', 'inbound_events_message_key',
+               'inbound_events_stable_event_key', 'support_runs_one_active',
+               'outbound_deliveries_one_reply', 'outbound_deliveries_one_handoff',
+               'run_inputs_one_current'
+             )
+             """)
+
+    assert %{rows: [[4, true]]} =
+             SQL.query!(Repo, """
+             SELECT count(*), bool_and(cardinality(conkey) > 1 AND confdeltype = 'r' AND convalidated)
+             FROM pg_constraint
+             WHERE conname IN (
+               'support_sessions_binding_id_fkey', 'inbound_events_session_id_fkey',
+               'outbound_deliveries_run_id_fkey', 'support_runs_parent_run_id_fkey'
+             )
+             """)
+  end
+
   test "Oban v14 uses the application Repo in manual mode with no worker queues" do
     assert %{repo: Repo, testing: :manual, queues: [], plugins: []} = Oban.config()
     assert 14 == Oban.Migration.migrated_version(repo: Repo)

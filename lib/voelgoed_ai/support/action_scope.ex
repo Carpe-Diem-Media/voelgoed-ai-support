@@ -1,14 +1,15 @@
 defmodule VoelgoedAi.Support.ActionScope do
   @moduledoc """
-  Exact application scopes for reading support configuration. Callers construct
+  Exact application scopes for support configuration and jobs. Callers construct
   these from qualified records and trusted job context, never request fields.
   """
 
   use Ash.Policy.SimpleCheck
 
+  alias VoelgoedAi.Accounts.StaffAccess.Session
   alias VoelgoedAi.Governance.{AuditEvent, AutomationControl}
   alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
-  alias VoelgoedAi.Support.InboxBinding
+  alias VoelgoedAi.Support.{InboxBinding, JobAction}
 
   defmodule Ingress do
     @moduledoc "Scope for a trusted ingress operation."
@@ -38,6 +39,13 @@ defmodule VoelgoedAi.Support.ActionScope do
   def describe(_opts), do: "the application actor is authorized for this exact operation"
 
   @impl true
+  def match?(
+        %Session{},
+        %{subject: %Ash.ActionInput{resource: AuditEvent, action: %{name: :system_history}}},
+        _opts
+      ),
+      do: true
+
   def match?(scope, %{subject: %Ash.ActionInput{} = input}, _opts), do: permits?(scope, input)
   def match?(_, _, _), do: false
 
@@ -57,11 +65,14 @@ defmodule VoelgoedAi.Support.ActionScope do
       {:read_configuration, resource} when resource in [Assistant, AssistantRevision] ->
         kind == Processing and target == arguments.id
 
+      {:system_history, AuditEvent} ->
+        kind == Reconciliation and target == {arguments.target_kind, arguments.id}
+
       {:operational_history, AuditEvent} ->
         kind in [Processing, Reconciliation] and target == {arguments.target_kind, arguments.id}
 
       _ ->
-        false
+        JobAction.kind(resource, action) == kind and target == arguments[:id]
     end
   end
 

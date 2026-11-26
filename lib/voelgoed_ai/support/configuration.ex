@@ -266,6 +266,48 @@ defmodule VoelgoedAi.Support.Configuration do
     end)
   end
 
+  @doc false
+  def lock_inbox(inbox) do
+    with {:ok, control} <- get(AutomationControl, :global, :for_update),
+         {:ok, %InboxBinding{} = candidate} <- read(InboxBinding, :qualified_inbox, inbox),
+         {:ok, assistant} <- get(Assistant, candidate.assistant_id, :for_update),
+         {:ok, binding} <- get(InboxBinding, candidate.id, :for_update),
+         true <- binding.assistant_id == assistant.id do
+      {:ok, %{control: control, assistant: assistant, binding: binding}}
+    else
+      {:ok, nil} -> {:error, :scope_denied}
+      false -> {:error, :concurrent_configuration_change}
+      error -> error
+    end
+  end
+
+  @doc false
+  def current_revision(%Assistant{active_revision_id: id}) when is_binary(id) do
+    with {:ok, %{status: :published} = revision} <- get(AssistantRevision, id),
+         {:ok, hash} <- fixture_hash(revision),
+         true <- hash == revision.config_hash do
+      {:ok, revision}
+    else
+      _ -> {:error, :stale_policy}
+    end
+  end
+
+  def current_revision(_), do: {:error, :stale_policy}
+
+  @doc false
+  def render_fixed_reply(assistant, run, delivery) do
+    with {:ok, revision} <- current_revision(assistant),
+         true <- revision.id == run.assistant_revision_id,
+         :fixed_reply <- revision.response_policy,
+         true <- revision.template_version == delivery.template_version,
+         true <- revision.config_hash == delivery.template_hash,
+         %{fixed_text: text} <- fixture() do
+      {:ok, text}
+    else
+      _ -> {:error, :stale_policy}
+    end
+  end
+
   defp rebind_target(:rebind, %{assistant_id: id}), do: [id]
   defp rebind_target(_action, _args), do: []
 
@@ -363,11 +405,11 @@ defmodule VoelgoedAi.Support.Configuration do
   defp scoped_configuration(Assistant, %{id: id}, %{assistant_id: id}),
     do: project(get(Assistant, id))
 
-  # Workers see only revisions that were published. Drafts and discarded
-  # revisions stay visible to admins only.
+  # Publication bumps the assistant epoch. A run pinned to a superseded
+  # revision retains its FK for history, but cannot render another reply.
   defp scoped_configuration(AssistantRevision, %{id: id}, %{assistant_id: assistant_id}) do
-    with {:ok, %{assistant_id: ^assistant_id, status: status} = revision}
-         when status in [:published, :superseded] <- get(AssistantRevision, id) do
+    with {:ok, %{assistant_id: ^assistant_id, status: :published} = revision} <-
+           get(AssistantRevision, id) do
       {:ok, projection(revision)}
     else
       _ -> {:error, :denied}

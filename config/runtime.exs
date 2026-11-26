@@ -41,3 +41,6 @@ config :voelgoed_ai, :entra,
 if config_env() != :prod do
   config :voelgoed_ai, VoelgoedAiWeb.Endpoint, secret_key_base: System.get_env("SECRET_KEY_BASE")
 end
+
+# F07 must verify the deployed contract before installing a network adapter.
+config :voelgoed_ai, :chatwoot_adapter, if(config_env() == :test, do: :fixture, else: :disabled)
