@@ -197,7 +197,7 @@ Verification status is **VERIFIED** for the local C1 Review 1 corrections. Merge
 
 ### HTTP and channel logging
 
-The primary logger filter replaces Bandit crash reports whose original `Plug.Conn.path_info` begins with `"staff"`. That prefix covers staff pages, the socket upgrade and the assets. The replacement carries a fixed notice and the OTP time, process and group leader metadata.
+The primary logger filter replaces Bandit crash reports whose original `Plug.Conn.path_info` begins with `"staff"`. That prefix covers staff pages, the socket upgrade and the assets. Review 3 showed that it did not cover percent-encoded paths, which Review 3 corrections below close. The replacement carries a fixed notice and the OTP time, process and group leader metadata.
 
 - Bandit 1.15.0 passes the original conn and plug to `handle_error/7` after conn construction. It unwraps `Plug.Conn.WrapperError` and logs the formatted exception with `domain: [:bandit]` and `crash_reason`. Elixir 1.20.5 prepends `:elixir` to that domain before the primary filters see it. See `deps/bandit/lib/bandit/{pipeline,logger}.ex` and Elixir's `Logger.add_elixir_domain/1`. Bandit is the configured adapter. The lockfile has no Plug.Cowboy package.
 - Phoenix 1.8.17 wraps the endpoint at compile time and emits `[:phoenix, :error_rendered]` before re-raising. Its logger prints the exception module for a struct exception and can inspect a thrown or exited reason. The endpoint marks the staff request process so the primary filter can drop that Phoenix log, which carries no conn metadata. The successful endpoint call clears the marker. On failure the marker survives until the Phoenix log is filtered, and a subsequent non-staff call clears any remainder. Bandit supplies the fixed crash notice. See `deps/phoenix/lib/phoenix/{endpoint.ex,endpoint/render_errors.ex,logger.ex}`. The configured JSON error response uses the status template.
@@ -270,6 +270,27 @@ BUG_FIX. Author self-assessment for VGAS-003 C1 Review 2, tracked in Plane VGAS-
 Implementation score is **9/10**. Requirements 4/4, observed verification 2/3, correctness and risk 2/2, and handoff 1/1. Hosted exact-head CI accounts for the verification deduction. Confidence is **90%**, based on the debug captures, 11 killed mutations and two full local seeds. Redaction depends on the pinned framework report shapes. The cause of the earlier indexing-status flake remains unconfirmed.
 
 Verification status is **VERIFIED** for the local Review 2 corrections. Merge status is `NOT_VERIFIED_FOR_MERGE`. The orchestrator owns hosted CI and independent review on the pushed head.
+
+## Review 3 corrections
+
+Review 3 at `8dbcbdb5eaa2a2f347abde3a5b75bcf7cabd2bcc` found one MEDIUM gap (R3-1). Phoenix 1.8.17's router URI-decodes each path segment before it matches a route (`deps/phoenix/lib/phoenix/router.ex:470`), but Bandit leaves `path_info` undecoded. Requests to `/%73taff/knowledge` and `/st%61ff/knowledge` therefore reached the staff LiveViews. The endpoint marker, `request_log_level/1` and the crash filter all match the raw `"staff"` segment, so none of them recognised these requests. A dead-render crash on such a path logged the exception, the staff ID and the payload. The socket and the assets were not affected, because socket dispatch and `Plug.Static` match the raw path.
+
+The fix is in commit `08f18e2`. Before any plug or log runs, `Endpoint.call/2` returns an empty 404 for any request whose first segment contains `%` and decodes to `"staff"`. A first segment with a malformed escape is left to the router, which already rejects it, and such a segment cannot decode to `"staff"`. All three raw-path checks therefore see every request that can reach a staff route.
+
+A new real-TLS test sends `/%73taff/knowledge`, `/st%61ff/knowledge` and `/%73%74%61%66%66/knowledge` with a valid staff cookie, and a scope fixture that crashes if it is reached. For each path it asserts a 404, that the request never reached the staff route, and that the debug capture contains none of the cookie, staff ID, binding, payload or path text.
+
+The orchestrator ran these checks on `08f18e2`.
+
+- The disposable helper on port 55434 ran `deps.get --check-locked`, `format --check-formatted`, `compile --warnings-as-errors`, and the staff suites (`staff_knowledge_{crash_log,auth,live}_test.exs` and `staff_auth_test.exs`) at seed 0. Every step exited 0, and the staff suites passed 58 tests.
+- Mutant: replacing the guard with `if false` made the new test fail (exit 2, 7 of 8 passed in the crash-log file). After `git checkout -- lib test config`, the diff check exited 0.
+- `mix test --seed 97` exited 0 with 468 passed, 5 skipped and 1 excluded. The expected synthetic reserve-commit failure was logged.
+- Forced TEST compiles under `ELIXIR_ERL_OPTIONS="+S 1"` and `"+S 2"` each exited 0.
+- `git diff --check e1040b8`, `git diff --exit-code e1040b8 -- mix.exs mix.lock priv/repo/migrations priv/resource_snapshots`, and Gitleaks with redaction exited 0, and Gitleaks found no leaks. `rg 'authorize\?: false' lib` found no matches.
+
+Not fixed in this PR:
+
+- R3-2 (LOW). No test pins that the request marker is cleared. Mutants that never clear it survive. In production this is safe, because Bandit's default `clear_process_dict: true` resets the process dictionary between keep-alive requests, and Bandit closes the connection after a 500. This is a C2 follow-up: add an in-process staff-404-then-public-404 debug test.
+- R3-3 (NIT). The socket `connect` origin check and the `handle_event` access recheck are both backed by outer checks, so removing either one leaves behaviour unchanged. They stay as defence in depth.
 
 ## Files changed
 
