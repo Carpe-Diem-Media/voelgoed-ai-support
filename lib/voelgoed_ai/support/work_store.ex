@@ -167,10 +167,17 @@ defmodule VoelgoedAi.Support.WorkStore do
     end)
   end
 
+  # Exposed so tests can prove each module is limited to its own actions;
+  # a capability still requires the caller's private local capture.
+  @doc false
+  def owns?(module, resource, action),
+    do: action in (@owners |> Map.get(module, %{}) |> Map.get(resource, []))
+
   defp owned?(owner, resource, action) when is_function(owner, 0) do
     info = Function.info(owner)
-    actions = @owners |> Map.get(info[:module], %{}) |> Map.get(resource, [])
-    info[:type] == :local and info[:name] == :work_store_owner and action in actions
+
+    info[:type] == :local and info[:name] == :work_store_owner and
+      owns?(info[:module], resource, action)
   end
 
   defp owned?(_, _, _), do: false

@@ -132,6 +132,20 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert {:ok, [^row]} = invoke.(ctx.admin)
     assert {:ok, [^row]} = invoke.(scope)
 
+    # Another delivery's system row and a staff row on this delivery must not
+    # appear in this target's system history.
+    other = SupportDBCase.next_conversation(ctx, 2)
+    other_id = SupportDBCase.prepare_reply(other)
+    assert :ok = Delivery.deliver(other_id)
+    assert [_] = SupportDBCase.audit_rows(:delivery_target_id, other_id)
+
+    assert {:ok, %{state: :abandoned}} =
+             Support.abandon_delivery(ctx.operator, id, :acknowledge_uncertainty)
+
+    assert [_, _] = SupportDBCase.audit_rows(:delivery_target_id, id)
+    assert {:ok, [^row]} = invoke.(ctx.operator)
+    assert {:ok, [^row]} = invoke.(scope)
+
     for actor <- [
           nil,
           %{ctx.operator | generation: ctx.operator.generation + 1},
@@ -806,6 +820,42 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
 
   defp work_store_owner, do: Support
 
+  test "storage ownership grants each module only its own actions" do
+    alias VoelgoedAi.Support.{
+      Delivery,
+      Ingress,
+      Ownership,
+      Recovery,
+      RunProcessing,
+      SupportSession,
+      SystemAudit,
+      WorkStore
+    }
+
+    for {module, resource, action} <- [
+          {Support, OutboundDelivery, :abandon},
+          {Support, SupportSession, :return_to_bot},
+          {Support, AuditEvent, :append_support_operator},
+          {Delivery, OutboundDelivery, :authorize_dispatch},
+          {SystemAudit, AuditEvent, :append_system}
+        ] do
+      assert WorkStore.owns?(module, resource, action)
+    end
+
+    for {module, resource, action} <- [
+          {Ingress, SupportSession, :return_to_bot},
+          {Delivery, OutboundDelivery, :abandon},
+          {Recovery, OutboundDelivery, :authorize_dispatch},
+          {RunProcessing, OutboundDelivery, :confirm_sent},
+          {Ownership, AuditEvent, :append_support_operator},
+          {SystemAudit, AuditEvent, :append_support_operator},
+          {Support, AuditEvent, :append_system},
+          {__MODULE__, OutboundDelivery, :abandon}
+        ] do
+      refute WorkStore.owns?(module, resource, action)
+    end
+  end
+
   test "Ash actions enforce original states and own their target state", ctx do
     alias VoelgoedAi.Support.{InboundEvent, SupportRun, SupportSession}
 
@@ -818,7 +868,12 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
           {%InboundEvent{state: :dispatched, disposition: :covered}, :record_disposition,
            %{disposition: :triage}, :disposition},
           {%OutboundDelivery{state: :sending, dispatch_authorized_at: ctx.event.received_at},
-           :safe_retry, %{claim_generation: 1}, :dispatch_authorized_at}
+           :safe_retry, %{claim_generation: 1}, :dispatch_authorized_at},
+          {%OutboundDelivery{state: :pending}, :authorize_dispatch,
+           %{dispatch_authorized_at: ctx.event.received_at}, :state},
+          {%OutboundDelivery{state: :sending, dispatch_authorized_at: ctx.event.received_at},
+           :authorize_dispatch, %{dispatch_authorized_at: ctx.event.received_at},
+           :dispatch_authorized_at}
         ] do
       changeset = Ash.Changeset.for_update(row, action, attrs)
 

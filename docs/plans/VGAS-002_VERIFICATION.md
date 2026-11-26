@@ -393,3 +393,21 @@ execution on DevCore TEST.
 
 F07 and isolated real inbox validation remain open. This follow-up used the
 fake adapter and carries no staging or exact-head independent review evidence.
+
+## Review 2 test gaps
+
+Review 2 of `2c1f834` requested changes for one test gap: the system history target filter had no test, and a mutant that removed it passed 144 tests. It also reported three LOW gaps with no reachable runtime defect: the actor-kind filter on system history, WorkStore's per-action allowlist, and the original-state guards on `:authorize_dispatch`. This follow-up adds tests and changes no runtime behaviour.
+
+- The system history test now creates a second UNKNOWN delivery in another conversation and abandons the first delivery as staff. History for the first delivery must still return only its own system row, to the operator and to the reconciliation scope.
+- `WorkStore.owns?/3` now holds the allowlist lookup that `owned?/3` already used. A new test checks that each module owns only its listed actions: for example `Ingress` cannot `return_to_bot`, `Delivery` cannot `abandon`, and `Ownership` cannot append a staff audit row.
+- The original-state test now covers `:authorize_dispatch` from PENDING and from an already authorized SENDING row.
+
+| Mutant | Test | Result |
+| --- | --- | --- |
+| System history without target-id scoping | system history test | Killed, exit 2 |
+| System history without the `actor_kind` filter | system history test | Killed, exit 2 |
+| `owns?/3` ignores the action | storage ownership test | Killed, exit 2 |
+| `:authorize_dispatch` without its state guard | original-state test | Killed, exit 2 |
+| `:authorize_dispatch` without its dispatch guard | original-state test | Killed, exit 2 |
+
+Each mutant ran alone with `--seed 0`, failed on an assertion rather than a compile error, and was reverted afterwards. On DevCore TEST, the delivery recovery file passed 55 tests. The full suite on seed 0 passed 358, with 5 skipped and 2 excluded. The webhook and support files on seed 103 passed 111. Format, compile with warnings as errors, `ash.codegen --check` and `git diff --check` exited 0.
