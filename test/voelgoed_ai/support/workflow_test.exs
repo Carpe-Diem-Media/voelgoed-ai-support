@@ -346,8 +346,51 @@ defmodule VoelgoedAi.Support.WorkflowTest do
                [Ecto.UUID.dump!(event_id)]
              )
 
+    assert :ok = RunProcessing.process_event(event_id)
+
+    assert [["support_worker", "inbound_event", "missed_deadline", "deadline"]] =
+             SupportDBCase.audit_rows(:event_target_id, event_id)
+
     assert [] = SupportDBCase.writes(ctx)
     assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "purpose")
+  end
+
+  test "a run deadline records one audit fact across recovery retries", ctx do
+    assert {:ok, receipt} = Ingress.accept(ctx.event)
+    assert :ok = RunProcessing.process_event(receipt)
+
+    assert %{rows: [[id]]} =
+             SQL.query!(Repo, "SELECT id::text FROM support_runs WHERE session_id = $1", [
+               Ecto.UUID.dump!(SupportDBCase.session_id(ctx))
+             ])
+
+    SupportDBCase.advance_clock(ctx, 46)
+    assert :ok = Recovery.run_deadline(id)
+    assert :ok = Recovery.run_deadline(id)
+
+    assert [["support_worker", "support_run", "missed_deadline", "deadline"]] =
+             SupportDBCase.audit_rows(:run_target_id, id)
+  end
+
+  test "failure to audit a receipt deadline rolls back triage", ctx do
+    assert {:ok, id} = Ingress.accept(ctx.event)
+    SupportDBCase.advance_clock(ctx, 46)
+
+    Process.put({VoelgoedAi.Support.SystemAudit, :reject_audit}, :missed_deadline)
+    assert {:error, :storage_failure} = RunProcessing.process_event(id)
+    Process.delete({VoelgoedAi.Support.SystemAudit, :reject_audit})
+
+    assert %{rows: [["pending", nil]]} =
+             SQL.query!(
+               Repo,
+               "SELECT disposition, session_id FROM inbound_events WHERE id = $1",
+               [
+                 Ecto.UUID.dump!(id)
+               ]
+             )
+
+    assert [] = SupportDBCase.audit_rows(:event_target_id, id)
+    assert :ok = RunProcessing.process_event(id)
   end
 
   for mode <- [:shadow, :assisted] do

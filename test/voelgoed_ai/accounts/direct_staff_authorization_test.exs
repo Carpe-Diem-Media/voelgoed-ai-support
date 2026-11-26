@@ -23,12 +23,15 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
   @audit_actions [
     append: :create,
     append_support_operator: :create,
-    staff_security_history: :read
+    append_system: :create,
+    staff_security_history: :read,
+    system_rows: :read
   ]
   @operational_actions [
     append_operational: :create,
     operational_history: :action,
-    operational_rows: :read
+    operational_rows: :read,
+    system_history: :action
   ]
 
   setup do
@@ -152,6 +155,20 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
       correlation_id: Ash.UUIDv7.generate()
     }
   end
+
+  defp arguments(:append_system, _) do
+    %{
+      actor_kind: :support_worker,
+      target_kind: :outbound_delivery,
+      delivery_target_id: Ash.UUIDv7.generate(),
+      event: :delivery_unknown,
+      reason_code: :ambiguous_write,
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:system_rows, _),
+    do: %{id: Ash.UUIDv7.generate(), target_kind: :outbound_delivery}
 
   defp arguments(:staff_security_history, %{target: target}), do: %{target_id: target.id}
 

@@ -7,7 +7,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
   alias VoelgoedAi.Governance.Admission
   alias VoelgoedAi.Repo
   alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, Delivery, InboundEvent}
-  alias VoelgoedAi.Support.{Ownership, RunInput, SupportRun, WorkStore}
+  alias VoelgoedAi.Support.{Ownership, RunInput, SupportRun, SystemAudit, WorkStore}
   alias VoelgoedAi.Support.Workers.{ProcessRun, Sweep}
 
   @max_pending 100
@@ -296,12 +296,15 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   defp disposition(event, session, disposition, reason, now) do
-    WorkStore.update(event, :record_disposition, %{
-      session_id: session.id,
-      disposition: disposition,
-      reason_code: reason,
-      processed_at: now
-    })
+    with {:ok, row} <-
+           WorkStore.update(event, :record_disposition, %{
+             session_id: session.id,
+             disposition: disposition,
+             reason_code: reason,
+             processed_at: now
+           }) do
+      audit_deadline(row)
+    end
   end
 
   @doc "Claim the current batch and render or suppress its fixed response."
@@ -487,15 +490,24 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   @doc false
-  def finish(run, action, state, now, reason),
-    do:
-      WorkStore.update(run, action, %{
-        state: state,
-        reason_code: reason,
-        finished_at: now,
-        lease_expires_at: nil,
-        retry_at: nil
-      })
+  def finish(run, action, state, now, reason) do
+    with {:ok, row} <-
+           WorkStore.update(run, action, %{
+             state: state,
+             reason_code: reason,
+             finished_at: now,
+             lease_expires_at: nil,
+             retry_at: nil
+           }) do
+      audit_deadline(row)
+    end
+  end
+
+  defp audit_deadline(%{reason_code: :deadline} = row) do
+    with {:ok, _} <- SystemAudit.append(row, :missed_deadline, :deadline), do: {:ok, row}
+  end
+
+  defp audit_deadline(row), do: {:ok, row}
 
   @doc false
   def job_result({:ok, result}) do

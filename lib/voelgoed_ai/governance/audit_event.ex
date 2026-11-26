@@ -1,5 +1,5 @@
 defmodule VoelgoedAi.Governance.AuditEvent do
-  @moduledoc "An immutable staff security or support configuration event with local references."
+  @moduledoc "An immutable staff security, configuration or support workflow fact with local references."
 
   use Ash.Resource,
     domain: VoelgoedAi.Governance,
@@ -9,7 +9,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   alias VoelgoedAi.Accounts.{StaffAccess, StaffUser}
   alias VoelgoedAi.Accounts.StaffAccess.Scope
 
-  alias VoelgoedAi.Support.{ActionScope, Configuration}
+  alias VoelgoedAi.Support.{ActionScope, Configuration, ReasonCode, SystemAudit, WorkStore}
 
   @staff_events [
     :provisioned,
@@ -39,6 +39,9 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   ]
   @target_kinds [:assistant, :assistant_revision, :inbox_binding, :automation_control]
   @support_events [:request_handoff, :return_to_bot, :close_session, :abandon_delivery]
+  @system_events [:delivery_unknown, :missed_deadline, :handoff_failed]
+  @system_target_kinds [:inbound_event, :support_run, :outbound_delivery]
+  @system_reason_sql Enum.map_join(ReasonCode.values(), ",", &"'#{&1}'")
   @operational_fields [
     ownership_epoch: [type: :integer, constraints: [min: 0]],
     status: [
@@ -111,6 +114,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       reference(:binding_target, on_delete: :restrict, on_update: :restrict)
       reference(:control_target, on_delete: :restrict, on_update: :restrict)
       reference(:session_target, on_delete: :restrict, on_update: :restrict)
+      reference(:event_target, on_delete: :restrict, on_update: :restrict)
+      reference(:run_target, on_delete: :restrict, on_update: :restrict)
       reference(:delivery_target, on_delete: :restrict, on_update: :restrict)
     end
 
@@ -119,12 +124,13 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         check: """
         (actor_kind = 'bootstrap' AND actor_staff_id IS NULL AND operator_ref = 'staff-bootstrap' AND operator_ref IS NOT NULL)
         OR (actor_kind = 'staff' AND actor_staff_id IS NOT NULL AND operator_ref IS NULL)
+        OR (actor_kind = 'support_worker' AND actor_staff_id IS NULL AND operator_ref IS NULL)
         """
       )
 
       check_constraint(:target_kind, "audit_events_exact_target",
         check: """
-          num_nonnulls(target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id, session_target_id, delivery_target_id) = 1
+          num_nonnulls(target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id, session_target_id, delivery_target_id, event_target_id, run_target_id) = 1
           AND (
             (target_kind = 'staff_user' AND target_id IS NOT NULL
               AND event IN ('provisioned','activated','signed_in','roles_changed','disabled','reactivated','retired')
@@ -140,18 +146,26 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             OR (target_kind = 'support_session' AND session_target_id IS NOT NULL
               AND event IN ('request_handoff','return_to_bot','close_session'))
             OR (target_kind = 'outbound_delivery' AND delivery_target_id IS NOT NULL
-              AND event = 'abandon_delivery')
+              AND event IN ('abandon_delivery','delivery_unknown','handoff_failed'))
+            OR (target_kind = 'inbound_event' AND event_target_id IS NOT NULL AND event = 'missed_deadline')
+            OR (target_kind = 'support_run' AND run_target_id IS NOT NULL AND event = 'missed_deadline')
           )
         """
       )
 
       check_constraint(:target_kind, "audit_events_state_shape",
         check: """
-          (target_kind = 'staff_user' AND after_state IS NOT NULL
+          (target_kind = 'staff_user' AND actor_kind IN ('staff','bootstrap') AND after_state IS NOT NULL
             AND operational_before IS NULL AND operational_after IS NULL)
           OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL
+            AND event NOT IN ('delivery_unknown','missed_deadline','handoff_failed')
             AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')
               OR (target_kind NOT IN ('staff_user', 'support_session', 'outbound_delivery') AND reason_code = 'local_admin')))
+          OR (actor_kind = 'support_worker' AND before_state IS NULL AND after_state IS NULL
+            AND operational_before IS NULL AND operational_after IS NULL
+            AND ((event = 'delivery_unknown' AND reason_code IN (#{@system_reason_sql}))
+              OR (event = 'missed_deadline' AND reason_code = 'deadline')
+              OR (event = 'handoff_failed' AND reason_code IN ('deadline','read_exhausted','no_effect'))))
         """
       )
     end
@@ -159,30 +173,40 @@ defmodule VoelgoedAi.Governance.AuditEvent do
 
   attributes do
     uuid_v7_primary_key(:id)
-    attribute(:actor_kind, :atom, allow_nil?: false, constraints: [one_of: [:staff, :bootstrap]])
+
+    attribute(:actor_kind, :atom,
+      allow_nil?: false,
+      constraints: [one_of: [:staff, :bootstrap, :support_worker]]
+    )
+
     attribute(:operator_ref, :string, constraints: [match: ~r/\Astaff-bootstrap\z/])
 
     attribute(:target_kind, :atom,
       allow_nil?: false,
       default: :staff_user,
-      constraints: [one_of: [:staff_user, :support_session, :outbound_delivery | @target_kinds]]
+      constraints: [
+        one_of: [:staff_user, :support_session | @system_target_kinds ++ @target_kinds]
+      ]
     )
 
     attribute(:event, :atom,
       allow_nil?: false,
-      constraints: [one_of: @staff_events ++ @operational_events ++ @support_events]
+      constraints: [
+        one_of: @staff_events ++ @operational_events ++ @support_events ++ @system_events
+      ]
     )
 
     attribute(:reason_code, :atom,
       allow_nil?: false,
       constraints: [
-        one_of: [
-          :allowlisted,
-          :verified_oidc,
-          :local_admin,
-          :approved_reprovision,
-          :local_operator
-        ]
+        one_of:
+          [
+            :allowlisted,
+            :verified_oidc,
+            :local_admin,
+            :approved_reprovision,
+            :local_operator
+          ] ++ ReasonCode.values()
       ]
     )
 
@@ -202,6 +226,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     belongs_to(:binding_target, VoelgoedAi.Support.InboxBinding)
     belongs_to(:control_target, VoelgoedAi.Governance.AutomationControl)
     belongs_to(:session_target, VoelgoedAi.Support.SupportSession)
+    belongs_to(:event_target, VoelgoedAi.Support.InboundEvent)
+    belongs_to(:run_target, VoelgoedAi.Support.SupportRun)
     belongs_to(:delivery_target, VoelgoedAi.Support.OutboundDelivery)
     belongs_to(:actor_staff, StaffUser)
   end
@@ -270,6 +296,58 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       validate(attribute_equals(:reason_code, :local_operator))
     end
 
+    create :append_system do
+      description("Append a typed support workflow fact inside its transition transaction.")
+      transaction?(false)
+
+      accept([
+        :actor_kind,
+        :target_kind,
+        :event_target_id,
+        :run_target_id,
+        :delivery_target_id,
+        :event,
+        :reason_code,
+        :correlation_id
+      ])
+
+      validate(attribute_equals(:actor_kind, :support_worker))
+      validate(attribute_in(:target_kind, @system_target_kinds))
+      validate(attribute_in(:event, @system_events))
+      validate(attribute_in(:reason_code, ReasonCode.values()))
+    end
+
+    action :system_history, {:array, :map} do
+      description("Return bounded system workflow history for one authorized internal target.")
+
+      argument(:target_kind, :atom,
+        allow_nil?: false,
+        constraints: [one_of: @system_target_kinds]
+      )
+
+      argument(:id, :uuid, allow_nil?: false)
+      run(SystemAudit)
+    end
+
+    read :system_rows do
+      argument(:target_kind, :atom,
+        allow_nil?: false,
+        constraints: [one_of: @system_target_kinds]
+      )
+
+      argument(:id, :uuid, allow_nil?: false)
+
+      filter(
+        expr(
+          actor_kind == :support_worker and target_kind == ^arg(:target_kind) and
+            (event_target_id == ^arg(:id) or run_target_id == ^arg(:id) or
+               delivery_target_id == ^arg(:id))
+        )
+      )
+
+      prepare(build(sort: [:occurred_at, :id], limit: 100))
+    end
+
     action :operational_history, {:array, :map} do
       argument(:target_kind, :atom, allow_nil?: false, constraints: [one_of: @target_kinds])
       argument(:id, :uuid, allow_nil?: false)
@@ -299,8 +377,12 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   end
 
   policies do
-    policy action(:append_support_operator) do
-      authorize_if(VoelgoedAi.Support.WorkStore)
+    policy action([:append_support_operator, :append_system, :system_rows]) do
+      authorize_if(WorkStore)
+    end
+
+    policy action(:system_history) do
+      authorize_if(ActionScope)
     end
 
     policy action([:append_operational, :operational_rows]) do

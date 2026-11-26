@@ -119,29 +119,7 @@ defmodule VoelgoedAi.Support.SupportSession do
       public?: true,
       allow_nil?: true,
       constraints: [
-        one_of: [
-          :ignored,
-          :oversize,
-          :admission_limited,
-          :deadline,
-          :scope_denied,
-          :disabled,
-          :human_takeover,
-          :resolved,
-          :stale_claim,
-          :stale_policy,
-          :late_input,
-          :history_changed,
-          :unavailable,
-          :ambiguous_write,
-          :awaiting_operator,
-          :accepted,
-          :already_human,
-          :explicit_handoff,
-          :manual_closure,
-          :no_effect,
-          :read_exhausted
-        ]
+        one_of: VoelgoedAi.Support.ReasonCode.values()
       ]
     )
 

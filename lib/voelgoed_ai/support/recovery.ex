@@ -32,7 +32,7 @@ defmodule VoelgoedAi.Support.Recovery do
   defp reserve(_, session, %{state: :unknown} = row, now) do
     cond do
       not remaining?(row, now) or row.read_count >= 3 ->
-        exhausted(row)
+        exhausted(row, now)
 
       row.last_read_at &&
           DateTime.diff(now, row.last_read_at, :millisecond) <
@@ -85,7 +85,7 @@ defmodule VoelgoedAi.Support.Recovery do
                  now,
                  :resolved
                ) do
-          exhausted(row)
+          exhausted(row, now)
         end
 
       Delivery.human_goal?(config, observation) ->
@@ -106,13 +106,18 @@ defmodule VoelgoedAi.Support.Recovery do
 
     if row.read_count < 3 and remaining?(row, when_due),
       do: Ownership.enqueue(Reconcile, %{"delivery_id" => row.id}, scheduled_at: when_due),
-      else: exhausted(row)
+      else: exhausted(row, now)
   end
 
-  defp exhausted(%{reason_code: :read_exhausted}), do: {:ok, :finished}
+  defp exhausted(%{reason_code: :read_exhausted}, _now), do: {:ok, :finished}
 
-  defp exhausted(row),
-    do: WorkStore.update(row, :reconcile, %{reason_code: :read_exhausted})
+  defp exhausted(row, now) do
+    reason = if remaining?(row, now), do: :read_exhausted, else: :deadline
+
+    with {:ok, updated} <- WorkStore.update(row, :reconcile, %{reason_code: :read_exhausted}) do
+      Delivery.audit_handoff_failure(updated, reason)
+    end
+  end
 
   defp remaining?(row, now), do: DateTime.compare(now, row.recovery_deadline_at) == :lt
 
@@ -135,7 +140,7 @@ defmodule VoelgoedAi.Support.Recovery do
         %{state: :unknown} ->
           if remaining?(row, now) and row.reason_code != :read_exhausted,
             do: Ownership.enqueue(Reconcile, %{"delivery_id" => row.id}),
-            else: exhausted(row)
+            else: exhausted(row, now)
 
         _ ->
           {:ok, :finished}

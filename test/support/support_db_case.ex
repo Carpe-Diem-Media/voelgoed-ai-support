@@ -308,6 +308,19 @@ defmodule VoelgoedAi.SupportDBCase do
     delivery_id
   end
 
+  def audit_rows(target_key, id) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT actor_kind, target_kind, event, reason_code
+      FROM audit_events AS audit
+      WHERE to_jsonb(audit)->>$1 = $2
+      ORDER BY occurred_at, id
+      """,
+      [Atom.to_string(target_key), id]
+    ).rows
+  end
+
   defp clean(inbox_id, account_id) do
     matches = "SELECT id FROM support_sessions WHERE external_inbox_id = $1"
 
@@ -331,7 +344,13 @@ defmodule VoelgoedAi.SupportDBCase do
 
     SQL.query!(
       Repo,
-      "DELETE FROM audit_events WHERE session_target_id IN (#{matches}) OR delivery_target_id IN (SELECT id FROM outbound_deliveries WHERE session_id IN (#{matches}))",
+      """
+      DELETE FROM audit_events
+      WHERE session_target_id IN (#{matches})
+        OR delivery_target_id IN (SELECT id FROM outbound_deliveries WHERE session_id IN (#{matches}))
+        OR event_target_id IN (SELECT id FROM inbound_events WHERE external_inbox_id = $1)
+        OR run_target_id IN (SELECT id FROM support_runs WHERE session_id IN (#{matches}))
+      """,
       [inbox_id]
     )
 

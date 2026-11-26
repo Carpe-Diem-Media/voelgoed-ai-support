@@ -6,6 +6,7 @@ defmodule VoelgoedAi.Support.ActionScope do
 
   use Ash.Policy.SimpleCheck
 
+  alias VoelgoedAi.Accounts.StaffAccess.Session
   alias VoelgoedAi.Governance.{AuditEvent, AutomationControl}
   alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
   alias VoelgoedAi.Support.{InboxBinding, JobAction}
@@ -38,6 +39,13 @@ defmodule VoelgoedAi.Support.ActionScope do
   def describe(_opts), do: "the application actor is authorized for this exact operation"
 
   @impl true
+  def match?(
+        %Session{},
+        %{subject: %Ash.ActionInput{resource: AuditEvent, action: %{name: :system_history}}},
+        _opts
+      ),
+      do: true
+
   def match?(scope, %{subject: %Ash.ActionInput{} = input}, _opts), do: permits?(scope, input)
   def match?(_, _, _), do: false
 
@@ -56,6 +64,9 @@ defmodule VoelgoedAi.Support.ActionScope do
 
       {:read_configuration, resource} when resource in [Assistant, AssistantRevision] ->
         kind == Processing and target == arguments.id
+
+      {:system_history, AuditEvent} ->
+        kind == Reconciliation and target == {arguments.target_kind, arguments.id}
 
       {:operational_history, AuditEvent} ->
         kind in [Processing, Reconciliation] and target == {arguments.target_kind, arguments.id}

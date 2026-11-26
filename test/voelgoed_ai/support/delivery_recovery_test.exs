@@ -3,6 +3,7 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
 
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.{Repo, Support, SupportDBCase}
+  alias VoelgoedAi.Governance.AuditEvent
 
   alias VoelgoedAi.Support.{
     ActionScope,
@@ -57,7 +58,128 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
                SupportDBCase.delivery_rows(ctx, "state, attempt_count, uncertainty_reason")
 
       assert [_] = SupportDBCase.writes(ctx)
+
+      assert [["support_worker", "outbound_delivery", "delivery_unknown", "ambiguous_write"]] =
+               SupportDBCase.audit_rows(:delivery_target_id, id)
     end
+  end
+
+  test "failure to audit UNKNOWN preserves the authorized write for recovery", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :timeout)
+
+    Process.put({VoelgoedAi.Support.SystemAudit, :reject_audit}, :delivery_unknown)
+    assert {:error, :storage_failure} = Delivery.deliver(id)
+    Process.delete({VoelgoedAi.Support.SystemAudit, :reject_audit})
+
+    assert %{rows: [["sending", 1, true]]} =
+             SupportDBCase.delivery_rows(
+               ctx,
+               "state, attempt_count, dispatch_authorized_at IS NOT NULL"
+             )
+
+    assert [] = SupportDBCase.audit_rows(:delivery_target_id, id)
+    SupportDBCase.advance_clock(ctx, 6)
+    assert :ok = Recovery.delivery_deadline(id)
+
+    assert [["support_worker", "outbound_delivery", "delivery_unknown", "ambiguous_write"]] =
+             SupportDBCase.audit_rows(:delivery_target_id, id)
+
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  test "system history projects exact targets for current staff and scoped reconciliation", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :timeout)
+    assert :ok = Delivery.deliver(id)
+
+    args = %{target_kind: :outbound_delivery, id: id}
+
+    {installation, account, inbox} =
+      {ctx.event.installation_ref, ctx.event.external_account_id, ctx.event.external_inbox_id}
+
+    scope = %ActionScope.Reconciliation{
+      action: :system_history,
+      resource: AuditEvent,
+      target: {:outbound_delivery, id},
+      inbox: {installation, account, inbox}
+    }
+
+    invoke = &VoelgoedAi.SupportFixtures.invoke(AuditEvent, :system_history, args, &1)
+
+    assert {:ok, [row]} = invoke.(ctx.operator)
+
+    assert %{
+             actor_kind: :support_worker,
+             target_kind: :outbound_delivery,
+             target_id: ^id,
+             event: :delivery_unknown,
+             reason_code: :ambiguous_write
+           } = row
+
+    assert Enum.sort(Map.keys(row)) ==
+             Enum.sort([
+               :id,
+               :actor_kind,
+               :target_kind,
+               :target_id,
+               :event,
+               :reason_code,
+               :correlation_id,
+               :occurred_at
+             ])
+
+    assert {:ok, [^row]} = invoke.(ctx.admin)
+    assert {:ok, [^row]} = invoke.(scope)
+
+    for actor <- [
+          nil,
+          %{ctx.operator | generation: ctx.operator.generation + 1},
+          %{scope | target: {:outbound_delivery, Ash.UUIDv7.generate()}},
+          %{scope | inbox: {installation, account, inbox + 1}},
+          %{scope | inbox: nil},
+          struct!(ActionScope.Processing, Map.from_struct(scope))
+        ] do
+      assert {:error, _} = invoke.(actor)
+    end
+
+    attrs = %{
+      actor_kind: :support_worker,
+      target_kind: :outbound_delivery,
+      delivery_target_id: id,
+      event: :delivery_unknown,
+      reason_code: :ambiguous_write,
+      correlation_id: Ash.UUIDv7.generate()
+    }
+
+    assert %Ash.Changeset{valid?: true} =
+             Ash.Changeset.for_create(AuditEvent, :append_system, attrs)
+
+    assert %Ash.Changeset{valid?: false, errors: [%{field: :actor_kind}]} =
+             Ash.Changeset.for_create(AuditEvent, :append_system, %{attrs | actor_kind: :staff})
+
+    for actor <- [
+          nil,
+          ctx.admin,
+          ctx.operator,
+          scope,
+          %VoelgoedAi.Support.WorkStore{ref: make_ref()}
+        ] do
+      assert {:error, %Ash.Error.Forbidden{}} =
+               AuditEvent
+               |> Ash.Query.for_read(:system_rows, args, actor: actor)
+               |> Ash.read()
+
+      assert {:error, %Ash.Error.Forbidden{}} =
+               Ash.create(AuditEvent, attrs, action: :append_system, actor: actor)
+    end
+
+    assert {:error, %Postgrex.Error{postgres: %{constraint: "audit_events_actor_reference"}}} =
+             SQL.query(
+               Repo,
+               "UPDATE audit_events SET actor_staff_id = $1 WHERE id = $2",
+               [Ecto.UUID.dump!(ctx.admin.id), Ecto.UUID.dump!(row.id)]
+             )
   end
 
   test "a binding auth failure inhibits writes until a successful read-only probe", ctx do
@@ -180,6 +302,9 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert %{rows: [["failed", "read_exhausted", 3, 0]]} =
              handoff_rows(ctx, "state, reason_code, read_count, attempt_count")
 
+    assert [["support_worker", "outbound_delivery", "handoff_failed", "read_exhausted"]] =
+             SupportDBCase.audit_rows(:delivery_target_id, id)
+
     assert_handoff_inhibited(ctx)
     assert [] = SupportDBCase.writes(ctx)
   end
@@ -197,8 +322,61 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert %{rows: [["failed", "deadline", 0]]} =
              handoff_rows(ctx, "state, reason_code, attempt_count")
 
+    assert [["support_worker", "outbound_delivery", "handoff_failed", "deadline"]] =
+             SupportDBCase.audit_rows(:delivery_target_id, id)
+
     assert_handoff_inhibited(ctx)
     assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "failure to audit a handoff deadline leaves the intent pending", ctx do
+    id = prepare_handoff(ctx)
+    SupportDBCase.advance_clock(ctx, 300)
+
+    Process.put({VoelgoedAi.Support.SystemAudit, :reject_audit}, :handoff_failed)
+    assert {:error, :storage_failure} = Recovery.delivery_deadline(id)
+    Process.delete({VoelgoedAi.Support.SystemAudit, :reject_audit})
+
+    assert %{rows: [["pending", nil]]} = handoff_rows(ctx, "state, reason_code")
+    assert [] = SupportDBCase.audit_rows(:delivery_target_id, id)
+    assert :ok = Recovery.delivery_deadline(id)
+  end
+
+  test "an expired handoff claim without dispatch records one deadline failure", ctx do
+    id = prepare_handoff(ctx)
+    SupportDBCase.block_after_claim(ctx, self())
+    worker = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:delivery_claimed, pid}, 1_000
+
+    SupportDBCase.advance_clock(ctx, 300)
+    assert :ok = Recovery.delivery_deadline(id)
+    send(pid, :resume_delivery_claim)
+    assert :ok = Task.await(worker)
+    assert :ok = Recovery.delivery_deadline(id)
+
+    assert %{rows: [["cancelled", 0]]} = handoff_rows(ctx, "state, attempt_count")
+
+    assert [["support_worker", "outbound_delivery", "handoff_failed", "deadline"]] =
+             SupportDBCase.audit_rows(:delivery_target_id, id)
+
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "an uncertain handoff records recovery failure without changing UNKNOWN", ctx do
+    id = prepare_handoff(ctx)
+    Agent.update(ctx.fake, &Map.put(&1, :handoff_observation, &1.observation))
+    assert :ok = Delivery.deliver(id)
+    SupportDBCase.advance_clock(ctx, 300)
+    assert :ok = Recovery.reconcile(id)
+    assert :ok = Recovery.delivery_deadline(id)
+
+    assert %{rows: [["unknown", "read_exhausted", "ambiguous_write"]]} =
+             handoff_rows(ctx, "state, reason_code, uncertainty_reason")
+
+    assert [
+             ["support_worker", "outbound_delivery", "delivery_unknown", "ambiguous_write"],
+             ["support_worker", "outbound_delivery", "handoff_failed", "deadline"]
+           ] = SupportDBCase.audit_rows(:delivery_target_id, id)
   end
 
   for {override, expected, reason} <- [
@@ -443,6 +621,10 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
       assert :ok = Recovery.reconcile(id)
       state = if unquote(committed?), do: "sent", else: "unknown"
       assert %{rows: [[^state, 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+
+      assert [["support_worker", "outbound_delivery", "delivery_unknown", "ambiguous_write"]] =
+               SupportDBCase.audit_rows(:delivery_target_id, id)
+
       assert [_] = SupportDBCase.writes(ctx)
     end
   end
@@ -547,7 +729,7 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert %{rows: [["abandon_delivery", "local_operator"]]} =
              SQL.query!(
                Repo,
-               "SELECT event, reason_code FROM audit_events WHERE delivery_target_id = $1",
+               "SELECT event, reason_code FROM audit_events WHERE delivery_target_id = $1 AND actor_kind = 'staff'",
                [Ecto.UUID.dump!(id)]
              )
 

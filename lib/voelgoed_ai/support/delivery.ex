@@ -14,7 +14,15 @@ defmodule VoelgoedAi.Support.Delivery do
     OutboundDelivery
   }
 
-  alias VoelgoedAi.Support.{Ownership, Recovery, RunProcessing, SupportRun, WorkStore}
+  alias VoelgoedAi.Support.{
+    Ownership,
+    Recovery,
+    RunProcessing,
+    SupportRun,
+    SystemAudit,
+    WorkStore
+  }
+
   alias VoelgoedAi.Support.Workers.{Reconcile, Sweep}
 
   @request_margin_ms 750
@@ -165,6 +173,9 @@ defmodule VoelgoedAi.Support.Delivery do
       delivery.state != :pending or delivery.read_sequence != reservation.read_sequence ->
         {:ok, :stale_claim}
 
+      delivery.purpose == :handoff_status and not DateTime.before?(now, delivery.deadline_at) ->
+        expire_pending(delivery, now)
+
       not valid?(config, session, delivery, now) or
           not BindingCircuit.closed?(config.binding, generation) ->
         fence(delivery, now, :stale_policy)
@@ -274,7 +285,25 @@ defmodule VoelgoedAi.Support.Delivery do
   def expire_pending(delivery, now), do: fence(delivery, now, :deadline)
 
   defp fail_pending(delivery, reason),
-    do: WorkStore.update(delivery, :fail, %{state: :failed, reason_code: reason})
+    do: fail_intent(delivery, :fail, :failed, reason)
+
+  defp fail_intent(delivery, action, state, reason) do
+    with {:ok, row} <-
+           WorkStore.update(delivery, action, %{
+             state: state,
+             lease_expires_at: nil,
+             reason_code: reason
+           }) do
+      audit_handoff_failure(row, reason)
+    end
+  end
+
+  @doc false
+  def audit_handoff_failure(%{purpose: :handoff_status} = row, reason) do
+    with {:ok, _} <- SystemAudit.append(row, :handoff_failed, reason), do: {:ok, row}
+  end
+
+  def audit_handoff_failure(row, _), do: {:ok, row}
 
   defp queued_input?(session) do
     where =
@@ -306,6 +335,9 @@ defmodule VoelgoedAi.Support.Delivery do
     cond do
       not current_claim?(delivery, claim) or delivery.dispatch_authorized_at != nil ->
         {:ok, :stale_claim}
+
+      delivery.purpose == :handoff_status and not DateTime.before?(now, delivery.deadline_at) ->
+        fence(delivery, now, :deadline)
 
       not valid?(config, session, delivery, now) or
         not BindingCircuit.closed?(config.binding, generation) or
@@ -383,20 +415,10 @@ defmodule VoelgoedAi.Support.Delivery do
   end
 
   defp finish_post(_, delivery, _now, {:error, {:not_issued, :deadline}}),
-    do:
-      WorkStore.update(delivery, :cancel, %{
-        state: :cancelled,
-        lease_expires_at: nil,
-        reason_code: :deadline
-      })
+    do: fail_intent(delivery, :cancel, :cancelled, :deadline)
 
   defp finish_post(_, delivery, _now, {:error, {:not_issued, _}}),
-    do:
-      WorkStore.update(delivery, :fail, %{
-        state: :failed,
-        lease_expires_at: nil,
-        reason_code: :no_effect
-      })
+    do: fail_intent(delivery, :fail, :failed, :no_effect)
 
   defp finish_post(_, delivery, now, _result), do: unknown(delivery, now, :ambiguous_write)
 
@@ -404,6 +426,10 @@ defmodule VoelgoedAi.Support.Delivery do
   def fence(%{state: :sending, dispatch_authorized_at: time} = delivery, now, reason)
       when not is_nil(time),
       do: unknown(delivery, now, reason)
+
+  def fence(%{purpose: :handoff_status, state: state} = delivery, _now, :deadline)
+      when state in [:pending, :sending],
+      do: fail_intent(delivery, :cancel, :cancelled, :deadline)
 
   def fence(%{state: state} = delivery, _now, reason) when state in [:pending, :sending],
     do:
@@ -429,6 +455,7 @@ defmodule VoelgoedAi.Support.Delivery do
              last_read_at: nil,
              read_count: if(delivery.purpose == :public_reply, do: 0, else: delivery.read_count)
            }),
+         {:ok, _} <- SystemAudit.append(row, :delivery_unknown, reason),
          {:ok, _} <- Ownership.enqueue(Reconcile, %{"delivery_id" => delivery.id}) do
       {:ok, row}
     end
