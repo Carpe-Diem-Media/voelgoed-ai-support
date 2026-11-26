@@ -3,6 +3,7 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
 
   @endpoint VoelgoedAiWeb.Endpoint
 
+  import ExUnit.CaptureLog, only: [with_log: 2]
   import Phoenix.ConnTest, only: [get: 2]
   import Phoenix.LiveViewTest
   import Plug.Conn
@@ -11,7 +12,9 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
 
   alias VoelgoedAi.{Accounts, StaffFixtures}
   alias VoelgoedAi.Knowledge.{Article, ArticleRevision, KnowledgeCollection}
-  import VoelgoedAi.StaffKnowledgeFixture, only: [read_page: 2]
+
+  import VoelgoedAi.StaffKnowledgeFixture,
+    only: [browser_credentials: 1, origin: 0, read_page: 2, start_listener: 1, upgrade: 4]
 
   setup :setup_knowledge
 
@@ -114,6 +117,98 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
 
     assert_redirect(view, "/staff/knowledge/denied", 4_000)
     assert_receive {:DOWN, ^ref, :process, _, _}, 1_000
+  end
+
+  test "staff transport and LiveView lifecycle keep credentials and editorial content out of logs",
+       ctx do
+    row = collection(ctx)
+    revision = draft_revision(ctx, row)
+    start_listener(:https)
+
+    original_level = Logger.level()
+    on_exit(fn -> Logger.configure(level: original_level) end)
+    :ok = Logger.configure(level: :debug)
+
+    # with_log uses the same capture as capture_log and returns the pages so
+    # the assertions can check the actual credentials issued during the flow.
+    {pages, log} =
+      with_log([level: :debug], fn ->
+        index = connected_page(ctx.editor, "/staff/knowledge")
+        {cookie, csrf} = browser_credentials(index)
+        assert upgrade(:https, cookie, csrf, origin()) == 101
+        assert upgrade(:https, cookie, nil, origin()) == 403
+
+        assert {:ok, index_view, _} = live(index)
+        collection_path = "/staff/knowledge/collections/#{row.id}"
+        assert has_element?(index_view, ~s(a[href="#{collection_path}"]))
+        collection_page = connected_page(ctx.editor, collection_path)
+        assert {:ok, collection_view, _} = live(collection_page)
+
+        article_path = "/staff/knowledge/articles/#{revision.article_id}"
+        assert has_element?(collection_view, ~s(a[href="#{article_path}"]))
+        article_page = connected_page(ctx.editor, article_path)
+        assert {:ok, article_view, _} = live(article_page)
+
+        path = revision_path(revision)
+        assert has_element?(article_view, ~s(a[href="#{path}"]))
+        revision_page = connected_page(ctx.editor, path)
+        assert {:ok, view, _} = live(revision_page)
+        assert has_element?(view, ".answer", "Synthetic answer.")
+        assert is_binary(render_click(view, "refresh", %{}))
+
+        Application.delete_env(:voelgoed_ai, :knowledge_fixture_scope)
+
+        assert {:error, {:redirect, %{to: "/staff/knowledge/denied"}}} =
+                 render_click(view, "refresh", %{})
+
+        assert read_page(ctx.editor, "/staff/knowledge/denied").status == 401
+        scope(ctx, row)
+
+        short = %{ctx.editor | expiry: System.system_time(:second) + 3}
+        expiry_page = connected_page(short, path)
+        assert {:ok, expiring_view, _} = live(expiry_page)
+        ref = Process.monitor(expiring_view.pid)
+        assert_redirect(expiring_view, "/staff/knowledge/denied", 4_000)
+        assert_receive {:DOWN, ^ref, :process, _, _}, 1_000
+
+        [index, collection_page, article_page, revision_page, expiry_page]
+      end)
+
+    for page <- pages do
+      {cookie, csrf} = browser_credentials(page)
+      root = page.resp_body |> LazyHTML.from_document() |> LazyHTML.query("[data-phx-session]")
+      [session] = LazyHTML.attribute(root, "data-phx-session")
+      [static] = LazyHTML.attribute(root, "data-phx-static")
+
+      assert_absent(log, "staff session cookie", [cookie])
+      assert_absent(log, "staff CSRF token", [csrf])
+      assert_absent(log, "signed LiveView tokens", [session, static])
+    end
+
+    answers = Enum.map(payload()["localized_content"], & &1["approved_answer"])
+    assert_absent(log, "editorial content", answers)
+
+    assert_absent(log, "staff identifiers", [
+      ctx.admin.id,
+      ctx.editor.id,
+      ctx.reviewer.id,
+      ctx.invited.subject,
+      ctx.other.subject,
+      ctx.editor.binding
+    ])
+
+    assert_absent(log, "staff HTTP or WebSocket transport log", [
+      "GET /staff/",
+      "CONNECTED TO VoelgoedAiWeb.StaffLiveSocket",
+      "REFUSED CONNECTION TO VoelgoedAiWeb.StaffLiveSocket"
+    ])
+
+    assert_absent(log, "staff LiveView lifecycle log", [
+      "MOUNT VoelgoedAiWeb.KnowledgeLive.",
+      "HANDLE PARAMS in VoelgoedAiWeb.KnowledgeLive.",
+      ~s(HANDLE EVENT "refresh" in VoelgoedAiWeb.KnowledgeLive.),
+      "Replied in "
+    ])
   end
 
   test "a revision URL must name its actual article and disclose no hidden content", ctx do
@@ -301,6 +396,12 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
   end
 
   defp staff_tuple(session), do: {session.id, session.generation, session.expiry, session.binding}
+
+  defp assert_absent(log, label, values) do
+    # Keep capture contents and credentials out of ExUnit failure output.
+    assert Enum.all?(values, &(is_binary(&1) and &1 != "")), "Missing #{label} fixture"
+    refute String.contains?(log, values), "Captured logs included #{label}"
+  end
 
   defp revision_path(revision),
     do: "/staff/knowledge/articles/#{revision.article_id}/revisions/#{revision.id}"
