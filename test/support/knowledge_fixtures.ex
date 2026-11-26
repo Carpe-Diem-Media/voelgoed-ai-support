@@ -145,6 +145,28 @@ defmodule VoelgoedAi.KnowledgeFixtures do
       params
     )
 
+    delete_accounting_fixture(attempt, params)
+
+    SQL.query!(
+      Repo,
+      "UPDATE article_embeddings SET last_attempt_id = NULL, attempt_count = 0, state = 'invalidated', vector = NULL WHERE id IN (#{embedding})",
+      params
+    )
+
+    SQL.query!(Repo, "DELETE FROM inference_runs WHERE id IN (#{attempt})", params)
+    SQL.query!(Repo, "DELETE FROM article_embeddings WHERE id IN (#{embedding})", params)
+
+    SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = $1", [original_inhibit])
+  end
+
+  def cleanup_query_attempts(run_id) do
+    params = [Ecto.UUID.dump!(run_id)]
+    attempt = "SELECT id FROM inference_runs WHERE support_run_id = $1"
+    delete_accounting_fixture(attempt, params)
+    SQL.query!(Repo, "DELETE FROM inference_runs WHERE id IN (#{attempt})", params)
+  end
+
+  defp delete_accounting_fixture(attempt, params) do
     SQL.query!(
       Repo,
       """
@@ -182,17 +204,6 @@ defmodule VoelgoedAi.KnowledgeFixtures do
       "DELETE FROM usage_reservations WHERE inference_run_id IN (#{attempt})",
       params
     )
-
-    SQL.query!(
-      Repo,
-      "UPDATE article_embeddings SET last_attempt_id = NULL, attempt_count = 0, state = 'invalidated', vector = NULL WHERE id IN (#{embedding})",
-      params
-    )
-
-    SQL.query!(Repo, "DELETE FROM inference_runs WHERE id IN (#{attempt})", params)
-    SQL.query!(Repo, "DELETE FROM article_embeddings WHERE id IN (#{embedding})", params)
-
-    SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = $1", [original_inhibit])
   end
 
   def collection(ctx, suffix \\ "", audience \\ :public) do

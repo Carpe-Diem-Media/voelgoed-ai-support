@@ -19,7 +19,7 @@ defmodule VoelgoedAi.Intelligence.EmbeddingProfile do
   def input(content, locale) do
     with %{"title" => title, "approved_answer" => answer} = variant <-
            Enum.find(content["localized_content"], &(&1["locale"] == locale)),
-         scope = Enum.sort(content["applicability"]),
+         scope = for({key, values} <- Enum.sort(content["applicability"]), do: [key, values]),
          text =
            Jason.encode!([
              @serialization_version,

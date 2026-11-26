@@ -1,9 +1,10 @@
 defmodule VoelgoedAi.Intelligence.Embedding do
   @moduledoc """
-  Owns the article embedding claim, dispatch fence and result application.
-  Each transaction takes control before collection, article, revision, all
-  generation rows by ID, attempt and reservation. Accounting takes windows
-  last. Only the committed dispatch winner holds permission to invoke.
+  Owns article and query embedding claims, dispatch fences and settlements.
+  Article work locks control, collection, article, revision and generation
+  rows before the attempt and hold. Query work qualifies the support claim
+  first under control, and money-only recovery checks its immutable parent.
+  Accounting takes windows last. Only a committed dispatch can invoke.
   """
 
   use Ash.Resource.Actions.Implementation
@@ -25,7 +26,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   }
 
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.Configuration
+  alias VoelgoedAi.Support.{Configuration, Ownership, SupportRun}
 
   @indexing_seconds 60
   @timeout_ms 5_000
@@ -44,8 +45,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
         with true <- closure_approved?(staff.id),
              {:ok, control} <- Configuration.lock_control(),
              {:ok, candidate} <- get(InferenceRun, id),
-             {:ok, context} <- lock_context(candidate.article_embedding_id),
-             {:ok, attempt} <- locked_attempt(context, id, nil),
+             {:ok, _context, attempt} <- lock_recovery(candidate, nil),
              {:ok, reservation} <- reservation(attempt) do
           close_unknown(control, attempt, reservation, staff.id)
         else
@@ -165,13 +165,200 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     with {:ok, attempts} <-
            Repo.transact(fn -> read(InferenceRun, :recovery_candidates, %{now: now()}) end) do
       Enum.reduce(attempts, :ok, fn attempt, result ->
-        case recover(attempt.article_embedding_id) do
+        case recover_by_purpose(attempt) do
           :ok -> result
           error -> error
         end
       end)
     else
       _ -> {:error, :indexing_storage}
+    end
+  end
+
+  defp recover_by_purpose(%{purpose: :article_embedding} = attempt),
+    do: recover(attempt.article_embedding_id)
+
+  defp recover_by_purpose(%{purpose: :query_embedding} = attempt) do
+    query_transaction(attempt, nil, fn control, current, reservation ->
+      now = now()
+
+      cond do
+        current.state != :running or DateTime.compare(now, current.deadline_at) == :lt ->
+          {:ok, :noop}
+
+        current.dispatched_at ->
+          hold(control, nil, current, reservation, now, :deadline)
+
+        true ->
+          release(control, nil, current, reservation, now, :deadline)
+      end
+    end)
+    |> result()
+  end
+
+  @doc false
+  def query(ref, input, qualify)
+
+  if Mix.env() == :test do
+    alias VoelgoedAi.Knowledge.Retrieval
+
+    def query(ref, input, qualify) do
+      with false <- Repo.in_transaction?(),
+           true <- Retrieval.authorize_query(ref),
+           {:ok, attempt} when is_struct(attempt, InferenceRun) <- qualify.(&claim_query/3) do
+        hook(:after_claim, attempt)
+
+        case consume(fn ->
+               qualify.(fn control, run, _ -> dispatch_query(control, run, attempt) end)
+             end) do
+          {:ok, {:dispatch, transport}} ->
+            hook(:after_dispatch, attempt)
+            outcome = invoke(input, transport, attempt)
+            hook(:before_settlement, attempt)
+
+            query_transaction(attempt, attempt.dispatch_fence, fn control, current, hold ->
+              settle(control, nil, current, hold, now(), outcome)
+            end)
+
+          _ ->
+            query_transaction(attempt, attempt.dispatch_fence, fn control, current, hold ->
+              if current.state == :running and is_nil(current.dispatched_at) do
+                release(control, nil, current, hold, now(), :stale_request)
+              else
+                {:ok, :noop}
+              end
+            end)
+
+            {:error, :unavailable}
+        end
+      else
+        _ -> {:error, :unavailable}
+      end
+    end
+
+    defp claim_query(control, run, deadline) do
+      now = now()
+
+      with true <- DateTime.compare(now, deadline) == :lt,
+           {:ok, config} <- gate(),
+           :ok <- allowed(control),
+           {:ok, nil} <-
+             query(
+               InferenceRun,
+               :query_attempt,
+               %{support_run_id: run.id},
+               false,
+               &Ash.read_one/1
+             ),
+           {:ok, attempt} <-
+             storage(InferenceRun, :insert_query_attempt, fn actor ->
+               Ash.create(
+                 InferenceRun,
+                 %{
+                   support_run_id: run.id,
+                   assistant_revision_id: run.assistant_revision_id,
+                   claim_generation: run.claim_generation,
+                   provider: EmbeddingProfile.provider(),
+                   model_id: EmbeddingProfile.model(),
+                   profile_id: EmbeddingProfile.id(),
+                   ordinal: 1,
+                   deadline_at: deadline,
+                   started_at: now,
+                   dispatch_fence: Ash.UUIDv7.generate(),
+                   correlation_id: Ash.UUIDv7.generate()
+                 },
+                 action: :insert_query_attempt,
+                 actor: actor
+               )
+             end),
+           :ok <- reserve_query_admission(now),
+           {:ok, _} <-
+             account(
+               attempt,
+               :reserve,
+               &EmbeddingAccounting.reserve(&1, control, attempt, now, config)
+             ) do
+        {:ok, attempt}
+      else
+        {:ok, _} -> {:error, :already_claimed}
+        false -> {:error, :deadline}
+        error -> error
+      end
+    end
+
+    defp dispatch_query(control, run, candidate) do
+      with {:ok, attempt} <- lock_query_attempt(run, candidate, candidate.dispatch_fence),
+           :ok <- fresh_dispatch(attempt, run),
+           true <- attempt.claim_generation == run.claim_generation,
+           true <- attempt.profile_id == EmbeddingProfile.id(),
+           true <- DateTime.compare(now(), attempt.deadline_at) == :lt,
+           :ok <- allowed(control),
+           {:ok, config} <- gate(),
+           {:ok, %{state: :reserved}} <- reservation(attempt),
+           {:ok, _} <- change(attempt, %{dispatched_at: now()}) do
+        {:ok, {:dispatch, config.transport}}
+      else
+        _ -> {:error, :unavailable}
+      end
+    end
+
+    defp reserve_query_admission(now) do
+      if fixture()[:query_admission] do
+        alias VoelgoedAi.Governance.Admission
+        Admission.reserve([Admission.window(:turn, "synthetic:query_embedding", now, 60, 2)])
+      else
+        :ok
+      end
+    end
+  else
+    def query(_, _, _), do: {:error, :disabled}
+  end
+
+  # Recovery authorizes money against the original parent even after answer
+  # permission or the support claim is gone.
+  defp query_transaction(candidate, fence, work) do
+    Repo.transact(fn ->
+      with {:ok, control} <- Configuration.lock_control(),
+           {:ok, nil, attempt} <- lock_recovery(candidate, fence),
+           {:ok, hold} <- reservation(attempt) do
+        work.(control, attempt, hold)
+      end
+    end)
+  rescue
+    _ -> {:error, :indexing_storage}
+  catch
+    :exit, _ -> {:error, :indexing_storage}
+  end
+
+  defp lock_recovery(%{purpose: :article_embedding} = candidate, fence) do
+    with {:ok, context} <- lock_context(candidate.article_embedding_id),
+         {:ok, attempt} <- locked_attempt(context, candidate.id, fence) do
+      {:ok, context, attempt}
+    end
+  end
+
+  defp lock_recovery(%{purpose: :query_embedding} = candidate, fence) do
+    with {:ok, run} when is_struct(run, SupportRun) <-
+           Ownership.get(SupportRun, candidate.support_run_id),
+         {:ok, attempt} <- lock_query_attempt(run, candidate, fence) do
+      {:ok, nil, attempt}
+    else
+      {:ok, nil} -> {:error, :missing_row}
+      error -> error
+    end
+  end
+
+  defp lock_query_attempt(run, candidate, fence) do
+    with {:ok, attempt} <- get(InferenceRun, candidate.id, true),
+         true <- attempt.purpose == :query_embedding and attempt.support_run_id == run.id,
+         true <- attempt.assistant_revision_id == run.assistant_revision_id,
+         true <- attempt.profile_id == candidate.profile_id,
+         true <- attempt.claim_generation == candidate.claim_generation,
+         true <- is_nil(fence) or attempt.dispatch_fence == fence do
+      {:ok, attempt}
+    else
+      false -> {:error, :stale_request}
+      error -> error
     end
   end
 
@@ -476,7 +663,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
                          reason_code: reason
                        })
                      ) do
-                apply_result(context, now, vector)
+                apply_settlement(context, now, vector, state, result)
               end
           end
       end
@@ -487,6 +674,14 @@ defmodule VoelgoedAi.Intelligence.Embedding do
        when state in [:succeeded, :failed, :abandoned], do: {:error, :conflicting_evidence}
 
   defp settle(_, _, _, _, _, _), do: {:ok, :noop}
+
+  defp apply_settlement(nil, _now, {:ok, vector}, :running, :trusted_usage),
+    do: {:ok, {:query_vector, vector}}
+
+  defp apply_settlement(nil, _now, _vector, _state, _accounting), do: {:ok, :noop}
+
+  defp apply_settlement(context, now, vector, _state, _accounting),
+    do: apply_result(context, now, vector)
 
   defp apply_result(%{row: %{state: :running} = row} = context, now, {:ok, vector}) do
     case eligible(context, now) do
@@ -509,7 +704,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   defp finalise_ready_generation(%{generation: rows, revision: revision, row: row}) do
     if Enum.all?(rows, &(&1.id == row.id or &1.state == :ready)) do
       # A failed insert aborts the READY write and financial settlement.
-      with {:ok, _} <- Publication.enqueue_finalisation(revision), do: :ok
+      with {:ok, _} <- enqueue_finalisation(revision), do: :ok
     else
       :ok
     end
@@ -545,6 +740,8 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       fail_publication(context, reason)
     end
   end
+
+  defp fail_publication(nil, _reason), do: {:ok, :noop}
 
   defp fail_publication(%{revision: revision, row: row, generation: rows}, reason) do
     if Publication.pending?(revision) and revision.publication_generation == row.generation do
@@ -719,12 +916,17 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       end
     end
 
+    defp enqueue_finalisation(revision),
+      do:
+        Map.get(fixture(), :enqueue_finalisation, &Publication.enqueue_finalisation/1).(revision)
+
     defp closure_approved?(id), do: fixture()[:closure_approved_by] == id
     def now, do: Map.get(fixture(), :clock, &DateTime.utc_now/0).()
     defp hook(stage, attempt), do: Map.get(fixture(), stage, fn _ -> :ok end).(attempt)
     defp consume(fence), do: Map.get(fixture(), :consume_dispatch, fn fun -> fun.() end).(fence)
   else
     defp gate, do: {:error, :disabled}
+    defp enqueue_finalisation(revision), do: Publication.enqueue_finalisation(revision)
     defp closure_approved?(_id), do: false
     def now, do: DateTime.utc_now()
     defp hook(_, _), do: :ok

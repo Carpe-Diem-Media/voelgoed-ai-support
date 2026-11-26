@@ -25,7 +25,7 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   }
 
   alias VoelgoedAi.Intelligence.{Embedding, EmbeddingProfile}
-  alias VoelgoedAi.Knowledge.Workers.{FinalizePublication, IndexArticle, RecoverIndexing}
+  alias VoelgoedAi.Knowledge.Workers.{IndexArticle, RecoverIndexing}
   alias VoelgoedAi.Support.Configuration
 
   @editor :knowledge_editor
@@ -284,21 +284,8 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     end
   end
 
-  defp revision_action(collection, article, row, :request_index_rollback, args, staff) do
-    now = Embedding.now()
-
-    with :ok <- Publication.rollback_available(),
-         :ok <- current_index(collection, article, row, args),
-         true <- row.retained_index_generation == args.target_generation,
-         {:ok, expires} <- Publication.approved_content(row, now),
-         {:ok, request} <- append_rollback_request(collection, row, staff, now, expires),
-         {:ok, _} <- Oban.insert(FinalizePublication.new(%{rollback_request_id: request.id})) do
-      {:ok, %{request_id: request.id}}
-    else
-      false -> {:error, :stale_index}
-      error -> error
-    end
-  end
+  defp revision_action(collection, article, row, :request_index_rollback, args, staff),
+    do: request_index_rollback(collection, article, row, args, staff)
 
   defp revision_action(_collection, article, row, :revoke, args, staff) do
     with :ok <- active(article),
@@ -349,42 +336,46 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     end
   end
 
-  defp append_rollback_request(collection, row, staff, now, expires) do
-    deadline = DateTime.add(now, 60, :second)
+  if Mix.env() == :test do
+    defp append_rollback_request(collection, row, staff, now, expires) do
+      deadline = DateTime.add(now, 60, :second)
 
-    deadline =
-      if not is_nil(expires) and DateTime.before?(expires, deadline), do: expires, else: deadline
+      deadline =
+        if not is_nil(expires) and DateTime.before?(expires, deadline),
+          do: expires,
+          else: deadline
 
-    before = %{
-      status: :published,
-      index_generation: row.active_index_generation,
-      index_epoch: row.index_epoch,
-      content_hash: row.content_hash
-    }
+      before = %{
+        status: :published,
+        index_generation: row.active_index_generation,
+        index_epoch: row.index_epoch,
+        content_hash: row.content_hash
+      }
 
-    attrs = %{
-      actor_kind: :staff,
-      actor_staff_id: staff.id,
-      article_revision_target_id: row.id,
-      target_kind: :knowledge_revision,
-      event: :request_index_rollback,
-      reason_code: :source_verified,
-      correlation_id: Ash.UUIDv7.generate(),
-      operational_before: before,
-      operational_after:
-        Map.merge(before, %{
-          index_generation: row.retained_index_generation,
-          collection_epoch: collection.security_epoch,
-          content_profile_id: row.active_index_profile_id,
-          deadline_us: DateTime.to_unix(deadline, :microsecond)
-        })
-    }
+      attrs = %{
+        actor_kind: :staff,
+        actor_staff_id: staff.id,
+        article_revision_target_id: row.id,
+        target_kind: :knowledge_revision,
+        event: :request_index_rollback,
+        reason_code: :source_verified,
+        correlation_id: Ash.UUIDv7.generate(),
+        operational_before: before,
+        operational_after:
+          Map.merge(before, %{
+            index_generation: row.retained_index_generation,
+            collection_epoch: collection.security_epoch,
+            content_profile_id: row.active_index_profile_id,
+            deadline_us: DateTime.to_unix(deadline, :microsecond)
+          })
+      }
 
-    storage(
-      AuditEvent,
-      :append_rollback_request,
-      &Ash.create(AuditEvent, attrs, action: :append_rollback_request, actor: &1)
-    )
+      storage(
+        AuditEvent,
+        :append_rollback_request,
+        &Ash.create(AuditEvent, attrs, action: :append_rollback_request, actor: &1)
+      )
+    end
   end
 
   defp clear_pointer(%{current_revision_id: id} = article, %{id: id}) do
@@ -639,8 +630,32 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     end
   end
 
+  if Mix.env() == :test do
+    defp request_index_rollback(collection, article, row, args, staff) do
+      now = Embedding.now()
+
+      with :ok <- current_index(collection, article, row, args),
+           true <- row.retained_index_generation == args.target_generation,
+           {:ok, expires} <- Publication.approved_content(row, now),
+           {:ok, request} <- append_rollback_request(collection, row, staff, now, expires),
+           {:ok, _} <-
+             Oban.insert(
+               VoelgoedAi.Knowledge.Workers.FinalizePublication.new(%{
+                 rollback_request_id: request.id
+               })
+             ) do
+        {:ok, %{request_id: request.id}}
+      else
+        false -> {:error, :stale_index}
+        error -> error
+      end
+    end
+  else
+    defp request_index_rollback(_, _, _, _, _), do: {:error, :rollback_disabled}
+  end
+
   defp export_entry(article) do
-    with {:ok, %ArticleRevision{} = row} <-
+    with {:ok, row} when is_struct(row, ArticleRevision) <-
            one(ArticleRevision, :latest_revision, %{article_id: article.id}),
          {:ok, content} <- Content.parse(row.content),
          true <- row.content_hash == Content.hash(content) do
@@ -805,11 +820,15 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     defp audit_attrs(attrs), do: attrs
   end
 
-  defp audit_target(%KnowledgeCollection{}),
+  defp audit_target(row) when is_struct(row, KnowledgeCollection),
     do: {:knowledge_collection, :knowledge_collection_target_id}
 
-  defp audit_target(%Article{}), do: {:knowledge_article, :article_target_id}
-  defp audit_target(%ArticleRevision{}), do: {:knowledge_revision, :article_revision_target_id}
+  defp audit_target(row) when is_struct(row, Article),
+    do: {:knowledge_article, :article_target_id}
+
+  defp audit_target(row) when is_struct(row, ArticleRevision),
+    do: {:knowledge_revision, :article_revision_target_id}
+
   defp audit_state(nil), do: nil
 
   defp audit_state(row),

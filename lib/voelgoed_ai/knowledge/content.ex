@@ -187,10 +187,13 @@ defmodule VoelgoedAi.Knowledge.Content do
   end
 
   defp value(:public_link, text) when is_binary(text) and byte_size(text) in 1..512 do
-    if text in public_link_fixture(), do: {:ok, text}, else: :error
+    if public_link_allowed?(text), do: {:ok, text}, else: :error
   end
 
   defp value(_, _), do: :error
+
+  @doc false
+  def public_link_allowed?(text), do: text in public_link_fixture()
 
   # Real public links await the owner's policy. No source is fetched here.
   if Mix.env() == :test do

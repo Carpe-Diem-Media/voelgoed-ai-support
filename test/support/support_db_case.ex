@@ -17,11 +17,8 @@ defmodule VoelgoedAi.SupportDBCase do
 
   @signing_key "synthetic-chatwoot-signing-key"
 
-  def setup do
-    staff = VoelgoedAi.SupportFixtures.setup()
-    admin = bootstrap_admin(staff.admin)
-    assert {:ok, operator} = Accounts.provision(admin, staff.invited, [:support_operator])
-    assert {:ok, operator} = authenticate(operator.id)
+  def setup(opts \\ []) do
+    {staff, admin, operator} = Keyword.get_lazy(opts, :staff, &setup_staff/0)
 
     assistant = create(admin, staff.slug)
     inbox_id = next_id()
@@ -86,6 +83,7 @@ defmodule VoelgoedAi.SupportDBCase do
       })
 
     revision = draft(admin, assistant)
+    Keyword.get(opts, :before_publish, fn _, _ -> :ok end).(admin, revision)
 
     assert {:ok, _} =
              invoke(
@@ -149,6 +147,14 @@ defmodule VoelgoedAi.SupportDBCase do
       assistant: assistant,
       revision: revision
     }
+  end
+
+  defp setup_staff do
+    staff = VoelgoedAi.SupportFixtures.setup()
+    admin = bootstrap_admin(staff.admin)
+    assert {:ok, operator} = Accounts.provision(admin, staff.invited, [:support_operator])
+    assert {:ok, operator} = authenticate(operator.id)
+    {staff, admin, operator}
   end
 
   def signed_receipt(%{event: event} = ctx) do

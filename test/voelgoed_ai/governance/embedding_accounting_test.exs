@@ -13,6 +13,23 @@ defmodule VoelgoedAi.Governance.EmbeddingAccountingTest do
     assert {:error, :amount_overflow} = EmbeddingAccounting.cost(9_223_372_036_854_775_807, price)
   end
 
+  test "article embedding serializes scoped content deterministically" do
+    content =
+      VoelgoedAi.KnowledgeFixtures.payload()
+      |> Map.put("applicability", %{"event" => ["evt"], "brand" => ["brand"]})
+
+    assert {:ok, input} = EmbeddingProfile.input(content, "en-ZA")
+
+    assert [
+             1,
+             "en-ZA",
+             "Synthetic FAQ",
+             [],
+             "Synthetic answer.",
+             [["brand", ["brand"]], ["event", ["evt"]]]
+           ] = Jason.decode!(input)
+  end
+
   test "a vector has exact dimension and a finite nonzero float32 representation" do
     assert {:ok, _} = EmbeddingProfile.vector([1.0 | List.duplicate(0.0, 1535)])
     assert {:error, :invalid_vector} = EmbeddingProfile.vector(List.duplicate(0.0, 1536))

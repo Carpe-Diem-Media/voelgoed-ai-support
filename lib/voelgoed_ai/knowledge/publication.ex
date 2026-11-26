@@ -296,8 +296,10 @@ defmodule VoelgoedAi.Knowledge.Publication do
         do: %{status: :publish_failed, publication_reason: reason},
         else: %{reindex_base_generation: nil, publication_reason: reason}
 
+    event = if revision.status == :publishing, do: :fail_publication, else: :fail_reindex
+
     with :ok <- invalidate(rows),
-         {:ok, _} <- change(revision, attrs) do
+         {:ok, _} <- transition(revision, attrs, event, reason) do
       # Return a conflict as data so the generation fence commits.
       {:ok, :stale}
     end
@@ -401,7 +403,7 @@ defmodule VoelgoedAi.Knowledge.Publication do
 
     defp rollback(id) do
       with {:ok, request} when is_struct(request, AuditEvent) <-
-             one(AuditEvent, :rollback_request, %{id: id}) do
+             one(AuditEvent, :rollback_request, %{id: id}, nil) do
         with_context(request.article_revision_target_id, fn collection,
                                                             article,
                                                             revision,
@@ -571,7 +573,7 @@ defmodule VoelgoedAi.Knowledge.Publication do
 
   defp get(resource, id, lock \\ nil), do: one(resource, :storage_row, %{id: id}, lock)
 
-  defp one(resource, action, args, lock \\ nil),
+  defp one(resource, action, args, lock),
     do: query(resource, action, args, lock, &Ash.read_one/1)
 
   defp read(resource, action, args, lock \\ nil),

@@ -202,6 +202,79 @@ defmodule VoelgoedAi.Knowledge.PublicationTest do
     assert vector_rows(en) == [["running", nil]]
   end
 
+  test "a returned enqueue error rolls back READY and leaves the hold recoverable", ctx do
+    {_, revision} = approved(ctx)
+    [af, en] = request_index(ctx, revision)
+    ready([af])
+
+    fixture(%{enqueue_finalisation: fn _ -> {:error, :synthetic_insert_error} end})
+    assert {:error, :indexing_storage} = Embedding.index(en)
+    assert vector_rows(af) == [["ready", 1536]]
+    assert vector_rows(en) == [["running", nil]]
+    assert [["running", true, "reserved", _, nil]] = reservation_rows(en)
+    assert publication_jobs(revision.id) == []
+  end
+
+  test "publication capability binds both action and target", ctx do
+    {_, revision} = approved(ctx)
+    [_, _] = request_index(ctx, revision)
+    ref = make_ref()
+    args = %{id: revision.id, generation: 1}
+    Process.put({Publication, :request}, {ref, :publish_ready, args})
+
+    try do
+      actor = %Publication{ref: ref}
+      assert {:ok, _} = invoke(ArticleRevision, :publish_ready, args, actor)
+
+      assert {:error, _} =
+               invoke(ArticleRevision, :publish_ready, %{args | id: Ash.UUIDv7.generate()}, actor)
+
+      assert {:error, _} = invoke(ArticleRevision, :expire, %{id: revision.id}, actor)
+    after
+      Process.delete({Publication, :request})
+    end
+  end
+
+  test "a missed reindex deadline records a publisher failure without clearing the active index",
+       ctx do
+    {_, revision} = approved(ctx)
+    now = DateTime.utc_now()
+    fixture(%{clock: fn -> now end})
+    ready(request_index(ctx, revision))
+    assert :ok = finalise(revision.id, 1)
+
+    assert {:ok, _} = reindex(ctx, revision, 1, 1)
+    fixture(%{clock: fn -> DateTime.add(now, 60) end})
+    assert :ok = finalise(revision.id, 2)
+    assert [["published", 1, _]] = publication_state(revision.id)
+    assert {:ok, %{publication_generation: 3}} = reindex(ctx, revision, 1, 1)
+
+    assert %{rows: [["publisher", "fail_reindex", "deadline"]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT actor_kind, event, reason_code FROM audit_events
+               WHERE article_revision_target_id = $1 AND event = 'fail_reindex'
+               """,
+               [db_id(revision.id)]
+             )
+  end
+
+  test "a pending reindex makes an otherwise valid rollback stale", ctx do
+    {_, revision} = approved(ctx)
+    ready(request_index(ctx, revision))
+    assert :ok = finalise(revision.id, 1)
+    assert {:ok, _} = reindex(ctx, revision, 1, 1)
+    ready(generation_ids(revision.id, 2))
+    assert :ok = finalise(revision.id, 2)
+
+    request = rollback_request(ctx, revision, 2, 2, 1)
+    assert {:ok, _} = Publication.record_fixture_evaluation(revision.id, 1)
+    assert {:ok, _} = reindex(ctx, revision, 2, 2)
+    assert :ok = perform_rollback(request)
+    assert [["published", 2, _]] = publication_state(revision.id)
+  end
+
   test "recovery activates stranded B1 work and fences a disabled and re-enabled epoch", ctx do
     {collection, revision} = approved(ctx)
     ready(request_index(ctx, revision))
@@ -321,6 +394,16 @@ defmodule VoelgoedAi.Knowledge.PublicationTest do
     fixture(%{clock: fn -> DateTime.add(now, 60, :second) end})
     assert :ok = RecoverIndexing.perform(%Oban.Job{args: %{}})
     assert [["publish_failed", nil, nil]] = publication_state(stranded.id)
+
+    assert %{rows: [["publisher", "fail_publication", "deadline"]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT actor_kind, event, reason_code FROM audit_events
+               WHERE article_revision_target_id = $1 AND event = 'fail_publication'
+               """,
+               [db_id(stranded.id)]
+             )
 
     expires = DateTime.add(now, 90, :second)
 
