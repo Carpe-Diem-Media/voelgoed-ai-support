@@ -338,6 +338,30 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       run(Editorial)
     end
 
+    action :search_published, VoelgoedAi.Knowledge.Retrieval.Manifest do
+      description("Return approved evidence for the current qualified support claim.")
+
+      argument(:query, :string,
+        sensitive?: true,
+        allow_nil?: false,
+        constraints: [allow_empty?: true, trim?: false, max_length: 3000]
+      )
+
+      run(VoelgoedAi.Knowledge.Retrieval)
+    end
+
+    action :validate_evidence, VoelgoedAi.Knowledge.Retrieval.Manifest do
+      description("Requalify citations and links from the manifest issued to this claim.")
+      argument(:citations, {:array, :uuid}, allow_nil?: false, constraints: [max_length: 4])
+
+      argument(:used_links, {:array, :string},
+        allow_nil?: false,
+        constraints: [max_length: 32, items: [max_length: 512, trim?: false]]
+      )
+
+      run(VoelgoedAi.Knowledge.Retrieval)
+    end
+
     action :publish_ready, :atom do
       constraints(one_of: [:activated, :switched, :stale, :pending, :noop])
       argument(:id, :uuid, allow_nil?: false)
@@ -495,6 +519,10 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
 
     policy action([:insert_row, :change_row, :latest_revision, :approved_revisions]) do
       authorize_if(Storage)
+    end
+
+    policy action([:search_published, :validate_evidence]) do
+      authorize_if(VoelgoedAi.Knowledge.Retrieval)
     end
 
     policy action([:publish_ready, :expire, :rollback_index]) do

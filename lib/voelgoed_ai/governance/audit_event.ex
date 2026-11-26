@@ -59,8 +59,16 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     :request_reindex,
     :archive
   ]
-  @publication_events [:activate, :supersede, :expire, :switch_index, :rollback_index]
-  @publication_reasons [:index_ready, :replaced, :deadline, :evaluated]
+  @publication_events [
+    :activate,
+    :supersede,
+    :expire,
+    :switch_index,
+    :rollback_index,
+    :fail_publication,
+    :fail_reindex
+  ]
+  @publication_reasons [:index_ready, :replaced, :deadline, :evaluated, :stale_request]
   @knowledge_reasons [
     :local_admin,
     :local_editor,
@@ -245,6 +253,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
               WHEN 'expire' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'expired'
               WHEN 'switch_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
               WHEN 'rollback_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              WHEN 'fail_publication' THEN reason_code IN ('deadline','stale_request')
+                AND operational_before->>'status' = 'publishing' AND operational_after->>'status' = 'publish_failed'
+              WHEN 'fail_reindex' THEN reason_code IN ('deadline','stale_request')
+                AND operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
               ELSE false END) IS TRUE)
           OR (actor_kind = 'support_worker' AND before_state IS NULL AND after_state IS NULL
             AND operational_before IS NULL AND operational_after IS NULL
@@ -281,8 +293,6 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       allow_nil?: false,
       constraints: [
         one_of: [
-          :fail_publication,
-          :fail_reindex,
           :request_index_rollback
           | @publication_events ++
               @staff_events ++

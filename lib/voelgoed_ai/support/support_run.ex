@@ -139,6 +139,7 @@ defmodule VoelgoedAi.Support.SupportRun do
 
   identities do
     identity(:same_session_run, [:id, :session_id])
+    identity(:same_assistant_revision, [:id, :assistant_revision_id])
   end
 
   actions do
