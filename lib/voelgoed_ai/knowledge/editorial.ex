@@ -20,11 +20,12 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     Content,
     KnowledgeCollection,
     Portable,
+    Publication,
     Storage
   }
 
   alias VoelgoedAi.Intelligence.{Embedding, EmbeddingProfile}
-  alias VoelgoedAi.Knowledge.Workers.{IndexArticle, RecoverIndexing}
+  alias VoelgoedAi.Knowledge.Workers.{FinalizePublication, IndexArticle, RecoverIndexing}
   alias VoelgoedAi.Support.Configuration
 
   @editor :knowledge_editor
@@ -39,6 +40,8 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     :export_articles,
     :request_publish,
     :retry_publication,
+    :request_reindex,
+    :request_index_rollback,
     :revoke
   ]
 
@@ -199,7 +202,13 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     # even when the embedding UUIDs belong to different generations.
     with :ok <- invalidate_publication_rows(revisions) do
       Enum.reduce_while(revisions, :ok, fn row, :ok ->
-        case change(row, %{status: :revoked}, :archive, staff, :obsolete) do
+        case change(
+               row,
+               Map.put(Publication.terminal_index(), :status, :revoked),
+               :archive,
+               staff,
+               :obsolete
+             ) do
           {:ok, _} -> {:cont, :ok}
           error -> {:halt, error}
         end
@@ -249,12 +258,62 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     end
   end
 
+  defp revision_action(collection, article, row, :request_reindex, args, staff) do
+    with :ok <- current_index(collection, article, row, args),
+         {:ok, deadline} <- Embedding.publication_deadline(row.content),
+         {:ok, requested} <-
+           change(
+             row,
+             %{
+               reindex_base_generation: row.active_index_generation,
+               publication_requested_by_id: staff.id,
+               publication_generation: row.publication_generation + 1,
+               publication_collection_epoch: collection.security_epoch,
+               expected_current_revision_id: row.id,
+               publication_deadline_at: deadline,
+               publication_profile_id: row.active_index_profile_id,
+               publication_reason: nil
+             },
+             :request_reindex,
+             staff,
+             :source_verified
+           ),
+         {:ok, _} <-
+           traverse(row.content["localized_content"], &queue_variant(requested, &1["locale"])) do
+      {:ok, revision_view(requested)}
+    end
+  end
+
+  defp revision_action(collection, article, row, :request_index_rollback, args, staff) do
+    now = Embedding.now()
+
+    with :ok <- Publication.rollback_available(),
+         :ok <- current_index(collection, article, row, args),
+         true <- row.retained_index_generation == args.target_generation,
+         {:ok, expires} <- Publication.approved_content(row, now),
+         {:ok, request} <- append_rollback_request(collection, row, staff, now, expires),
+         {:ok, _} <- Oban.insert(FinalizePublication.new(%{rollback_request_id: request.id})) do
+      {:ok, %{request_id: request.id}}
+    else
+      false -> {:error, :stale_index}
+      error -> error
+    end
+  end
+
   defp revision_action(_collection, article, row, :revoke, args, staff) do
     with :ok <- active(article),
          :ok <- same_snapshot(row, args),
-         true <- row.status in [:approved, :publishing, :publish_failed],
+         true <- row.status in [:approved, :publishing, :publish_failed, :published],
          :ok <- invalidate_publication_rows([row]),
-         {:ok, revoked} <- change(row, %{status: :revoked}, :revoke, staff, args.reason) do
+         {:ok, revoked} <-
+           change(
+             row,
+             Map.put(Publication.terminal_index(), :status, :revoked),
+             :revoke,
+             staff,
+             args.reason
+           ),
+         :ok <- clear_pointer(article, row) do
       {:ok, revision_view(revoked)}
     else
       false -> {:error, :invalid_transition}
@@ -271,6 +330,74 @@ defmodule VoelgoedAi.Knowledge.Editorial do
       {:ok, revision_view(result)}
     end
   end
+
+  defp current_index(collection, article, row, args) do
+    with :ok <- active(collection),
+         :ok <- active(article),
+         true <-
+           collection.audience == :public and row.status == :published and
+             article.current_revision_id == row.id and not Publication.pending?(row) and
+             row.active_index_profile_id == EmbeddingProfile.id() and
+             row.active_index_generation == args.expected_generation and
+             row.index_epoch == args.expected_index_epoch and
+             row.content_hash == args.expected_hash,
+         {:ok, _} <- Publication.approved_content(row, Embedding.now()) do
+      :ok
+    else
+      false -> {:error, :stale_index}
+      error -> error
+    end
+  end
+
+  defp append_rollback_request(collection, row, staff, now, expires) do
+    deadline = DateTime.add(now, 60, :second)
+
+    deadline =
+      if not is_nil(expires) and DateTime.before?(expires, deadline), do: expires, else: deadline
+
+    before = %{
+      status: :published,
+      index_generation: row.active_index_generation,
+      index_epoch: row.index_epoch,
+      content_hash: row.content_hash
+    }
+
+    attrs = %{
+      actor_kind: :staff,
+      actor_staff_id: staff.id,
+      article_revision_target_id: row.id,
+      target_kind: :knowledge_revision,
+      event: :request_index_rollback,
+      reason_code: :source_verified,
+      correlation_id: Ash.UUIDv7.generate(),
+      operational_before: before,
+      operational_after:
+        Map.merge(before, %{
+          index_generation: row.retained_index_generation,
+          collection_epoch: collection.security_epoch,
+          content_profile_id: row.active_index_profile_id,
+          deadline_us: DateTime.to_unix(deadline, :microsecond)
+        })
+    }
+
+    storage(
+      AuditEvent,
+      :append_rollback_request,
+      &Ash.create(AuditEvent, attrs, action: :append_rollback_request, actor: &1)
+    )
+  end
+
+  defp clear_pointer(%{current_revision_id: id} = article, %{id: id}) do
+    with {:ok, _} <-
+           storage(
+             Article,
+             :change_row,
+             &Ash.update(article, %{current_revision_id: nil}, action: :change_row, actor: &1)
+           ),
+         do: :ok
+  end
+
+  defp clear_pointer(_, _), do: :ok
 
   defp queue_variant(revision, locale) do
     attrs = %{
@@ -298,22 +425,19 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   end
 
   defp invalidate_publication_rows(revisions) do
-    generations = Enum.filter(revisions, &(&1.publication_generation > 0))
-
     with {:ok, rows} <-
-           traverse(
-             generations,
-             &read(ArticleEmbedding, :generation_rows, %{
-               revision_id: &1.id,
-               generation: &1.publication_generation
-             })
+           read(
+             ArticleEmbedding,
+             :revision_rows,
+             %{revision_ids: Enum.map(revisions, & &1.id)},
+             :for_update
            ),
-         ids = rows |> List.flatten() |> Enum.map(& &1.id) |> Enum.sort(),
-         {:ok, locked} <- traverse(ids, &get(ArticleEmbedding, &1, :for_update)),
-         {:ok, _} <- traverse(locked, &invalidate_variant/1) do
+         {:ok, _} <- traverse(rows, &invalidate_variant/1) do
       :ok
     end
   end
+
+  defp invalidate_variant(%{state: :invalidated} = row), do: {:ok, row}
 
   defp invalidate_variant(row) do
     storage(
@@ -724,7 +848,13 @@ defmodule VoelgoedAi.Knowledge.Editorial do
         :publication_generation,
         :publication_requested_by_id,
         :publication_deadline_at,
-        :publication_reason
+        :publication_reason,
+        :published_at,
+        :active_index_generation,
+        :active_index_profile_id,
+        :index_epoch,
+        :retained_index_generation,
+        :reindex_base_generation
       ])
 
   # Like support configuration, only the owning transaction can mint a token.

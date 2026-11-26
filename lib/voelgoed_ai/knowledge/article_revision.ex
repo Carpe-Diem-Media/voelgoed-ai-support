@@ -6,7 +6,7 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
     data_layer: AshPostgres.DataLayer,
     authorizers: [Ash.Policy.Authorizer]
 
-  alias VoelgoedAi.Knowledge.{Editorial, Storage}
+  alias VoelgoedAi.Knowledge.{Editorial, Publication, Storage}
 
   postgres do
     table("article_revisions")
@@ -16,7 +16,11 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       revision_number: :bigint,
       edit_version: :bigint,
       publication_generation: :bigint,
-      publication_collection_epoch: :bigint
+      publication_collection_epoch: :bigint,
+      active_index_generation: :bigint,
+      retained_index_generation: :bigint,
+      reindex_base_generation: :bigint,
+      index_epoch: :bigint
     )
 
     references do
@@ -27,7 +31,42 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       reference(:expected_current_revision, on_delete: :restrict, on_update: :restrict)
     end
 
+    custom_indexes do
+      index([:article_id],
+        name: "article_revisions_one_published",
+        unique: true,
+        where: "status = 'published'"
+      )
+
+      index([:publication_deadline_at, :id],
+        name: "article_revisions_pending_index",
+        where: "status = 'publishing' OR reindex_base_generation IS NOT NULL"
+      )
+
+      index([:publication_expires_at, :id],
+        name: "article_revisions_expiry",
+        where: "status = 'published' AND publication_expires_at IS NOT NULL"
+      )
+    end
+
     check_constraints do
+      check_constraint(:index_epoch, "article_revisions_active_index",
+        check: """
+        index_epoch >= 0
+        AND ((status = 'published' AND published_at IS NOT NULL AND index_epoch > 0
+              AND active_index_generation IS NOT NULL AND active_index_generation > 0
+              AND active_index_generation <= publication_generation AND active_index_profile_id IS NOT NULL)
+          OR (status <> 'published' AND active_index_generation IS NULL AND active_index_profile_id IS NULL
+              AND retained_index_generation IS NULL AND reindex_base_generation IS NULL
+              AND publication_expires_at IS NULL AND index_evaluation IS NULL))
+        AND (retained_index_generation IS NULL OR (retained_index_generation > 0
+          AND retained_index_generation <= publication_generation AND retained_index_generation <> active_index_generation))
+        AND (reindex_base_generation IS NULL OR (reindex_base_generation = active_index_generation
+          AND publication_generation > active_index_generation AND expected_current_revision_id IS NOT NULL
+          AND expected_current_revision_id = id))
+        """
+      )
+
       check_constraint(:publication_generation, "article_revisions_publication_request",
         check: """
         publication_generation >= 0
@@ -36,7 +75,7 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
           OR (publication_generation > 0 AND publication_requested_by_id IS NOT NULL
               AND publication_collection_epoch >= 0 AND publication_collection_epoch IS NOT NULL
               AND publication_deadline_at IS NOT NULL AND publication_profile_id IS NOT NULL
-              AND status IN ('publishing','publish_failed','revoked')))
+              AND status IN ('publishing','publish_failed','revoked','published','superseded','expired')))
         AND (status NOT IN ('publishing','publish_failed') OR publication_generation > 0)
         AND (status <> 'publish_failed' OR publication_reason IS NOT NULL)
         """
@@ -54,7 +93,7 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
         AND (
           (status IN ('draft','withdrawn') AND review_hash IS NULL AND approved_by_id IS NULL AND approved_at IS NULL)
           OR (status = 'in_review' AND review_hash IS NOT NULL AND review_hash = content_hash AND approved_by_id IS NULL AND approved_at IS NULL)
-          OR (status IN ('approved','revoked','publishing','publish_failed') AND review_hash IS NOT NULL AND review_hash = content_hash AND approved_by_id IS NOT NULL AND approved_at IS NOT NULL)
+          OR (status IN ('approved','revoked','publishing','publish_failed','published','superseded','expired') AND review_hash IS NOT NULL AND review_hash = content_hash AND approved_by_id IS NOT NULL AND approved_at IS NOT NULL)
         )
         """
       )
@@ -77,7 +116,10 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
           :withdrawn,
           :revoked,
           :publishing,
-          :publish_failed
+          :publish_failed,
+          :published,
+          :superseded,
+          :expired
         ]
       ]
     )
@@ -103,6 +145,34 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
     attribute(:publication_collection_epoch, :integer)
     attribute(:publication_profile_id, :string)
     attribute(:publication_deadline_at, :utc_datetime_usec)
+
+    attribute(:published_at, :utc_datetime_usec)
+    attribute(:publication_expires_at, :utc_datetime_usec)
+    attribute(:active_index_generation, :integer)
+    attribute(:active_index_profile_id, :string)
+    attribute(:retained_index_generation, :integer)
+    attribute(:reindex_base_generation, :integer)
+    attribute(:index_epoch, :integer, allow_nil?: false, default: 0)
+
+    attribute(:index_evaluation, :map,
+      constraints: [
+        fields: [
+          generation: [type: :integer, allow_nil?: false, constraints: [min: 1]],
+          content_hash: [
+            type: :string,
+            allow_nil?: false,
+            constraints: [match: ~r/\A[a-f0-9]{64}\z/]
+          ],
+          profile_id: [type: :string, allow_nil?: false, constraints: [max_length: 128]],
+          evaluator: [
+            type: :string,
+            allow_nil?: false,
+            constraints: [match: ~r/\A[a-z_]{1,32}\z/]
+          ],
+          evaluated_at: [type: :utc_datetime_usec, allow_nil?: false]
+        ]
+      ]
+    )
 
     attribute(:publication_reason, :atom,
       constraints: [
@@ -241,6 +311,87 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       run(Editorial)
     end
 
+    action :request_reindex, :map do
+      argument(:id, :uuid, allow_nil?: false)
+
+      argument(:expected_hash, :string,
+        allow_nil?: false,
+        constraints: [match: ~r/\A[a-f0-9]{64}\z/]
+      )
+
+      argument(:expected_generation, :integer, allow_nil?: false, constraints: [min: 1])
+      argument(:expected_index_epoch, :integer, allow_nil?: false, constraints: [min: 1])
+      run(Editorial)
+    end
+
+    action :request_index_rollback, :map do
+      argument(:id, :uuid, allow_nil?: false)
+
+      argument(:expected_hash, :string,
+        allow_nil?: false,
+        constraints: [match: ~r/\A[a-f0-9]{64}\z/]
+      )
+
+      argument(:expected_generation, :integer, allow_nil?: false, constraints: [min: 1])
+      argument(:expected_index_epoch, :integer, allow_nil?: false, constraints: [min: 1])
+      argument(:target_generation, :integer, allow_nil?: false, constraints: [min: 1])
+      run(Editorial)
+    end
+
+    action :publish_ready, :atom do
+      constraints(one_of: [:activated, :switched, :stale, :pending, :noop])
+      argument(:id, :uuid, allow_nil?: false)
+      argument(:generation, :integer, allow_nil?: false, constraints: [min: 1])
+      run(Publication)
+    end
+
+    action :expire, :atom do
+      constraints(one_of: [:expired, :early, :stale, :noop])
+      argument(:id, :uuid, allow_nil?: false)
+      run(Publication)
+    end
+
+    action :rollback_index, :atom do
+      constraints(one_of: [:switched, :stale, :noop])
+      argument(:request_id, :uuid, allow_nil?: false)
+      run(Publication)
+    end
+
+    read :pending_finalisation do
+      argument(:now, :utc_datetime_usec, allow_nil?: false)
+
+      argument(:status, :atom,
+        allow_nil?: false,
+        constraints: [one_of: [:publishing, :published]]
+      )
+
+      filter(
+        expr(
+          status == ^arg(:status) and
+            (status == :publishing or not is_nil(reindex_base_generation)) and
+            (publication_deadline_at <= ^arg(:now) or
+               (fragment(
+                  "EXISTS (SELECT 1 FROM article_embeddings e WHERE e.revision_id = ? AND e.generation = ? AND e.state = 'ready')",
+                  id,
+                  publication_generation
+                ) and
+                  not fragment(
+                    "EXISTS (SELECT 1 FROM article_embeddings e WHERE e.revision_id = ? AND e.generation = ? AND e.state <> 'ready')",
+                    id,
+                    publication_generation
+                  )))
+        )
+      )
+
+      prepare(build(sort: [:publication_deadline_at, :id], limit: 50))
+    end
+
+    read :due_expiries do
+      argument(:now, :utc_datetime_usec, allow_nil?: false)
+      filter(expr(status == :published and publication_expires_at <= ^arg(:now)))
+      prepare(build(sort: [:publication_expires_at, :id], limit: 50))
+    end
+
     action :revoke, :map do
       argument(:id, :uuid, allow_nil?: false)
 
@@ -270,7 +421,8 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
 
       filter(
         expr(
-          article_id == ^arg(:article_id) and status in [:approved, :publishing, :publish_failed]
+          article_id == ^arg(:article_id) and
+            status in [:approved, :publishing, :publish_failed, :published]
         )
       )
 
@@ -310,7 +462,15 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
         :expected_current_revision_id,
         :publication_profile_id,
         :publication_deadline_at,
-        :publication_reason
+        :publication_reason,
+        :published_at,
+        :publication_expires_at,
+        :active_index_generation,
+        :active_index_profile_id,
+        :retained_index_generation,
+        :reindex_base_generation,
+        :index_epoch,
+        :index_evaluation
       ])
     end
   end
@@ -326,6 +486,8 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
              :withdraw,
              :request_publish,
              :retry_publication,
+             :request_reindex,
+             :request_index_rollback,
              :revoke
            ]) do
       authorize_if(Editorial)
@@ -335,7 +497,11 @@ defmodule VoelgoedAi.Knowledge.ArticleRevision do
       authorize_if(Storage)
     end
 
-    policy action(:storage_row) do
+    policy action([:publish_ready, :expire, :rollback_index]) do
+      authorize_if(Publication)
+    end
+
+    policy action([:storage_row, :pending_finalisation, :due_expiries]) do
       authorize_if(Storage)
     end
   end

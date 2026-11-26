@@ -548,7 +548,7 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas003EmbeddingAccounting do
     # discard the new schema without discarding any work or spend evidence.
     execute("""
     LOCK TABLE automation_controls, article_revisions, article_embeddings,
-               inference_runs, usage_reservations, usage_ledger_entries, spend_windows
+               inference_runs, usage_reservations, usage_ledger_entries, spend_windows, audit_events
     IN ACCESS EXCLUSIVE MODE
     """)
 
@@ -560,6 +560,8 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas003EmbeddingAccounting do
          OR EXISTS (SELECT 1 FROM usage_reservations)
          OR EXISTS (SELECT 1 FROM usage_ledger_entries)
          OR EXISTS (SELECT 1 FROM spend_windows)
+         OR EXISTS (SELECT 1 FROM audit_events
+                    WHERE event IN ('request_publish','retry_publication','revoke','fail_publication'))
          OR EXISTS (SELECT 1 FROM automation_controls WHERE embedding_inhibited) THEN
         RAISE EXCEPTION 'VGAS-003 indexing rollback blocked because publication or accounting history exists';
       END IF;
