@@ -6,6 +6,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
     data_layer: AshPostgres.DataLayer,
     authorizers: [Ash.Policy.Authorizer]
 
+  alias VoelgoedAi.Knowledge.Storage
   alias VoelgoedAi.Support.{ActionScope, Configuration}
 
   postgres do
@@ -57,6 +58,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
 
     attribute(:security_epoch, :integer, allow_nil?: false, default: 0, constraints: [min: 0])
 
+    attribute(:embedding_inhibited, :boolean, allow_nil?: false, default: false)
     create_timestamp(:inserted_at)
     update_timestamp(:updated_at)
   end
@@ -83,6 +85,12 @@ defmodule VoelgoedAi.Governance.AutomationControl do
       filter(expr(singleton == true))
     end
 
+    update :inhibit_embedding do
+      transaction?(false)
+      require_atomic?(false)
+      change(set_attribute(:embedding_inhibited, true))
+    end
+
     update :update_row do
       transaction?(false)
       require_atomic?(false)
@@ -91,6 +99,10 @@ defmodule VoelgoedAi.Governance.AutomationControl do
   end
 
   policies do
+    policy action(:inhibit_embedding) do
+      authorize_if(Storage)
+    end
+
     policy action([:enable_automation, :disable_automation]) do
       authorize_if(ActionScope.Admin)
     end

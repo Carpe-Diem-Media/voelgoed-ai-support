@@ -11,6 +11,9 @@ defmodule VoelgoedAi.Governance do
   end
 
   resources do
+    resource(VoelgoedAi.Governance.UsageReservation)
+    resource(VoelgoedAi.Governance.UsageLedger)
+    resource(VoelgoedAi.Governance.SpendWindow)
     resource(AuditEvent)
     resource(VoelgoedAi.Governance.AutomationControl)
   end

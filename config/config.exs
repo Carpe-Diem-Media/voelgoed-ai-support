@@ -10,7 +10,7 @@ config :voelgoed_ai,
     VoelgoedAi.Support
   ]
 
-config :voelgoed_ai, VoelgoedAi.Repo, log: false
+config :voelgoed_ai, VoelgoedAi.Repo, log: false, types: VoelgoedAi.PostgresTypes
 
 # Job storage is available. Execution requires a separate activation decision.
 config :voelgoed_ai, Oban,
@@ -35,7 +35,14 @@ if config_env() == :test do
   # same bounded sweep worker explicitly.
   config :voelgoed_ai, Oban,
     testing: :manual,
-    cron: [crontab: [{"* * * * *", VoelgoedAi.Support.Workers.Sweep}]]
+    cron: [
+      crontab: [
+        {"* * * * *", VoelgoedAi.Support.Workers.Sweep},
+        {"* * * * *", VoelgoedAi.Knowledge.Workers.RecoverIndexing}
+      ]
+    ]
+
+  config :voelgoed_ai, :embedding_fixture, %{mode: :fixture}
 
   config :voelgoed_ai, :entra_fixture_transport, {Req.Test, VoelgoedAi.StaffEntraFixture}
 

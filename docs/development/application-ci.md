@@ -42,3 +42,10 @@ Use DevCore for local bootstrap and keep DEV and TEST separate. The workstation
 TEST role cannot install server extensions. On a pgvector-enabled TEST target,
 run the vector probe with `VGAS_VERIFY_PGVECTOR=true`. CI sets this flag in
 every shard and all migration lanes, so missing pgvector fails the gate.
+
+The VGAS-003 embedding accounting migration requires a pre-provisioned
+`vector` extension. Use a disposable pgvector instance on `127.0.0.1:55434`
+with TEST database and role `vgas_test` and `VGAS_VERIFY_PGVECTOR=true` when
+the workstation allocation lacks the extension. The Entra feasibility
+fixtures accept this explicit loopback target as well as the standard TEST
+endpoint. Shared DevCore credentials remain in DevCore.

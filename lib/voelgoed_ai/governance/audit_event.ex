@@ -53,6 +53,9 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     :request_changes,
     :approve,
     :withdraw,
+    :request_publish,
+    :retry_publication,
+    :revoke,
     :archive
   ]
   @knowledge_reasons [
@@ -94,6 +97,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           :archived,
           :in_review,
           :approved,
+          :publishing,
+          :publish_failed,
           :withdrawn,
           :revoked
         ]
@@ -163,7 +168,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         check: """
         (actor_kind = 'bootstrap' AND actor_staff_id IS NULL AND operator_ref = 'staff-bootstrap' AND operator_ref IS NOT NULL)
         OR (actor_kind = 'staff' AND actor_staff_id IS NOT NULL AND operator_ref IS NULL)
-        OR (actor_kind = 'support_worker' AND actor_staff_id IS NULL AND operator_ref IS NULL)
+        OR (actor_kind IN ('support_worker','embedding_worker') AND actor_staff_id IS NULL AND operator_ref IS NULL)
         """
       )
 
@@ -192,6 +197,9 @@ defmodule VoelgoedAi.Governance.AuditEvent do
                 OR (event = 'request_changes' AND reason_code IN ('source_correction','content_correction'))
                 OR (event = 'approve' AND reason_code IN ('source_verified','self_approval_attested'))
                 OR (event = 'withdraw' AND reason_code = 'withdrawn_by_staff')
+                OR (event IN ('request_publish','retry_publication') AND reason_code = 'source_verified')
+                OR (event = 'revoke' AND reason_code = 'obsolete')
+                OR (event = 'fail_publication' AND reason_code IN ('deadline','stale_request','transport_unknown','invalid_vector','admission_denied'))
                 OR (event = 'archive' AND reason_code = 'obsolete')))
             OR (target_kind = 'support_session' AND session_target_id IS NOT NULL
               AND event IN ('request_handoff','return_to_bot','close_session'))
@@ -208,10 +216,13 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           (target_kind = 'staff_user' AND actor_kind IN ('staff','bootstrap') AND after_state IS NOT NULL
             AND operational_before IS NULL AND operational_after IS NULL)
           OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL
-            AND event NOT IN ('delivery_unknown','missed_deadline','handoff_failed')
+            AND event NOT IN ('delivery_unknown','missed_deadline','handoff_failed','fail_publication')
             AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')
               OR (target_kind IN ('knowledge_collection','knowledge_article','knowledge_revision'))
               OR (target_kind NOT IN ('staff_user','support_session','outbound_delivery','knowledge_collection','knowledge_article','knowledge_revision') AND reason_code = 'local_admin')))
+          OR (actor_kind = 'embedding_worker' AND target_kind = 'knowledge_revision'
+            AND event = 'fail_publication' AND before_state IS NULL AND after_state IS NULL
+            AND operational_before IS NOT NULL AND operational_after IS NOT NULL)
           OR (actor_kind = 'support_worker' AND before_state IS NULL AND after_state IS NULL
             AND operational_before IS NULL AND operational_after IS NULL
             AND ((event = 'delivery_unknown' AND reason_code IN (#{@system_reason_sql}))
@@ -227,7 +238,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
 
     attribute(:actor_kind, :atom,
       allow_nil?: false,
-      constraints: [one_of: [:staff, :bootstrap, :support_worker]]
+      constraints: [one_of: [:staff, :bootstrap, :support_worker, :embedding_worker]]
     )
 
     attribute(:operator_ref, :string, constraints: [match: ~r/\Astaff-bootstrap\z/])
@@ -246,9 +257,11 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     attribute(:event, :atom,
       allow_nil?: false,
       constraints: [
-        one_of:
-          @staff_events ++
-            @operational_events ++ @support_events ++ @system_events ++ @knowledge_events
+        one_of: [
+          :fail_publication
+          | @staff_events ++
+              @operational_events ++ @support_events ++ @system_events ++ @knowledge_events
+        ]
       ]
     )
 
@@ -262,7 +275,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             :local_admin,
             :approved_reprovision,
             :local_operator
-          ] ++ ReasonCode.values() ++ @knowledge_reasons
+          ] ++
+            ReasonCode.values() ++
+            @knowledge_reasons ++
+            [:stale_request, :transport_unknown, :invalid_vector, :admission_denied]
       ]
     )
 
@@ -356,6 +372,24 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       validate(attribute_in(:target_kind, @knowledge_targets))
       validate(attribute_in(:event, @knowledge_events))
       validate(attribute_in(:reason_code, @knowledge_reasons))
+    end
+
+    create :append_publication_failure do
+      transaction?(false)
+
+      accept([
+        :article_revision_target_id,
+        :event,
+        :actor_kind,
+        :target_kind,
+        :reason_code,
+        :operational_before,
+        :operational_after,
+        :correlation_id
+      ])
+
+      validate(attribute_equals(:event, :fail_publication))
+      validate(attribute_equals(:actor_kind, :embedding_worker))
     end
 
     action :knowledge_history, {:array, :map} do
@@ -481,6 +515,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   end
 
   policies do
+    policy action(:append_publication_failure) do
+      authorize_if(Storage)
+    end
+
     policy action([:append_knowledge, :knowledge_rows]) do
       authorize_if(Storage)
     end

@@ -23,6 +23,7 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
   @audit_actions [
     append: :create,
     append_knowledge: :create,
+    append_publication_failure: :create,
     knowledge_rows: :read,
     append_support_operator: :create,
     append_system: :create,
@@ -170,6 +171,19 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
       reason_code: :source_verified,
       operational_before: %{status: :in_review},
       operational_after: %{status: :approved},
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:append_publication_failure, _) do
+    %{
+      actor_kind: :embedding_worker,
+      target_kind: :knowledge_revision,
+      article_revision_target_id: Ash.UUIDv7.generate(),
+      event: :fail_publication,
+      reason_code: :transport_unknown,
+      operational_before: %{status: :publishing},
+      operational_after: %{status: :publish_failed},
       correlation_id: Ash.UUIDv7.generate()
     }
   end

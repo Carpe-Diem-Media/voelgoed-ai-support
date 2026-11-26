@@ -15,6 +15,7 @@ defmodule VoelgoedAi.Knowledge.Editorial do
 
   alias VoelgoedAi.Knowledge.{
     Article,
+    ArticleEmbedding,
     ArticleRevision,
     Content,
     KnowledgeCollection,
@@ -22,6 +23,8 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     Storage
   }
 
+  alias VoelgoedAi.Intelligence.{Embedding, EmbeddingProfile}
+  alias VoelgoedAi.Knowledge.Workers.{IndexArticle, RecoverIndexing}
   alias VoelgoedAi.Support.Configuration
 
   @editor :knowledge_editor
@@ -29,7 +32,15 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   @read_actions [:read_collection, :read_article, :read_revision, :knowledge_history]
   @collection_admin [:create, :enable, :disable, :retire]
   @editor_actions [:create_draft, :edit_draft, :submit_review, :preview_import, :apply_import]
-  @reviewer_actions [:request_changes, :approve, :archive, :export_articles]
+  @reviewer_actions [
+    :request_changes,
+    :approve,
+    :archive,
+    :export_articles,
+    :request_publish,
+    :retry_publication,
+    :revoke
+  ]
 
   @impl Ash.Policy.Check
   def describe(_opts),
@@ -184,16 +195,72 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   end
 
   defp revoke_approved(revisions, staff) do
-    Enum.reduce_while(revisions, :ok, fn row, :ok ->
-      case change(row, %{status: :revoked}, :archive, staff, :obsolete) do
-        {:ok, _} -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
+    # Lock all revision rows first, then all affected embedding rows by ID,
+    # even when the embedding UUIDs belong to different generations.
+    with :ok <- invalidate_publication_rows(revisions) do
+      Enum.reduce_while(revisions, :ok, fn row, :ok ->
+        case change(row, %{status: :revoked}, :archive, staff, :obsolete) do
+          {:ok, _} -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+      end)
+    end
   end
 
   defp revision_action(_collection, _article, row, :read_revision, _args, _staff),
     do: {:ok, revision_view(row)}
+
+  defp revision_action(collection, article, row, action, args, staff)
+       when action in [:request_publish, :retry_publication] do
+    expected_status = if action == :request_publish, do: :approved, else: :publish_failed
+
+    with :ok <- active(collection),
+         :ok <- active(article),
+         :ok <- same_snapshot(row, args),
+         :ok <- review_snapshot(row),
+         true <-
+           row.status == expected_status and collection.audience == :public and
+             row.content["sensitive"] != true and row.content["response_mode"] != "escalate_only",
+         true <- args.expected_current_revision_id == article.current_revision_id,
+         {:ok, deadline} <- Embedding.publication_deadline(row.content),
+         {:ok, requested} <-
+           change(
+             row,
+             %{
+               status: :publishing,
+               publication_requested_by_id: staff.id,
+               publication_generation: row.publication_generation + 1,
+               publication_collection_epoch: collection.security_epoch,
+               expected_current_revision_id: article.current_revision_id,
+               publication_deadline_at: deadline,
+               publication_profile_id: EmbeddingProfile.id(),
+               publication_reason: nil
+             },
+             action,
+             staff,
+             :source_verified
+           ),
+         {:ok, _} <-
+           traverse(row.content["localized_content"], &queue_variant(requested, &1["locale"])) do
+      {:ok, revision_view(requested)}
+    else
+      false -> {:error, :invalid_publication_request}
+      error -> error
+    end
+  end
+
+  defp revision_action(_collection, article, row, :revoke, args, staff) do
+    with :ok <- active(article),
+         :ok <- same_snapshot(row, args),
+         true <- row.status in [:approved, :publishing, :publish_failed],
+         :ok <- invalidate_publication_rows([row]),
+         {:ok, revoked} <- change(row, %{status: :revoked}, :revoke, staff, args.reason) do
+      {:ok, revision_view(revoked)}
+    else
+      false -> {:error, :invalid_transition}
+      error -> error
+    end
+  end
 
   defp revision_action(collection, article, row, action, args, staff) do
     with :ok <- active(collection),
@@ -203,6 +270,60 @@ defmodule VoelgoedAi.Knowledge.Editorial do
          {:ok, result} <- change(row, attrs, action, staff, reason) do
       {:ok, revision_view(result)}
     end
+  end
+
+  defp queue_variant(revision, locale) do
+    attrs = %{
+      revision_id: revision.id,
+      locale: locale,
+      profile_id: revision.publication_profile_id,
+      content_hash: revision.content_hash,
+      generation: revision.publication_generation,
+      deadline_at: revision.publication_deadline_at
+    }
+
+    with {:ok, row} <-
+           storage(
+             ArticleEmbedding,
+             :insert_row,
+             &Ash.create(ArticleEmbedding, attrs, action: :insert_row, actor: &1)
+           ),
+         {:ok, _} <- Oban.insert(IndexArticle.new(%{embedding_id: row.id})),
+         {:ok, _} <-
+           Oban.insert(
+             RecoverIndexing.new(%{embedding_id: row.id}, scheduled_at: row.deadline_at)
+           ) do
+      {:ok, row}
+    end
+  end
+
+  defp invalidate_publication_rows(revisions) do
+    generations = Enum.filter(revisions, &(&1.publication_generation > 0))
+
+    with {:ok, rows} <-
+           traverse(
+             generations,
+             &read(ArticleEmbedding, :generation_rows, %{
+               revision_id: &1.id,
+               generation: &1.publication_generation
+             })
+           ),
+         ids = rows |> List.flatten() |> Enum.map(& &1.id) |> Enum.sort(),
+         {:ok, locked} <- traverse(ids, &get(ArticleEmbedding, &1, :for_update)),
+         {:ok, _} <- traverse(locked, &invalidate_variant/1) do
+      :ok
+    end
+  end
+
+  defp invalidate_variant(row) do
+    storage(
+      ArticleEmbedding,
+      :change_row,
+      &Ash.update(row, %{state: :invalidated, vector: nil, error_code: :stale_request},
+        action: :change_row,
+        actor: &1
+      )
+    )
   end
 
   defp same_snapshot(row, args) do
@@ -599,7 +720,11 @@ defmodule VoelgoedAi.Knowledge.Editorial do
         :review_hash,
         :created_by_id,
         :approved_at,
-        :approved_by_id
+        :approved_by_id,
+        :publication_generation,
+        :publication_requested_by_id,
+        :publication_deadline_at,
+        :publication_reason
       ])
 
   # Like support configuration, only the owning transaction can mint a token.
