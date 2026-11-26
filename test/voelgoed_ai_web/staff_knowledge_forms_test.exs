@@ -17,6 +17,32 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
 
   setup :setup_knowledge
 
+  test "a draft needs a source reference before it can be submitted for review", ctx do
+    args = put_in(draft_args(ctx, collection(ctx)), [:content, "source_references"], [])
+    assert {:ok, %{revision: draft}} = invoke(Article, :create_draft, args, ctx.editor)
+    assert {:ok, view, _} = live(connected_page(ctx.editor, path(draft)))
+
+    refute has_element?(view, "#submit-review")
+
+    assert has_element?(
+             view,
+             "#review-notice",
+             "Add a source reference before submitting for review."
+           )
+
+    reply =
+      render_submit(view, "submit_review", %{
+        "form_token" => form_token(view, "#withdraw"),
+        "confirm" => "true"
+      })
+
+    assert reply =~ "Reload"
+    version = draft.edit_version
+
+    assert {:ok, %{status: :draft, edit_version: ^version}} =
+             invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.editor)
+  end
+
   test "review uses the displayed draft snapshot and ignores a forged target", ctx do
     collection = collection(ctx)
     draft = draft_revision(ctx, collection)
@@ -139,6 +165,21 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
              exact
   end
 
+  test "a forged draft form token cannot save an edit", ctx do
+    draft = draft_revision(ctx, collection(ctx))
+    assert {:ok, view, _} = live(connected_page(ctx.editor, path(draft) <> "/edit"))
+    fields = %{"draft" => %{"en-ZA-approved_answer" => "Synthetic unsaved answer."}}
+
+    assert render_submit(form(view, "#draft-form", fields), %{"form_token" => "forged"}) =~
+             "Reload before saving this draft."
+
+    %{content: content, content_hash: hash, edit_version: version} = draft
+
+    assert {:ok,
+            %{status: :draft, content: ^content, content_hash: ^hash, edit_version: ^version}} =
+             invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.editor)
+  end
+
   test "the page cannot write after session generation changes", ctx do
     draft = draft_revision(ctx, collection(ctx))
     assert {:ok, view, _} = live(connected_page(ctx.editor, path(draft)))
@@ -168,6 +209,45 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
 
     assert {:ok, %{status: :approved, publication_generation: 0}} =
              invoke(ArticleRevision, :read_revision, %{id: approved.id}, ctx.reviewer)
+  end
+
+  @tag :embedding_index
+  test "an approved revision in an internal collection has no publication controls or notice",
+       ctx do
+    fixture(%{})
+    approved = approve_content(ctx, collection(ctx, "", :internal), payload())
+    assert {:ok, _} = Embedding.publication_deadline(approved.content)
+    assert {:ok, view, _} = live(connected_page(ctx.reviewer, path(approved)))
+
+    refute has_element?(view, "#request-publish")
+    refute has_element?(view, "#publication-notice")
+  end
+
+  @tag :embedding_index
+  test "an approved escalation-only revision has no publication controls or notice", ctx do
+    fixture(%{})
+    approved = approve_content(ctx, Map.put(payload(), "response_mode", "escalate_only"))
+    assert {:ok, view, _} = live(connected_page(ctx.reviewer, path(approved)))
+
+    refute has_element?(view, "#request-publish")
+    refute has_element?(view, "#publication-notice")
+  end
+
+  test "a sensitive revision stays in review with no approval or publication control", ctx do
+    args = put_in(draft_args(ctx, collection(ctx)), [:content, "sensitive"], true)
+    assert {:ok, %{revision: draft}} = invoke(Article, :create_draft, args, ctx.editor)
+    reviewed = review(ctx, draft)
+
+    assert {:error, _} =
+             invoke(ArticleRevision, :approve, attest(snapshot(reviewed)), ctx.reviewer)
+
+    assert {:ok, view, _} = live(connected_page(ctx.reviewer, path(reviewed)))
+    refute has_element?(view, "#approve")
+    refute has_element?(view, "#request-publish")
+    refute has_element?(view, "#publication-notice")
+
+    assert {:ok, %{status: :in_review}} =
+             invoke(ArticleRevision, :read_revision, %{id: reviewed.id}, ctx.reviewer)
   end
 
   @tag :embedding_index
@@ -235,12 +315,14 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
              invoke(ArticleRevision, :read_revision, %{id: approved.id}, ctx.reviewer)
   end
 
-  defp approve_content(ctx, content) do
+  defp approve_content(ctx, content), do: approve_content(ctx, collection(ctx), content)
+
+  defp approve_content(ctx, collection, content) do
     assert {:ok, %{revision: draft}} =
              invoke(
                Article,
                :create_draft,
-               %{draft_args(ctx, collection(ctx)) | content: content},
+               %{draft_args(ctx, collection) | content: content},
                ctx.editor
              )
 

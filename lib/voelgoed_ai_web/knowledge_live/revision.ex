@@ -108,12 +108,14 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Revision do
   defp publication_message(%{publication_blocker: :expired}), do: "This revision has expired."
   defp publication_message(%{publication_blocker: :unavailable}), do: "Publishing is unavailable."
 
-  defp content_date(value) do
+  defp content_date(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, datetime, _} -> timestamp(datetime)
       _ -> timestamp(nil)
     end
   end
+
+  defp content_date(_), do: timestamp(nil)
 
   defp decision_id(action), do: action |> Atom.to_string() |> String.replace("_", "-")
 
@@ -158,6 +160,9 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Revision do
       </section>
       <section :if={Enum.any?(@decisions, fn {action, _, _} -> show_decision?(@revision, action) end) or @revision.action_hints.edit_draft} aria-labelledby="revision-actions">
         <h2 id="revision-actions" class="section-heading">Editorial actions</h2>
+        <p :if={@revision.review_blocker == :missing_source} id="review-notice" class="notice" role="status">
+          Add a source reference before submitting for review.
+        </p>
         <p :if={@revision.publication_blocker} id="publication-notice" class="notice" role="status">
           {publication_message(@revision)}
         </p>

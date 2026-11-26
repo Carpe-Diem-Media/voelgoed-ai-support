@@ -490,7 +490,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   @doc false
   def eligible_content(content, now) do
     with false <- content["sensitive"] == true or content["response_mode"] == "escalate_only",
-         {:ok, starts, 0} <- DateTime.from_iso8601(content["effective_from"]),
+         {:ok, starts} <- utc_date(content["effective_from"]),
          true <- DateTime.compare(now, starts) != :lt,
          {:ok, expires} <- expires_at(content["expires_at"]),
          true <- is_nil(expires) or DateTime.compare(now, expires) == :lt do
@@ -501,10 +501,13 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   end
 
   defp expires_at(nil), do: {:ok, nil}
+  defp expires_at(value), do: utc_date(value)
 
-  defp expires_at(value) do
-    with {:ok, expires, 0} <- DateTime.from_iso8601(value), do: {:ok, expires}
+  defp utc_date(value) when is_binary(value) do
+    with {:ok, date, 0} <- DateTime.from_iso8601(value), do: {:ok, date}
   end
+
+  defp utc_date(_), do: {:error, :stale_request}
 
   defp earlier(left, right) do
     if DateTime.compare(left, right) == :gt, do: right, else: left

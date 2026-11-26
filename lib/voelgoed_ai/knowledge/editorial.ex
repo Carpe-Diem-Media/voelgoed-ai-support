@@ -397,6 +397,8 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     active? = collection.status == :active and article.status == :active
     editor? = scoped?(collection.id, staff, @editor)
     reviewer? = scoped?(collection.id, staff, @reviewer)
+    draft_editor? = active? and editor? and row.status == :draft
+    reviewable? = Content.reviewable?(row.content)
 
     public? =
       collection.audience == :public and row.content["sensitive"] != true and
@@ -422,8 +424,8 @@ defmodule VoelgoedAi.Knowledge.Editorial do
 
     %{
       action_hints: %{
-        edit_draft: active? and editor? and row.status == :draft,
-        submit_review: active? and editor? and row.status == :draft,
+        edit_draft: draft_editor?,
+        submit_review: draft_editor? and reviewable? and snapshot_intact?(row),
         withdraw: active? and (editor? or reviewer?) and row.status in [:draft, :in_review],
         request_changes: active? and reviewer? and row.status == :in_review,
         approve:
@@ -440,6 +442,7 @@ defmodule VoelgoedAi.Knowledge.Editorial do
           article.status == :active and reviewer? and
             row.status in [:approved, :publishing, :publish_failed, :published]
       },
+      review_blocker: if(draft_editor? and not reviewable?, do: :missing_source),
       publication_blocker:
         if(publication_candidate?, do: publication_blocker(deadline, row.content))
     }
@@ -460,10 +463,13 @@ defmodule VoelgoedAi.Knowledge.Editorial do
   defp publication_blocker({:ok, _}, _), do: nil
 
   defp content_date_order(value, now) when is_binary(value) do
-    with {:ok, date, 0} <- DateTime.from_iso8601(value), do: DateTime.compare(date, now)
+    case DateTime.from_iso8601(value) do
+      {:ok, date, _offset} -> DateTime.compare(date, now)
+      {:error, _} -> nil
+    end
   end
 
-  defp content_date_order(nil, _), do: nil
+  defp content_date_order(_, _), do: nil
 
   defp current_index(collection, article, row, args) do
     with :ok <- active(collection),
@@ -590,10 +596,12 @@ defmodule VoelgoedAi.Knowledge.Editorial do
 
   defp same_snapshot(row, args) do
     if row.edit_version == args.expected_version and row.content_hash == args.expected_hash and
-         row.content_hash == Content.hash(row.content),
+         snapshot_intact?(row),
        do: :ok,
        else: {:error, :stale_snapshot}
   end
+
+  defp snapshot_intact?(row), do: row.content_hash == Content.hash(row.content)
 
   defp revision_transition(%{status: :draft} = row, :edit_draft, args, staff) do
     with {:ok, content} <- Content.parse(args.content) do
