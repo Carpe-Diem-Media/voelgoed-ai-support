@@ -191,6 +191,30 @@ Recorded as follow-ups, not fixed in B1:
   mailbox messages, a database CHECK on `contributor_ids`, and an
   `admission_denied` reason for invalid content.
 
+## Review 2 fix
+
+Review 2 of `6dce3ef` stopped before a verdict. Its mutation run left one
+surviving mutant: removing the inhibit check at dispatch failed no test.
+
+A new test commits the inhibit between the reservation and dispatch. It
+exposed a defect. Dispatch correctly refused with `:embedding_inhibited`, and
+the release path recorded `:admission_denied`. The `reason_code` allowlists on
+`InferenceRun` and `UsageReservation` did not include that value, so the
+release transaction rolled back. The hold stayed RESERVED until deadline
+recovery released it, and `index/1` returned `{:error, :indexing_storage}`.
+A gate disabled between claim and dispatch took the same path.
+
+Commit `e36deea` adds `:admission_denied` to both allowlists. These are
+application-level constraints only, so the migration and snapshots are
+unchanged and `mix ash.codegen --check` exits 0. The test asserts that the
+attempt is rejected without dispatch, the reservation is released with no
+ledger entry, the row fails, and the wire is never called.
+
+Both mutants failed the new test: removing the dispatch inhibit check, and
+removing `:admission_denied` from the attempt allowlist. Disposable
+`mix test --seed 0` and `--seed 103` each passed 398 tests, with 5 skipped and
+1 excluded.
+
 ## Owner decisions
 
 VGAS-7 still owns live provider entitlement, usable transport evidence,
