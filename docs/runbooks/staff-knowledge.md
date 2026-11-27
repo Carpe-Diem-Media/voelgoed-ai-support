@@ -89,9 +89,10 @@ event, handler ID and callback tuples. It covers Phoenix socket connect,
 channel join and message, endpoint, router and error rendering, plus
 LiveView and live component spans including exceptions. The reviewed
 framework loggers honour staff log suppression or the primary crash
-filter. The inventory also checks the Repo's configured prefix and the
-staff auth and support diagnostics prefixes. These prefixes have no
-steady-state Repo or application subscribers on the VGAS-21 base.
+filter. The inventory enumerates every attached handler, not selected prefixes,
+so any Repo, Oban, application or exporter subscriber fails it. The
+VGAS-21 base has no steady-state subscriber outside the reviewed framework
+loggers.
 
 Staff denial emits a count, an enumerated reason and a generated correlation
 ID. Support alerts emit a count, typed state and reason, and internal record

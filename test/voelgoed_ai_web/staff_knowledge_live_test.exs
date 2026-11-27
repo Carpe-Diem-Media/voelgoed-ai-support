@@ -74,6 +74,9 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
             "value" => %{"probe" => private_input}
           }
 
+          # This records current behaviour, not a requirement: whether sign-out
+          # must invalidate joined or copied sessions immediately is a VGAS-9
+          # owner decision.
           assert reply_has_key?(tls_message(socket, "3", topic, "event", event), "diff"),
                  "copied session unexpectedly revoked at sign-out"
 

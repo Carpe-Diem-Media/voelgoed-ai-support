@@ -40,7 +40,9 @@ criteria and the controlling addendum.
   lock barrier on `article_embeddings` forces a real 750 ms statement
   timeout, which returns unavailable without private Repo events or app
   logs. The existing fixture-volume timing checks still report projected
-  statistics. No exporter is registered at application boot.
+  statistics. The boot inventory enumerates every attached handler with
+  `:telemetry.list_handlers([])`, so no exporter or unreviewed subscriber
+  on any event is registered at application boot.
 - PostgreSQL 18.7 with pgvector 0.8.7 had `logging_collector=off`,
   `log_statement=none`, `log_min_error_statement=error`,
   `log_parameter_max_length=-1` and `log_parameter_max_length_on_error=0`.
@@ -71,7 +73,9 @@ probes exercise Bandit 1.15.0 and the OTP 29.1.2 primary filter.
   the input marker and leave no articles or editorial audit entries.
   Malformed timestamps and digit-adjacent substrings still fail. The
   inherited heuristic can miss numbers with consecutive separators
-  between digit groups. That format needs a VGAS-11 policy decision.
+  between digit groups. A 12-digit number written exactly as a valid
+  standalone `YYYY-MM-DD HH:MM` timestamp is also accepted by design.
+  Both formats need a VGAS-11 policy decision.
 - The direct preview and connected preview leave the collection empty.
   A valid apply creates one draft with no published pointer. The scoped
   export returns the exact canonical bilingual prose and content hash.
@@ -308,3 +312,37 @@ inventories showed no disposable resources for ports 55436 or 55437.
 returned no listeners. The base and mutant worktrees were removed.
 Before removal, the restored mutant tree matched the implementation
 commit. The private steps and runner transcripts were removed at handoff.
+
+## Review 1 corrections
+
+The independent review of `c88ed95` returned CHANGES_REQUIRED, with one
+MEDIUM finding. The boot inventory listed handlers under 12 fixed prefixes
+only. A boot handler on `[:oban, :job, :stop]` survived as mutant T2, and a
+replacement on `[:phoenix, :socket_drain]` survived as mutant T3. That left
+the exporter claim above unenforced.
+
+The inventory now enumerates `:telemetry.list_handlers([])` and allowlists
+exactly the 16 reviewed framework tuples. That includes Phoenix's
+`socket_drain` logger, which already attached at boot. The negative test now
+also attaches on `socket_drain`, `[:oban, :job, :stop]` and an arbitrary
+event.
+
+The review's other findings are handled as follows:
+
+- **LOW**, the timestamp-shaped 12-digit number: recorded above for VGAS-11.
+- **NIT**, the sign-out assertion: now commented as current behaviour owned
+  by VGAS-9.
+- **NIT**, the TLS event-hook recheck isolation: no change. The forms and
+  portable tests kill that mutant.
+
+The correction was verified on disposable PostgreSQL 18.7 with pgvector
+0.8.7 at port 55436:
+
+- A forced TEST compile with warnings as errors exited 0.
+- `telemetry_privacy_test.exs` and `staff_knowledge_live_test.exs` at seed 0
+  gave 17 passed.
+- With a boot handler on `[:oban, :job, :stop]` (T2) or
+  `[:phoenix, :socket_drain]` (T3) added to `application.ex`, the inventory
+  tests fail: 1/4 passed in each case. Each mutant was restored before the
+  next step.
+- The inventory file passed with `--repeat-until-failure 10` and exit 0.

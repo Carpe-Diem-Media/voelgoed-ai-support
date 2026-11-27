@@ -4,16 +4,6 @@ defmodule VoelgoedAi.TelemetryPrivacyTest do
   alias VoelgoedAi.Repo
   alias VoelgoedAiWeb.StaffSession
 
-  @framework_prefixes [
-    [:phoenix, :socket_connected],
-    [:phoenix, :channel_joined],
-    [:phoenix, :channel_handled_in],
-    [:phoenix, :endpoint],
-    [:phoenix, :router_dispatch],
-    [:phoenix, :error_rendered],
-    [:phoenix, :live_view],
-    [:phoenix, :live_component]
-  ]
   @staff_denied [:voelgoed_ai, :staff_auth, :denied]
 
   test "booted telemetry accepts only reviewed framework subscribers" do
@@ -24,6 +14,9 @@ defmodule VoelgoedAi.TelemetryPrivacyTest do
     for event <- [
           [:phoenix, :socket_connected],
           [:phoenix, :live_view, :mount, :exception],
+          [:phoenix, :socket_drain],
+          [:oban, :job, :stop],
+          [:vgas_unreviewed, :exporter],
           repo_prefix() ++ [:query],
           @staff_denied
         ] do
@@ -95,20 +88,10 @@ defmodule VoelgoedAi.TelemetryPrivacyTest do
 
   defp repo_prefix, do: Keyword.fetch!(Repo.config(), :telemetry_prefix)
 
+  # The empty prefix lists every attached handler, so a subscriber or exporter
+  # on any event, including Oban or a future dependency, must be reviewed here.
   defp unexpected_handlers do
-    prefixes =
-      Enum.uniq(
-        @framework_prefixes ++
-          [
-            [:voelgoed_ai, :repo],
-            repo_prefix(),
-            [:voelgoed_ai, :staff_auth],
-            [:voelgoed_ai, :support]
-          ]
-      )
-
-    for prefix <- prefixes,
-        %{id: id, event_name: event, function: callback} <- :telemetry.list_handlers(prefix),
+    for %{id: id, event_name: event, function: callback} <- :telemetry.list_handlers([]),
         not allowed_logger?(id, event, callback),
         do: event
   end
@@ -118,6 +101,7 @@ defmodule VoelgoedAi.TelemetryPrivacyTest do
       {[:phoenix, :socket_connected], &Phoenix.Logger.phoenix_socket_connected/4},
       {[:phoenix, :channel_joined], &Phoenix.Logger.phoenix_channel_joined/4},
       {[:phoenix, :channel_handled_in], &Phoenix.Logger.phoenix_channel_handled_in/4},
+      {[:phoenix, :socket_drain], &Phoenix.Logger.phoenix_socket_drain/4},
       {[:phoenix, :endpoint, :start], &Phoenix.Logger.phoenix_endpoint_start/4},
       {[:phoenix, :endpoint, :stop], &Phoenix.Logger.phoenix_endpoint_stop/4},
       {[:phoenix, :router_dispatch, :start], &Phoenix.Logger.phoenix_router_dispatch_start/4},
