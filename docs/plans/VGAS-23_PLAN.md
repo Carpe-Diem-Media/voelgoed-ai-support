@@ -128,3 +128,7 @@ I reviewed the plan against the four Plane VGAS-23 criteria, AGENTS.md and A-010
    - The new `verify_test_results.py` and the formatter extension stay minimal.
    - Negative experiments stay out of the diff; record them in `docs/plans/VGAS-23_VERIFICATION.md`.
    - Commit this plan as `docs/plans/VGAS-23_PLAN.md`.
+
+**Ruling 3 revision (2026-11-27).**
+- The base CI services bind port 55433, not 55434. Do not add a 55433 exception to F04. Move the CI ExUnit shard service to 55434 so the existing guard applies.
+- The image-verification runner is approved. Use a private copy, kept outside the repository, of the disposable helper with only the IMG line changed. Use it on 55436 and 55437 only, and delete it afterwards.
