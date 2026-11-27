@@ -121,8 +121,10 @@ exited 0 with 103 passing tests and zero failures. The restoration check
    the epoch and preserves the existing inhibit. In the operator abandonment
    regression, the UNKNOWN reply becomes ABANDONED, the handoff stays
    PENDING, and delivery makes one status POST and records SENT
-   `accepted`. The action and WorkStore tests check the state and owner
-   restrictions.
+   `accepted`. The state test rejects ordinary takeover from HANDOFF_PENDING.
+   The WorkStore test checks who may apply the signed action. PR A of VGAS-15
+   adds direct proof that the signed action rejects BOT_ACTIVE and that a
+   successful signed takeover advances the ownership epoch.
 2. **Qualified GET of the existing goal.** A signed
    `conversation_updated` receipt now updates the observed assignee and
    leaves the handoff pending. The delivery worker confirms the open,

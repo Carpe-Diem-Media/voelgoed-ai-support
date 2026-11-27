@@ -127,7 +127,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     workflow_version: [type: :string, constraints: [max_length: 64]],
     template_version: [type: :string, constraints: [max_length: 64]],
     locale: [type: :atom, constraints: [one_of: [:af, :en]]],
-    response_policy: [type: :atom, constraints: [one_of: [:fixed_reply, :handoff]]],
+    response_policy: [
+      type: :atom,
+      constraints: [one_of: [:fixed_reply, :handoff, :shadow_decision]]
+    ],
     config_hash: [type: :string, constraints: [max_length: 64]],
     config_hash_version: [type: :integer, constraints: [min: 1, max: 2]],
     collection_id: [type: :uuid],
@@ -143,7 +146,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     external_inbox_id: [type: :integer, constraints: [min: 1]],
     handoff_team_id: [type: :integer, constraints: [min: 1]],
     operating_mode: [type: :atom, constraints: [one_of: [:shadow, :assisted, :automatic]]],
-    mode: [type: :atom, constraints: [one_of: [:disabled, :fake]]]
+    mode: [type: :atom, constraints: [one_of: [:disabled, :fake, :shadow_test]]]
   ]
 
   @state_fields [

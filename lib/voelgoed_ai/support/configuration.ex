@@ -356,7 +356,10 @@ defmodule VoelgoedAi.Support.Configuration do
 
   defp binding_transition(%{status: status} = binding, :change_mode, %{operating_mode: :automatic})
        when status != :retired do
-    with :ok <- eligible_binding(binding), do: {:ok, %{operating_mode: :automatic}}
+    with :ok <- eligible_binding(binding),
+         {:ok, :fake} <- control_mode(%{binding | operating_mode: :automatic}) do
+      {:ok, %{operating_mode: :automatic}}
+    end
   end
 
   defp binding_transition(%{status: status}, :change_mode, %{operating_mode: mode})
@@ -370,10 +373,10 @@ defmodule VoelgoedAi.Support.Configuration do
     do: {:ok, %{status: :disabled, mode: :disabled}}
 
   defp control_transition(%{status: :disabled}, :enable_automation, %{binding_id: id}) do
-    with {:ok, %{status: :enabled, operating_mode: :automatic} = binding} <-
-           lock_binding(id),
-         :ok <- eligible_binding(binding) do
-      {:ok, %{status: :enabled, mode: :fake}}
+    with {:ok, %{status: :enabled} = binding} <- lock_binding(id),
+         :ok <- eligible_binding(binding),
+         {:ok, mode} <- control_mode(binding) do
+      {:ok, %{status: :enabled, mode: mode}}
     else
       {:ok, _} -> {:error, :invalid_transition}
       error -> error
@@ -381,6 +384,28 @@ defmodule VoelgoedAi.Support.Configuration do
   end
 
   defp control_transition(_, _, _), do: {:error, :invalid_transition}
+
+  if Mix.env() == :test do
+    defp control_mode(%{operating_mode: :automatic}) do
+      if match?(%{response_policy: :shadow_decision}, fixture()),
+        do: {:error, :invalid_transition},
+        else: {:ok, :fake}
+    end
+
+    defp control_mode(%{operating_mode: :shadow} = binding) do
+      with true <- VoelgoedAi.Support.Ownership.shadow_fixture?(binding),
+           {:ok, assistant} <- get(Assistant, binding.assistant_id),
+           {:ok, %{response_policy: :shadow_decision}} <- current_revision(assistant) do
+        {:ok, :shadow_test}
+      else
+        _ -> {:error, :unverified_test_binding}
+      end
+    end
+  else
+    defp control_mode(%{operating_mode: :automatic}), do: {:ok, :fake}
+  end
+
+  defp control_mode(_), do: {:error, :invalid_transition}
 
   # The binding's assistant is read unlocked first so that its lock is taken
   # before the binding's. A rebind between the two reads is reported as a
@@ -510,6 +535,25 @@ defmodule VoelgoedAi.Support.Configuration do
     end
   end
 
+  if Mix.env() == :test do
+    defp fixture_hash(%{response_policy: :shadow_decision} = revision, collection_ids) do
+      version = VoelgoedAi.Support.DecisionTemplates.version()
+
+      with %{shadow_evaluation: true} = fixture <- fixture(),
+           true <- revision.workflow_version == version and revision.template_version == version,
+           true <- revision.config_hash_version == 2,
+           true <- same_fields?(revision, fixture, [:assistant_id | @revision_fields]) do
+        value = Enum.map(@revision_fields, &Map.fetch!(revision, &1))
+        {:ok, hash_revision([2, value, collection_ids])}
+      else
+        _ -> {:error, :unverified_test_revision}
+      end
+    end
+  else
+    defp fixture_hash(%{response_policy: :shadow_decision}, _),
+      do: {:error, :unverified_test_revision}
+  end
+
   defp fixture_hash(revision, collection_ids) do
     case fixture() do
       %{fixed_text: text} = fixture when is_binary(text) and byte_size(text) in 1..4096 ->
@@ -520,8 +564,7 @@ defmodule VoelgoedAi.Support.Configuration do
           value =
             if revision.config_hash_version == 2, do: [2, value, collection_ids], else: value
 
-          {:ok,
-           :crypto.hash(:sha256, :erlang.term_to_binary(value)) |> Base.encode16(case: :lower)}
+          {:ok, hash_revision(value)}
         else
           {:error, :unverified_test_revision}
         end
@@ -529,6 +572,10 @@ defmodule VoelgoedAi.Support.Configuration do
       _ ->
         {:error, :unverified_test_revision}
     end
+  end
+
+  defp hash_revision(value) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(value)) |> Base.encode16(case: :lower)
   end
 
   # Only deterministic TEST fixtures can authorize activation in this slice.

@@ -35,7 +35,7 @@ defmodule VoelgoedAi.Support.WorkStore do
       SupportSession => [:observe_signed_handoff_takeover]
     },
     Ownership => %{
-      InboundEvent => [:by_id],
+      InboundEvent => [:by_id, :pending],
       OutboundDelivery => [:by_id, :for_session, :prepare],
       SupportRun => [:by_id, :active, :cancel],
       SupportSession => [
@@ -60,13 +60,14 @@ defmodule VoelgoedAi.Support.WorkStore do
         :extend_batch,
         :claim,
         :complete,
+        :complete_shadow,
+        :shadow_clarifications,
         :cancel,
         :supersede,
         :fail
       ]
     },
     Delivery => %{
-      InboundEvent => [:pending],
       OutboundDelivery => [
         :for_session,
         :reserve_read,

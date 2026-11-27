@@ -996,6 +996,8 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
           {%SupportSession{state: :closed}, :return_to_bot, %{}, :state},
           {%SupportSession{state: :handoff_pending}, :observe_human_takeover,
            %{ownership_epoch: 1}, :state},
+          {%SupportSession{state: :bot_active}, :observe_signed_handoff_takeover,
+           %{ownership_epoch: 1}, :state},
           {%InboundEvent{state: :dispatched}, :dispatch, %{}, :state},
           {%InboundEvent{state: :dispatched, disposition: :covered}, :record_disposition,
            %{disposition: :triage}, :disposition},
@@ -1171,8 +1173,13 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
         end
 
       assert Agent.get(ctx.fake, & &1.observation.assignee) == :bot
+      assert %{rows: [[epoch]]} = session_state(ctx, "ownership_epoch")
       assert signed_takeover(ctx) == 204
-      assert %{rows: [["human_active", true]]} = session_state(ctx, "state, human_inhibit")
+
+      assert %{rows: [["human_active", true, next_epoch]]} =
+               session_state(ctx, "state, human_inhibit, ownership_epoch")
+
+      assert next_epoch == epoch + 1
 
       assert %{rows: [^expected]} =
                handoff_rows(ctx, "state, reason_code, uncertainty_reason, attempt_count")

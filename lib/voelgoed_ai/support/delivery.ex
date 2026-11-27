@@ -12,7 +12,6 @@ defmodule VoelgoedAi.Support.Delivery do
     BindingCircuit,
     ChatwootAdapter,
     Configuration,
-    InboundEvent,
     OutboundDelivery
   }
 
@@ -232,7 +231,7 @@ defmodule VoelgoedAi.Support.Delivery do
       Ownership.eligible_bot?(config, session, observation) ->
         with {:ok, inputs} <- RunProcessing.inputs(delivery.run_id),
              :ok <- RunProcessing.check_coverage(inputs, history),
-             {:ok, false} <- queued_input?(session) do
+             {:ok, false} <- Ownership.pending_input?(session) do
           claim_delivery(delivery, now)
         else
           {:ok, true} -> {:ok, :input_pending}
@@ -318,17 +317,6 @@ defmodule VoelgoedAi.Support.Delivery do
 
   def audit_handoff_failure(row, _), do: {:ok, row}
 
-  defp queued_input?(session) do
-    where =
-      session
-      |> Map.take([:installation_ref, :external_account_id, :external_inbox_id, :conversation_id])
-      |> Map.merge(%{kind: :input, state: :dispatched, disposition: :pending})
-
-    with {:ok, rows} <- store_read(InboundEvent, :pending, %{}, where, many: true, limit: 1) do
-      {:ok, rows != []}
-    end
-  end
-
   defp claim_delivery(delivery, now) do
     lease = DateTime.add(now, @lease_seconds)
 
@@ -381,7 +369,7 @@ defmodule VoelgoedAi.Support.Delivery do
     end
   end
 
-  defp newer_input?(session, %{purpose: :public_reply}), do: queued_input?(session)
+  defp newer_input?(session, %{purpose: :public_reply}), do: Ownership.pending_input?(session)
   defp newer_input?(_, _), do: {:ok, false}
 
   defp render(_config, %{purpose: :handoff_status}), do: {:ok, nil}
