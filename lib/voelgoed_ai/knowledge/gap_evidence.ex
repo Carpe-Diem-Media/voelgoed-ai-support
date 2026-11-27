@@ -11,6 +11,7 @@ defmodule VoelgoedAi.Knowledge.GapEvidence do
 
     @topic "synthetic_rehearsal_day"
     @reference "synthetic-rehearsal-day-v1"
+    @query_options [log: false, telemetry_event: nil, timeout: 1_000]
     @questions %{"en-ZA" => "Synthetic rehearsal day", "af-ZA" => "Sintetiese repetisiedag"}
     @facts %{
       "en-ZA" => %{
@@ -131,21 +132,30 @@ defmodule VoelgoedAi.Knowledge.GapEvidence do
       """
 
       parameters = Enum.map([binding, assistant, collection, pin], &Ecto.UUID.dump!/1)
-      # This optional proof may fail without poisoning the shadow transaction.
-      options = [log: false, telemetry_event: nil, timeout: 1_000, mode: :savepoint]
 
-      with {:ok, _} <- SQL.query(Repo, "SET LOCAL statement_timeout = '750ms'", [], options),
-           {:ok, %{rows: [_ | _] = rows}} <-
-             SQL.query(
-               Repo,
-               statement,
-               parameters ++ [@reference, now, EmbeddingProfile.id()],
-               options
-             ),
+      with {:ok, %{rows: [_ | _] = rows}} <-
+             proof_query(statement, parameters ++ [@reference, now, EmbeddingProfile.id()]),
            true <- length(rows) < 5 do
         {:ok, rows}
       else
         _ -> :none
+      end
+    end
+
+    @doc false
+    def proof_query(statement, parameters) do
+      SQL.query!(Repo, "SAVEPOINT knowledge_gap_proof", [], @query_options)
+
+      try do
+        with {:ok, _} <-
+               SQL.query(Repo, "SET LOCAL statement_timeout = '750ms'", [], @query_options) do
+          SQL.query(Repo, statement, parameters, @query_options)
+        end
+      after
+        # This proof only reads. Roll back even on success so its timeout and
+        # any query error stay inside the savepoint the caller owns.
+        SQL.query!(Repo, "ROLLBACK TO SAVEPOINT knowledge_gap_proof", [], @query_options)
+        SQL.query!(Repo, "RELEASE SAVEPOINT knowledge_gap_proof", [], @query_options)
       end
     end
 

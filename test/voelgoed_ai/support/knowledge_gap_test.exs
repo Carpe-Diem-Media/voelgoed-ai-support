@@ -12,7 +12,8 @@ defmodule VoelgoedAi.Support.KnowledgeGapTest do
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.{Accounts, Repo, StaffFixtures, StaffKnowledgeFixture, SupportDBCase}
   alias VoelgoedAi.Intelligence.EmbeddingTransport
-  alias VoelgoedAi.Knowledge.{KnowledgeGap, Retrieval}
+  alias VoelgoedAi.Knowledge.{GapEvidence, KnowledgeGap, Retrieval}
+  alias VoelgoedAi.Support.ChatwootAdapter
   alias VoelgoedAiWeb.{GapLiveSocket, StaffLiveSocket}
 
   @moduletag :requires_pgvector
@@ -110,6 +111,101 @@ defmodule VoelgoedAi.Support.KnowledgeGapTest do
     assert [] = occurrences(id)
     assert %{shadow_disposition: :local_handoff} = run(id)
     assert_no_writes(ctx)
+  end
+
+  test "new coverage from outside the fixture source suppresses a missing gap at T04" do
+    ctx = setup_faq(:en, "exact")
+    scope = enable_gap(ctx)
+    id = queue(ctx, @question)
+    configure(ctx)
+    owner = self()
+
+    task =
+      Task.async(fn ->
+        Retrieval.with_rank_measurement(
+          fn _, _, _ ->
+            Agent.update(ctx.support.fake, &Map.put(&1, :decision_history_barrier, owner))
+          end,
+          fn -> perform(id) end
+        )
+      end)
+
+    assert_receive {:decision_history, worker}, 5_000
+
+    raw =
+      VoelgoedAi.KnowledgeFixtures.payload()
+      |> topic("Monday")
+      |> Map.put("source_references", [%{"kind" => "document", "ref" => "ordinary-faq"}])
+
+    %{id: revision_id} = publish(ctx.staff, %{id: scope.collection_id}, raw, "-LATE")
+    send(worker, :resume_decision_history)
+
+    assert :ok = Task.await(task, 6_000)
+    assert %{state: :completed, shadow_disposition: :local_handoff} = run(id)
+    assert [] = occurrences(id)
+
+    fresh = queue(next_conversation(ctx, 1), @question)
+    assert :ok = perform(fresh)
+
+    assert %{typed_decision: %{decision: "answer_exact", evidence_revision_ids: [^revision_id]}} =
+             run(fresh)
+
+    assert [] = occurrences(fresh)
+    assert_no_writes(ctx)
+  end
+
+  test "optional proof restores the outer timeout after success and a canceled statement" do
+    ctx = setup_faq(:en, "exact", content: &topic(&1, "Monday"))
+    scope = enable_gap(ctx)
+    id = queue(ctx, @question)
+
+    gap =
+      Map.merge(scope, %{
+        assistant_revision_id: run(id).assistant_revision_id,
+        locale: "en-ZA",
+        applicability: "general",
+        topic: "synthetic_rehearsal_day"
+      })
+
+    proof = fn expected ->
+      assert {:ok, :usable} =
+               Repo.transaction(fn ->
+                 SQL.query!(Repo, "SET LOCAL statement_timeout = '3s'")
+
+                 assert GapEvidence.addressable?(gap, ctx.target.id, ChatwootAdapter.now()) ==
+                          expected
+
+                 assert %{rows: [["3s"]]} = SQL.query!(Repo, "SHOW statement_timeout")
+                 :usable
+               end)
+    end
+
+    owner = self()
+
+    blocker =
+      Task.async(fn ->
+        Repo.transaction(fn ->
+          SQL.query!(Repo, "LOCK TABLE article_embeddings IN ACCESS EXCLUSIVE MODE")
+          send(owner, :proof_table_locked)
+
+          receive do
+            :release_proof_table -> :released
+          after
+            5_000 -> flunk("proof table lock was not released")
+          end
+        end)
+      end)
+
+    assert_receive :proof_table_locked, 5_000
+
+    try do
+      proof.(false)
+    after
+      send(blocker.pid, :release_proof_table)
+    end
+
+    assert {:ok, :released} = Task.await(blocker)
+    proof.(true)
   end
 
   test "embedding failure and revoked or withdrawn source authority create no gap" do

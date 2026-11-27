@@ -315,15 +315,26 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
 
     @doc false
     def gap_at_decision(owner, config, run, revision, context, commitment, candidate) do
-      with %{locale: locale} <- candidate,
+      with %{locale: locale, cause: cause} <- candidate,
            true <- Repo.in_transaction?() and worker_owner?(owner),
-           %{locale: ^locale, pin_hash: hash, run_id: id, claim_generation: claim} <- authority(),
+           %{locale: ^locale, pin_hash: hash, run_id: id, claim_generation: claim} = search <-
+             authority(),
            true <- id == run.id and claim == run.claim_generation and hash == revision.config_hash,
            true <- context.commitment == commitment and GapEvidence.qualified?(context, locale),
-           {:ok, ^candidate} <- GapEvidence.find(config, run, locale, ChatwootAdapter.now()) do
+           now = ChatwootAdapter.now(),
+           true <- gap_coverage_current?(cause, search, params(search, config, run, now)),
+           {:ok, ^candidate} <- GapEvidence.find(config, run, locale, now) do
         candidate
       else
         _ -> nil
+      end
+    end
+
+    defp gap_coverage_current?(cause, context, bindings) do
+      case {cause, coverage(context, bindings, &GapEvidence.proof_query/2)} do
+        {cause, {:ok, []}} when cause in [:missing, :insufficient] -> true
+        {:conflicting, {:ok, [{_, false, _}, {_, false, _}]}} -> true
+        _ -> false
       end
     end
 
@@ -647,14 +658,19 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     # alternative. Only an explicit, topically linked continuation can use
     # prior contact terms to fill a missing part. Inspect at most two subjects
     # so a conflicting variant outside the rank limits still forces triage.
-    defp coverage(%{shadow_query: query, prior_query: prior, locale: locale}, bindings) do
+    defp coverage(context, bindings, query_sql \\ &sql/2)
+
+    defp coverage(%{shadow_query: query, prior_query: prior, locale: locale}, bindings, query_sql) do
       with {:ok, %{rows: rows}} <-
-             sql(@eligible <> @coverage, bindings ++ [query, prior, @function_words[locale]]) do
+             query_sql.(
+               @eligible <> @coverage,
+               bindings ++ [query, prior, @function_words[locale]]
+             ) do
         {:ok, Enum.map(rows, &List.to_tuple/1)}
       end
     end
 
-    defp coverage(_, _), do: {:ok, :fixture}
+    defp coverage(_, _, _), do: {:ok, :fixture}
 
     defp has_eligible(params, absence \\ :no_evidence) do
       case sql(@eligible <> "SELECT EXISTS (SELECT 1 FROM eligible)", params) do
