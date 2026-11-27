@@ -67,6 +67,7 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
       postgres:
+        # pgvector/pgvector:0.8.7-pg18 (PostgreSQL 18.7), linux/amd64 manifest.
         image: pgvector/pgvector@sha256:4bdc16048580b56345bca441bffe8d9b45dd2f5d76963808c853df1661df6e00
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
@@ -154,6 +155,7 @@ jobs:
         lane: [fresh, upgrade, vgas001-upgrade]
     services:
       postgres:
+        # pgvector/pgvector:0.8.7-pg18 (PostgreSQL 18.7), linux/amd64 manifest.
         image: pgvector/pgvector@sha256:4bdc16048580b56345bca441bffe8d9b45dd2f5d76963808c853df1661df6e00
         env:
           POSTGRES_HOST_AUTH_METHOD: trust

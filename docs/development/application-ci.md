@@ -57,28 +57,49 @@ The migration matrix keeps its runner-private port 55433.
 
 ## Disposable local workflow
 
-Run the VGAS-23 migration and vector checks with the owner-approved
-`vgas_disposable_pg.sh` attachment. It starts a fresh loopback instance
-of `devcore-postgres:18.7-vector0.8.7` and preinstalls vector using the
-container bootstrap role. The application runs as `vgas_test`, which owns
-the `vgas_test` database and has no superuser, database creation or role
-creation privilege. The runner generates throwaway credentials and passes
-them through the environment. Keep them out of steps files and logs.
+Run the VGAS-23 migration and vector checks against a throwaway container of
+the same public image that CI pins. The commands below do the same bootstrap
+as CI. The container, volume and credentials last for one run only. Never use
+55432 (shared DevCore DEV) or 55433 (shared DevCore TEST) for this workflow.
 
 ```sh
-ss -ltn '( sport = :55436 or sport = :55437 )'
-docker image inspect devcore-postgres:18.7-vector0.8.7 --format '{{.Id}} {{.Os}}/{{.Architecture}}'
-bash /home/jcschoeman96/.t3/userdata/attachments/vgas_disposable_pg.sh "$PWD" "$vgas_steps" 55436
+image=pgvector/pgvector@sha256:4bdc16048580b56345bca441bffe8d9b45dd2f5d76963808c853df1661df6e00
+port=55436 # use 55437 for the full suite; must be free
+ss -ltn "( sport = :$port )"
+name=vgas-disposable-$port
+docker run -d --rm --name "$name" -e POSTGRES_HOST_AUTH_METHOD=trust \
+  -p "127.0.0.1:$port:5432" "$image"
+until docker exec "$name" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; do sleep 1; done
+TEST_DATABASE_PASSWORD=$(openssl rand -hex 24)
+docker exec -i "$name" psql -X -q -v ON_ERROR_STOP=1 -U postgres <<SQL
+CREATE ROLE vgas_test LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$TEST_DATABASE_PASSWORD';
+CREATE DATABASE vgas_test OWNER vgas_test;
+\connect vgas_test
+CREATE EXTENSION vector;
+SQL
+export MIX_ENV=test VGAS_VERIFY_PGVECTOR=true TEST_DATABASE_HOST=127.0.0.1 \
+  TEST_DATABASE_PORT=$port TEST_DATABASE_USERNAME=vgas_test \
+  TEST_DATABASE_NAME=vgas_test TEST_DATABASE_PASSWORD
+bash .github/scripts/verify_postgres.sh 180007
+mise exec -- mix ecto.migrate --strict-version-order
+VGAS_F04_DISPOSABLE=1 mise exec -- mix test --seed 0
+docker stop "$name" # --rm removes the container and its anonymous volume
+ss -ltn "( sport = :$port )"
 ```
 
-Use a private steps file with one command per line. Use a fresh 55436
-run for each migration lane and 55437 for the full suite. Confirm the
-runner reports `cleanup: container=0 volume=0` and check port release
-with `ss -ltn` after each run. The runner removes its own container
-and volume on exit. The F04 guard accepts only loopback on 55434, 55436
-or 55437 and checks the database, role, PostgreSQL and vector versions
-before creating fixtures. The local commands, predecessor pins and
-recovery evidence are in the [VGAS-23 verification record](../plans/VGAS-23_VERIFICATION.md).
+Keep the generated password in the shell environment only. Do not write it to
+files or logs. The application runs as `vgas_test`. That role owns the
+`vgas_test` database and has no superuser, database-creation or
+role-creation privilege. To run a migration lane, start a fresh container for
+each lane. Apply that lane's predecessor steps from the workflow before running
+the candidate migrations. The F04 guard accepts only loopback on 55434, 55436
+or 55437. Before creating fixtures it checks the database, the role, and the
+PostgreSQL and vector versions.
+
+The orchestrator's own runs used an approved local helper. It wraps these same
+steps, adds cleanup reporting and strips provider keys. Its use is optional.
+The exact commands, predecessor pins and recovery evidence are in the
+[VGAS-23 verification record](../plans/VGAS-23_VERIFICATION.md).
 
 Check clean rollback and reapply only before protected history exists.
 Once query or publisher failure history exists, B2b refuses rollback.

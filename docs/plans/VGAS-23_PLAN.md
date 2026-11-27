@@ -132,3 +132,5 @@ I reviewed the plan against the four Plane VGAS-23 criteria, AGENTS.md and A-010
 **Ruling 3 revision (2026-11-27).**
 - The base CI services bind port 55433, not 55434. Do not add a 55433 exception to F04. Move the CI ExUnit shard service to 55434 so the existing guard applies.
 - The image-verification runner is approved. Use a private copy, kept outside the repository, of the disposable helper with only the IMG line changed. Use it on 55436 and 55437 only, and delete it afterwards.
+
+**Split-clock test fix approval (2026-11-27).** The orchestrator approved the narrow `knowledge/retrieval_test.exs` change while VGAS-23 was being implemented, and recorded it in Plane VGAS-23 comment `3f211d90`. The two split-clock tests assumed the late month window was absent. From 2026-11-27, that window can already exist, because an earlier editorial test creates it (January 2027). The fix snapshots the window and asserts it is unchanged at both checkpoints. The no-late-charge assertion stays. Production and support files are untouched.
