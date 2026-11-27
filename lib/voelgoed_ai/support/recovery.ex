@@ -6,12 +6,9 @@ defmodule VoelgoedAi.Support.Recovery do
 
   use VoelgoedAi.Support.WorkStore, [:read, :update]
 
-  alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ChatwootAdapter, Delivery, InboundEvent, OutboundDelivery}
+  alias VoelgoedAi.Support.{ChatwootAdapter, Delivery, OutboundDelivery}
   alias VoelgoedAi.Support.{Ownership, RunProcessing, SupportRun}
-  alias VoelgoedAi.Support.Workers.{Deliver, ProcessEvent, ProcessRun, Reconcile}
-
-  @batch_size 25
+  alias VoelgoedAi.Support.Workers.{Deliver, ProcessRun, Reconcile}
 
   @doc "Reconcile one UNKNOWN intent with qualified, bounded read-only evidence."
   def reconcile(id),
@@ -207,68 +204,79 @@ defmodule VoelgoedAi.Support.Recovery do
     end
   end
 
-  @doc "Find a bounded set of durable work whose individual job may have been lost."
-  def sweep do
-    now = ChatwootAdapter.now()
+  if Mix.env() == :test do
+    alias VoelgoedAi.Repo
+    alias VoelgoedAi.Support.InboundEvent
+    alias VoelgoedAi.Support.Workers.ProcessEvent
 
-    with %{} <- ChatwootAdapter.fixture(),
-         {:ok, %{events: events, runs: runs, deliveries: deliveries}} <-
-           Repo.transact(fn -> due(now) end) do
-      for event <- events, do: Ownership.enqueue(ProcessEvent, %{"event_id" => event.id})
-      for run <- runs, do: run_deadline(run.id)
-      for delivery <- deliveries, do: delivery_deadline(delivery.id)
-      :ok
-    else
-      nil -> :ok
-      error -> RunProcessing.job_result(error)
+    @batch_size 25
+
+    @doc "Find a bounded set of durable work whose individual job may have been lost."
+    def sweep do
+      now = ChatwootAdapter.now()
+
+      with %{} <- ChatwootAdapter.fixture(),
+           {:ok, %{events: events, runs: runs, deliveries: deliveries}} <-
+             Repo.transact(fn -> due(now) end) do
+        for event <- events, do: Ownership.enqueue(ProcessEvent, %{"event_id" => event.id})
+        for run <- runs, do: run_deadline(run.id)
+        for delivery <- deliveries, do: delivery_deadline(delivery.id)
+        :ok
+      else
+        nil -> :ok
+        error -> RunProcessing.job_result(error)
+      end
     end
-  end
 
-  defp due(now) do
-    opts = [many: true, sort: [:inserted_at, :id], limit: @batch_size]
+    defp due(now) do
+      opts = [many: true, sort: [:inserted_at, :id], limit: @batch_size]
 
-    with {:ok, events} <-
-           store_read(
-             InboundEvent,
-             :pending,
-             %{},
-             %{state: :dispatched, disposition: :pending},
-             opts
-           ),
-         {:ok, runs} <-
-           store_read(
-             SupportRun,
-             :recoverable,
-             %{},
-             %{
-               or: [
-                 %{state: :queued, batch_cutoff_at: %{less_than_or_equal: now}},
-                 %{state: :running, lease_expires_at: %{less_than_or_equal: now}}
-               ]
-             },
-             opts
-           ),
-         {:ok, deliveries} <-
-           store_read(
-             OutboundDelivery,
-             :recoverable,
-             %{},
-             %{
-               or: [
-                 %{state: :pending},
-                 %{state: :sending, lease_expires_at: %{less_than_or_equal: now}},
-                 %{
-                   state: :unknown,
-                   or: [
-                     %{reason_code: %{is_nil: true}},
-                     %{reason_code: %{not_eq: :read_exhausted}}
-                   ]
-                 }
-               ]
-             },
-             opts
-           ) do
-      {:ok, %{events: events, runs: runs, deliveries: deliveries}}
+      with {:ok, events} <-
+             store_read(
+               InboundEvent,
+               :pending,
+               %{},
+               %{state: :dispatched, disposition: :pending},
+               opts
+             ),
+           {:ok, runs} <-
+             store_read(
+               SupportRun,
+               :recoverable,
+               %{},
+               %{
+                 or: [
+                   %{state: :queued, batch_cutoff_at: %{less_than_or_equal: now}},
+                   %{state: :running, lease_expires_at: %{less_than_or_equal: now}}
+                 ]
+               },
+               opts
+             ),
+           {:ok, deliveries} <-
+             store_read(
+               OutboundDelivery,
+               :recoverable,
+               %{},
+               %{
+                 or: [
+                   %{state: :pending},
+                   %{state: :sending, lease_expires_at: %{less_than_or_equal: now}},
+                   %{
+                     state: :unknown,
+                     or: [
+                       %{reason_code: %{is_nil: true}},
+                       %{reason_code: %{not_eq: :read_exhausted}}
+                     ]
+                   }
+                 ]
+               },
+               opts
+             ) do
+        {:ok, %{events: events, runs: runs, deliveries: deliveries}}
+      end
     end
+  else
+    @doc "Find a bounded set of durable work whose individual job may have been lost."
+    def sweep, do: :ok
   end
 end

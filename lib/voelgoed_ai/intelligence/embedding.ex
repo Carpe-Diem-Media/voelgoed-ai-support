@@ -40,9 +40,9 @@ defmodule VoelgoedAi.Intelligence.Embedding do
 
   @impl Ash.Resource.Actions.Implementation
   def run(%{arguments: %{id: id, reason: :conservative_closure}}, _opts, %{actor: session}) do
-    with {:ok, _} <- gate() do
+    with_fixture_settings(fn _settings ->
       StaffAccess.with_current(session, :admin, fn staff ->
-        with true <- closure_approved?(staff.id),
+        with true <- Enum.any?(approved_closers(), &(&1 == staff.id)),
              {:ok, control} <- Configuration.lock_control(),
              {:ok, candidate} <- get(InferenceRun, id),
              {:ok, _context, attempt} <- lock_recovery(candidate, nil),
@@ -53,7 +53,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
           error -> error
         end
       end)
-    end
+    end)
     |> case do
       {:ok, value} -> {:ok, value}
       {:error, _} -> {:error, "embedding closure denied"}
@@ -100,11 +100,12 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   def publication_deadline(content) do
     now = now()
 
-    with {:ok, _} <- gate(),
-         {:ok, expires} <- eligible_content(content, now) do
-      deadline = DateTime.add(now, @indexing_seconds, :second)
-      {:ok, if(expires, do: earlier(deadline, expires), else: deadline)}
-    end
+    with_fixture_settings(fn _settings ->
+      with {:ok, expires} <- eligible_content(content, now) do
+        deadline = DateTime.add(now, @indexing_seconds, :second)
+        {:ok, if(expires, do: earlier(deadline, expires), else: deadline)}
+      end
+    end)
   end
 
   @doc "Process one durable article embedding row without replaying a reserved attempt."
@@ -460,35 +461,37 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       row = context.row
       now = now()
 
-      with :ok <- queued(row),
-           {:ok, config} <- gate(),
-           :ok <- eligible(context, now),
-           {:ok, _input} <- EmbeddingProfile.input(context.revision.content, row.locale),
-           {:ok, attempt} <-
-             insert(InferenceRun, %{
-               article_embedding_id: row.id,
-               provider: EmbeddingProfile.provider(),
-               model_id: EmbeddingProfile.model(),
-               profile_id: row.profile_id,
-               ordinal: row.attempt_count + 1,
-               deadline_at: row.deadline_at,
-               dispatch_fence: Ash.UUIDv7.generate(),
-               correlation_id: Ash.UUIDv7.generate()
-             }),
-           {:ok, attempt} <- change(attempt, %{state: :running, started_at: now}),
-           {:ok, _} <-
-             change(row, %{
-               state: :running,
-               attempt_count: attempt.ordinal,
-               last_attempt_id: attempt.id
-             }),
-           {:ok, _} <-
-             account(
-               attempt,
-               :reserve,
-               &EmbeddingAccounting.reserve(&1, control, attempt, now, config)
-             ) do
-        {:ok, attempt}
+      with :ok <- queued(row) do
+        with_fixture_settings(fn config ->
+          with :ok <- eligible(context, now),
+               {:ok, _input} <- EmbeddingProfile.input(context.revision.content, row.locale),
+               {:ok, attempt} <-
+                 insert(InferenceRun, %{
+                   article_embedding_id: row.id,
+                   provider: EmbeddingProfile.provider(),
+                   model_id: EmbeddingProfile.model(),
+                   profile_id: row.profile_id,
+                   ordinal: row.attempt_count + 1,
+                   deadline_at: row.deadline_at,
+                   dispatch_fence: Ash.UUIDv7.generate(),
+                   correlation_id: Ash.UUIDv7.generate()
+                 }),
+               {:ok, attempt} <- change(attempt, %{state: :running, started_at: now}),
+               {:ok, _} <-
+                 change(row, %{
+                   state: :running,
+                   attempt_count: attempt.ordinal,
+                   last_attempt_id: attempt.id
+                 }),
+               {:ok, _} <-
+                 account(
+                   attempt,
+                   :reserve,
+                   &EmbeddingAccounting.reserve(&1, control, attempt, now, config)
+                 ) do
+            {:ok, attempt}
+          end
+        end)
       end
     end)
   end
@@ -498,17 +501,20 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       now = now()
 
       with {:ok, attempt} <- locked_attempt(context, attempt_id, fence),
-           :ok <- fresh_dispatch(attempt, context.row),
-           {:ok, config} <- gate(),
-           :ok <- eligible(context, now),
-           :ok <- allowed(control),
-           {:ok, %UsageReservation{state: :reserved}} <- reservation(attempt),
-           {:ok, input} <- EmbeddingProfile.input(context.revision.content, context.row.locale),
-           {:ok, _} <- change(attempt, %{dispatched_at: now}) do
-        {:ok, {input, config.transport}}
-      else
-        {:ok, %UsageReservation{}} -> {:error, :stale_request}
-        error -> error
+           :ok <- fresh_dispatch(attempt, context.row) do
+        with_fixture_settings(fn config ->
+          with :ok <- eligible(context, now),
+               :ok <- allowed(control),
+               {:ok, %UsageReservation{state: :reserved}} <- reservation(attempt),
+               {:ok, input} <-
+                 EmbeddingProfile.input(context.revision.content, context.row.locale),
+               {:ok, _} <- change(attempt, %{dispatched_at: now}) do
+            {:ok, {input, config.transport}}
+          else
+            {:ok, %UsageReservation{}} -> {:error, :stale_request}
+            error -> error
+          end
+        end)
       end
     end)
     |> case do
@@ -971,6 +977,10 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   # Only TEST compiles the fixture gate. B1 has no configuration source that
   # can select the real adapter or accept a provider key, so every other build
   # refuses before any reservation or transport work.
+  defp with_fixture_settings(work) do
+    Enum.find_value(fixture_settings(), {:error, :disabled}, work)
+  end
+
   if Mix.env() == :test do
     @fixture_price %{
       version: "embedding-fixture-v1",
@@ -980,6 +990,13 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     }
 
     defp fixture, do: Application.get_env(:voelgoed_ai, :embedding_fixture, %{})
+
+    defp fixture_settings do
+      case gate() do
+        {:ok, settings} -> [settings]
+        {:error, :disabled} -> []
+      end
+    end
 
     defp gate do
       config = fixture()
@@ -1002,14 +1019,14 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       do:
         Map.get(fixture(), :enqueue_finalisation, &Publication.enqueue_finalisation/1).(revision)
 
-    defp closure_approved?(id), do: fixture()[:closure_approved_by] == id
+    defp approved_closers, do: [fixture()[:closure_approved_by]]
     def now, do: Map.get(fixture(), :clock, &DateTime.utc_now/0).()
     defp hook(stage, attempt), do: Map.get(fixture(), stage, fn _ -> :ok end).(attempt)
     defp consume(fence), do: Map.get(fixture(), :consume_dispatch, fn fun -> fun.() end).(fence)
   else
-    defp gate, do: {:error, :disabled}
+    defp fixture_settings, do: []
     defp enqueue_finalisation(revision), do: Publication.enqueue_finalisation(revision)
-    defp closure_approved?(_id), do: false
+    defp approved_closers, do: []
     def now, do: DateTime.utc_now()
     defp hook(_, _), do: :ok
     defp consume(fence), do: fence.()

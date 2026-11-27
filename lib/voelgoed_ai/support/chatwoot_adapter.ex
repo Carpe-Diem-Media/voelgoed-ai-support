@@ -85,10 +85,7 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
   def in_scope?(row) do
     keys = [:installation_ref, :external_account_id, :external_inbox_id]
 
-    case fixture() do
-      %{} = configured -> Map.take(configured, keys) == Map.take(row, keys)
-      _ -> false
-    end
+    Enum.any?(fixtures(), &(Map.take(&1, keys) == Map.take(row, keys)))
   end
 
   @type read_failure :: :scope_denied | :unavailable | :deadline | :rate_limited
@@ -108,9 +105,9 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
 
   @doc false
   def now do
-    case fixture() do
+    case Enum.find(fixtures(), &Map.has_key?(&1, :clock)) do
       %{clock: clock} -> clock.()
-      _ -> DateTime.utc_now()
+      nil -> DateTime.utc_now()
     end
   end
 
@@ -125,11 +122,19 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
   end
 
   @doc false
+  def write_fixture? do
+    Enum.any?(fixtures(), fn settings ->
+      match?(%{adapter: {_, _}}, settings) and
+        not match?(%{response_policy: :shadow_decision}, settings)
+    end)
+  end
+
+  @doc false
   def call(operation, destination, args, deadline) do
     budget = min(500, DateTime.diff(deadline, now(), :millisecond))
 
     with true <- budget > 0 and not VoelgoedAi.Repo.in_transaction?(),
-         %{adapter: {module, context}} <- fixture() do
+         %{adapter: {module, context}} <- Enum.find(fixtures(), &match?(%{adapter: {_, _}}, &1)) do
       apply(module, operation, [context, destination] ++ args ++ [budget])
     else
       _ -> {:error, :unavailable}
@@ -207,14 +212,24 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
 
   defp public_message?(_), do: false
 
-  @doc false
   if Mix.env() == :test do
+    @doc false
     def fixture do
       if Application.get_env(:voelgoed_ai, :chatwoot_adapter, :disabled) == :fixture do
         Application.get_env(:voelgoed_ai, :support_fixture)
       end
     end
+
+    defp fixtures do
+      case fixture() do
+        %{} = configured -> [configured]
+        _ -> []
+      end
+    end
   else
+    @doc false
     def fixture, do: nil
+    # No Chatwoot adapter or trusted inbox is registered outside TEST.
+    defp fixtures, do: []
   end
 end

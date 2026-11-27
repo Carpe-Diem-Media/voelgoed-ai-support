@@ -93,8 +93,7 @@ defmodule VoelgoedAi.Support.Ownership do
   def write_enabled?(config) do
     permitted?(config) and config.binding.operating_mode == :automatic and
       config.control.status == :enabled and config.control.mode == :fake and
-      match?(%{adapter: {_, _}}, ChatwootAdapter.fixture()) and
-      not match?(%{response_policy: :shadow_decision}, ChatwootAdapter.fixture())
+      ChatwootAdapter.write_fixture?()
   end
 
   if Mix.env() == :test do

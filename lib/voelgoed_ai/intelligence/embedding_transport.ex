@@ -3,10 +3,8 @@ defmodule VoelgoedAi.Intelligence.EmbeddingTransport do
 
   alias VoelgoedAi.Intelligence.Embedding
   alias VoelgoedAi.Intelligence.EmbeddingProfile, as: Profile
-  alias VoelgoedAi.Intelligence.GenerationTransport
 
   @base_url "https://api.openai.com/v1"
-  @fixture_key "synthetic-embedding-fixture"
   @model "text-embedding-3-small"
 
   def invoke(ref, input, timeout, mode) do
@@ -80,47 +78,59 @@ defmodule VoelgoedAi.Intelligence.EmbeddingTransport do
   defp decode(body) when is_binary(body), do: Jason.decode(body)
   defp decode(_), do: :error
 
-  def fixture_wire(request) do
-    body = %{
-      "object" => "list",
-      "model" => @model,
-      "data" => [
-        %{"object" => "embedding", "index" => 0, "embedding" => [1.0 | List.duplicate(0.0, 1535)]}
-      ],
-      "usage" => %{"prompt_tokens" => 3, "total_tokens" => 3}
-    }
+  if Mix.env() == :test do
+    alias VoelgoedAi.Intelligence.GenerationTransport
 
-    {request,
-     Req.Response.new(
-       status: 200,
-       headers: [{"x-request-id", "req_" <> Ash.UUIDv7.generate()}],
-       body: body
-     )}
+    @fixture_key "synthetic-embedding-fixture"
+
+    def fixture_wire(request) do
+      body = %{
+        "object" => "list",
+        "model" => @model,
+        "data" => [
+          %{
+            "object" => "embedding",
+            "index" => 0,
+            "embedding" => [1.0 | List.duplicate(0.0, 1535)]
+          }
+        ],
+        "usage" => %{"prompt_tokens" => 3, "total_tokens" => 3}
+      }
+
+      {request,
+       Req.Response.new(
+         status: 200,
+         headers: [{"x-request-id", "req_" <> Ash.UUIDv7.generate()}],
+         body: body
+       )}
+    end
+
+    defp private_query(request, wire) do
+      request = GenerationTransport.protect_errors(request)
+
+      case wire.(request) do
+        {request, %Req.Response{status: status}} when status != 200 ->
+          {request,
+           ReqLLM.Error.API.Request.exception(reason: "embedding HTTP failure", status: status)}
+
+        pair ->
+          pair
+      end
+    rescue
+      _ ->
+        {GenerationTransport.protect_errors(request),
+         ReqLLM.Error.API.Request.exception(reason: "embedding request failed")}
+    end
   end
 
-  # Query inputs can contain public customer text. The pinned ReqLLM
-  # exception metadata can include it even when payload telemetry is off.
-  defp wire({:query_fixture, fun}), do: {@fixture_key, &private_query(&1, fun)}
-  defp wire({:fixture, fun}), do: {@fixture_key, fun}
+  if Mix.env() == :test do
+    # Query inputs can contain public customer text. The pinned ReqLLM
+    # exception metadata can include it even when payload telemetry is off.
+    defp wire({:query_fixture, fun}), do: {@fixture_key, &private_query(&1, fun)}
+    defp wire({:fixture, fun}), do: {@fixture_key, fun}
+  end
 
   # Reserved for the separately approved provider gate. Embedding never
   # selects this adapter in B1, even when OPENAI_API_KEY is present.
   defp wire({:candidate, key}), do: {key, &Req.Finch.run/1}
-
-  defp private_query(request, wire) do
-    request = GenerationTransport.protect_errors(request)
-
-    case wire.(request) do
-      {request, %Req.Response{status: status}} when status != 200 ->
-        {request,
-         ReqLLM.Error.API.Request.exception(reason: "embedding HTTP failure", status: status)}
-
-      pair ->
-        pair
-    end
-  rescue
-    _ ->
-      {GenerationTransport.protect_errors(request),
-       ReqLLM.Error.API.Request.exception(reason: "embedding request failed")}
-  end
 end

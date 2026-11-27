@@ -436,10 +436,7 @@ defmodule VoelgoedAi.Knowledge.Editorial do
         retry_publication:
           publication_candidate? and row.status == :publish_failed and can_publish?,
         request_reindex: current_index? and can_publish?,
-        # Rollback reuses a retained index without requesting embeddings.
-        request_index_rollback:
-          current_index? and Publication.rollback_available() == :ok and
-            is_integer(row.retained_index_generation),
+        request_index_rollback: rollback_hint?(current_index?, row),
         revoke:
           article.status == :active and reviewer? and
             row.status in [:approved, :publishing, :publish_failed, :published]
@@ -448,6 +445,16 @@ defmodule VoelgoedAi.Knowledge.Editorial do
       publication_blocker:
         if(publication_candidate?, do: publication_blocker(deadline, row.content))
     }
+  end
+
+  if Mix.env() == :test do
+    # Rollback reuses a retained index without requesting embeddings.
+    defp rollback_hint?(current_index?, row) do
+      current_index? and Publication.rollback_available() == :ok and
+        is_integer(row.retained_index_generation)
+    end
+  else
+    defp rollback_hint?(_current_index?, _row), do: false
   end
 
   # The deadline decides eligibility. Dates only explain a refusal to the reviewer.

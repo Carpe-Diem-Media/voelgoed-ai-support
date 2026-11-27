@@ -32,6 +32,12 @@ config :phoenix, :filter_parameters, ["password", "secret", "token", "code", "st
 config :req_llm, load_dotenv: false
 config :ash, default_string_length_count: :codepoints
 
+if config_env() == :dev do
+  # The release ships Phoenix's locked browser bundles and the checked-in staff assets.
+  config :esbuild, version: "0.25.0"
+  config :tailwind, version: "4.3.0"
+end
+
 if config_env() == :test do
   # Oban manual mode suppresses automatic Cron insertion. Tests perform the
   # same bounded sweep worker explicitly.

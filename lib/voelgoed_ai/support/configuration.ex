@@ -468,7 +468,7 @@ defmodule VoelgoedAi.Support.Configuration do
          :fixed_reply <- revision.response_policy,
          true <- revision.template_version == delivery.template_version,
          true <- revision.config_hash == delivery.template_hash,
-         %{fixed_text: text} <- fixture() do
+         %{fixed_text: text} <- Enum.find(activation_fixtures(), &Map.has_key?(&1, :fixed_text)) do
       {:ok, text}
     else
       _ -> {:error, :stale_policy}
@@ -512,16 +512,14 @@ defmodule VoelgoedAi.Support.Configuration do
   end
 
   defp binding_fixture(binding) do
-    case fixture() do
+    Enum.find_value(activation_fixtures(), {:error, :unverified_test_binding}, fn
       %{credential_ref: ref, handoff_team_id: team} = fixture
       when is_binary(ref) and is_integer(team) ->
-        if same_fields?(binding, fixture, [:assistant_id | @inbox_fields]),
-          do: {:ok, fixture},
-          else: {:error, :unverified_test_binding}
+        if same_fields?(binding, fixture, [:assistant_id | @inbox_fields]), do: {:ok, fixture}
 
       _ ->
-        {:error, :unverified_test_binding}
-    end
+        nil
+    end)
   end
 
   defp published_hash(%{config_hash_version: 1} = revision), do: fixture_hash(revision, [])
@@ -555,7 +553,7 @@ defmodule VoelgoedAi.Support.Configuration do
   end
 
   defp fixture_hash(revision, collection_ids) do
-    case fixture() do
+    Enum.find_value(activation_fixtures(), {:error, :unverified_test_revision}, fn
       %{fixed_text: text} = fixture when is_binary(text) and byte_size(text) in 1..4096 ->
         if same_fields?(revision, fixture, [:assistant_id | @revision_fields]) do
           value = Enum.map(@revision_fields ++ [:fixed_text], &Map.fetch!(fixture, &1))
@@ -565,13 +563,11 @@ defmodule VoelgoedAi.Support.Configuration do
             if revision.config_hash_version == 2, do: [2, value, collection_ids], else: value
 
           {:ok, hash_revision(value)}
-        else
-          {:error, :unverified_test_revision}
         end
 
       _ ->
-        {:error, :unverified_test_revision}
-    end
+        nil
+    end)
   end
 
   defp hash_revision(value) do
@@ -581,8 +577,15 @@ defmodule VoelgoedAi.Support.Configuration do
   # Only deterministic TEST fixtures can authorize activation in this slice.
   if Mix.env() == :test do
     defp fixture, do: Application.get_env(:voelgoed_ai, :support_fixture)
+
+    defp activation_fixtures do
+      case fixture() do
+        %{} = configured -> [configured]
+        _ -> []
+      end
+    end
   else
-    defp fixture, do: nil
+    defp activation_fixtures, do: []
   end
 
   defp same_fields?(left, right, fields), do: Map.take(left, fields) == Map.take(right, fields)

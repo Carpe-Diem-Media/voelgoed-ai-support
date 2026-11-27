@@ -123,8 +123,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
     with :ok <- admit_slot(delivery),
          {:ok, revision} <- Configuration.current_revision(config.assistant),
          :ok <- authorize_capacity(batch),
-         :ok <- ensure_current_batch(batch, config, session, now),
-         :ok <- charge(event, now, batch == nil),
+         :ok <- qualify_fixture_input(batch, config, session, event, now),
          {:ok, run} <- schedule(config, session, revision, batch, delivery, now, deadline) do
       with {:ok, _} <-
              store_create(RunInput, :cover, %{
@@ -209,14 +208,26 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   defp batch_candidate(run, _), do: {:ok, run}
 
-  defp ensure_current_batch(nil, _, _, _), do: :ok
+  defp qualify_fixture_input(batch, config, session, event, now) do
+    Enum.find_value(admission_fixtures(), {:error, :stale_policy}, fn
+      %{batch_size: batch_size} = fixture ->
+        with :ok <- ensure_current_batch(batch, config, session, now, batch_size) do
+          charge(event, now, batch == nil, fixture)
+        end
 
-  defp ensure_current_batch(batch, config, session, now) do
+      _ ->
+        nil
+    end)
+  end
+
+  defp ensure_current_batch(nil, _, _, _, _), do: :ok
+
+  defp ensure_current_batch(batch, config, session, now, batch_size) do
     with true <- Ownership.current?(config, session, batch),
          :lt <- DateTime.compare(now, batch.deadline_at),
          true <- batch.state == :queued or batch.regroup_count == 0,
          {:ok, rows} <- inputs(batch.id),
-         true <- length(rows) < ChatwootAdapter.fixture().batch_size do
+         true <- length(rows) < batch_size do
       :ok
     else
       error when is_tuple(error) -> error
@@ -224,8 +235,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
   end
 
-  defp charge(event, now, new_turn?) do
-    fixture = ChatwootAdapter.fixture()
+  defp charge(event, now, new_turn?, fixture) do
     account = "#{event.installation_ref}:#{event.external_account_id}"
     inbox = "#{account}:inbox:#{event.external_inbox_id}:input"
     contact = "#{account}:contact:#{event.contact_id}:input"
@@ -250,6 +260,17 @@ defmodule VoelgoedAi.Support.RunProcessing do
     ]
 
     Admission.reserve(if new_turn?, do: messages ++ turns, else: messages)
+  end
+
+  if Mix.env() == :test do
+    defp admission_fixtures do
+      case ChatwootAdapter.fixture() do
+        %{} = fixture -> [fixture]
+        _ -> []
+      end
+    end
+  else
+    defp admission_fixtures, do: []
   end
 
   defp schedule(config, session, revision, nil, _, now, deadline) do
