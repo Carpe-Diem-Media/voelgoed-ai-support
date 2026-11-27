@@ -545,7 +545,10 @@ defmodule VoelgoedAi.Support.Delivery do
 
   defp settle(config, session, delivery, now, claim, result, generation) do
     if current_claim?(delivery, claim) and DateTime.compare(now, delivery.lease_expires_at) == :lt do
-      :ok = BindingCircuit.record(config.binding, generation, now, result)
+      if config.binding.security_epoch == claim.binding_epoch do
+        :ok = BindingCircuit.record(config.binding, generation, now, result)
+      end
+
       finish_post(session, delivery, now, result)
     else
       {:ok, :stale_claim}

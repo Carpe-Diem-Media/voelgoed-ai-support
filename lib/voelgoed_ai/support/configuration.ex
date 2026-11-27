@@ -317,10 +317,11 @@ defmodule VoelgoedAi.Support.Configuration do
 
   defp collection(id, lock), do: read(KnowledgeCollection, :storage_row, %{id: id}, lock)
 
-  defp grants(id) do
+  defp grants(id, timeout \\ nil) do
     storage(AssistantKnowledgeGrant, :for_revision, fn actor ->
       AssistantKnowledgeGrant
       |> Ash.Query.for_read(:for_revision, %{id: id}, actor: actor)
+      |> Ash.Query.timeout(timeout)
       |> Ash.read()
     end)
   end
@@ -484,17 +485,21 @@ defmodule VoelgoedAi.Support.Configuration do
   end
 
   @doc false
-  def current_revision(%Assistant{active_revision_id: id}) when is_binary(id) do
-    with {:ok, %{status: :published} = revision} <- get(AssistantRevision, id),
-         {:ok, hash} <- published_hash(revision),
+  def current_revision(%Assistant{active_revision_id: id}) when is_binary(id),
+    do: qualified_revision(id)
+
+  def current_revision(_), do: {:error, :stale_policy}
+
+  @doc false
+  def qualified_revision(id, timeout \\ nil) do
+    with {:ok, %{status: :published} = revision} <- get(AssistantRevision, id, nil, timeout),
+         {:ok, hash} <- published_hash(revision, timeout),
          true <- hash == revision.config_hash do
       {:ok, revision}
     else
       _ -> {:error, :stale_policy}
     end
   end
-
-  def current_revision(_), do: {:error, :stale_policy}
 
   @doc false
   def render_fixed_reply(assistant, run, delivery) do
@@ -557,10 +562,12 @@ defmodule VoelgoedAi.Support.Configuration do
     end)
   end
 
-  defp published_hash(%{config_hash_version: 1} = revision), do: fixture_hash(revision, [])
+  defp published_hash(revision, timeout \\ nil)
 
-  defp published_hash(%{config_hash_version: 2} = revision) do
-    with {:ok, grants} <- grants(revision.id),
+  defp published_hash(%{config_hash_version: 1} = revision, _), do: fixture_hash(revision, [])
+
+  defp published_hash(%{config_hash_version: 2} = revision, timeout) do
+    with {:ok, grants} <- grants(revision.id, timeout),
          true <- length(grants) <= @grant_limit do
       fixture_hash(revision, Enum.map(grants, & &1.collection_id))
     else
@@ -723,20 +730,20 @@ defmodule VoelgoedAi.Support.Configuration do
   defp project({:ok, row}), do: {:ok, projection(row)}
   defp project(error), do: error
 
-  defp get(resource, id, lock \\ nil) do
+  defp get(resource, id, lock \\ nil, timeout \\ nil) do
     args = if id == :global, do: %{}, else: %{id: id}
 
-    case read(resource, :configuration_row, args, lock) do
+    case read(resource, :configuration_row, args, lock, timeout) do
       {:ok, nil} -> {:error, :not_found}
       result -> result
     end
   end
 
-  defp read(resource, action, args, lock \\ nil) do
+  defp read(resource, action, args, lock \\ nil, timeout \\ nil) do
     storage(resource, action, fn actor ->
       query = Ash.Query.for_read(resource, action, args, actor: actor)
       query = if lock, do: Ash.Query.lock(query, lock), else: query
-      Ash.read_one(query)
+      query |> Ash.Query.timeout(timeout) |> Ash.read_one()
     end)
   end
 

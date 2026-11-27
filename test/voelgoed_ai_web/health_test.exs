@@ -30,6 +30,33 @@ defmodule VoelgoedAiWeb.HealthTest do
     assert counts.() == before
   end
 
+  for mode <- [nil, :en] do
+    test "readiness requires a current enabled fixture for #{inspect(mode)}" do
+      ctx = VoelgoedAi.SupportDBCase.setup(shadow: unquote(mode))
+      fixture = Application.fetch_env!(:voelgoed_ai, :support_fixture)
+      remote = Agent.get(ctx.fake, & &1)
+
+      ready = fn ->
+        Plug.Test.conn(:get, "/ready")
+        |> VoelgoedAiWeb.Endpoint.call(VoelgoedAiWeb.Endpoint.init([]))
+      end
+
+      assert ready.().status == 200
+
+      try do
+        Application.put_env(:voelgoed_ai, :support_fixture, %{fixture | locale: :invalid})
+        response = ready.()
+        assert response.status == 503
+        assert Jason.decode!(response.resp_body) == %{"status" => "unavailable"}
+      after
+        Application.put_env(:voelgoed_ai, :support_fixture, fixture)
+      end
+
+      assert ready.().status == 200
+      assert Agent.get(ctx.fake, & &1) == remote
+    end
+  end
+
   test "missing job storage returns a generic 503" do
     alias Ecto.Adapters.SQL
     alias VoelgoedAi.Repo

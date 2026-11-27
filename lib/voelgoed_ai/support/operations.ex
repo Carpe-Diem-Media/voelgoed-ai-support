@@ -16,16 +16,29 @@ defmodule VoelgoedAi.Support.Operations do
   def snapshot(staff, selected) do
     readiness = Readiness.check()
 
-    StaffAccess.with_current(staff, nil, fn row ->
-      with true <- :admin in row.roles or :support_operator in row.roles,
-           {:ok, admin} <- admin(staff, :admin in row.roles, readiness),
-           {:ok, operator} <- operator(staff, :support_operator in row.roles, selected) do
-        {:ok, %{admin: admin, operator: operator}}
-      else
-        false -> {:error, :denied}
-        error -> error
-      end
-    end)
+    with {:ok, data} <-
+           StaffAccess.with_current(staff, nil, fn row ->
+             with true <- :admin in row.roles or :support_operator in row.roles,
+                  {:ok, admin} <- admin(staff, :admin in row.roles, readiness),
+                  {:ok, operator} <- operator(staff, :support_operator in row.roles, selected) do
+               {:ok, %{admin: admin, operator: operator}}
+             else
+               false -> {:error, :denied}
+               error -> error
+             end
+           end) do
+      attach_spend(staff, data)
+    end
+  end
+
+  defp attach_spend(_, %{admin: nil} = data), do: {:ok, data}
+
+  defp attach_spend(staff, %{admin: admin} = data) do
+    # A failed accounting transaction must leave the disable control available.
+    case EmbeddingAccounting.staff_exposure(staff) do
+      {:error, :denied} = error -> error
+      spend -> {:ok, %{data | admin: Map.put(admin, :spend, spend)}}
+    end
   end
 
   defp admin(_, false, _), do: {:ok, nil}
@@ -40,7 +53,6 @@ defmodule VoelgoedAi.Support.Operations do
          status: effective_status(control, readiness),
          readiness: readiness,
          configuration: configuration,
-         spend: EmbeddingAccounting.staff_exposure(staff),
          audit:
            (audit ++ binding_audit)
            |> Enum.sort_by(& &1.occurred_at, {:desc, DateTime})

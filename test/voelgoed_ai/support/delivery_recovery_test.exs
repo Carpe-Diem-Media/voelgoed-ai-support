@@ -196,6 +196,39 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
              )
   end
 
+  test "an old delivery result cannot inhibit a revalidated binding", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :forbidden)
+    parent = self()
+    Agent.update(ctx.fake, &Map.put(&1, :write_barrier, parent))
+
+    task = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:chatwoot_write, worker}, 1_000
+
+    for action <- [:disable, :enable] do
+      assert {:ok, _} =
+               VoelgoedAi.SupportFixtures.invoke(
+                 VoelgoedAi.Support.InboxBinding,
+                 action,
+                 %{id: ctx.binding_id},
+                 ctx.admin
+               )
+    end
+
+    send(worker, :resume_chatwoot_write)
+    assert :ok = Task.await(task)
+    assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+
+    assert %{rows: [[false]]} =
+             SQL.query!(
+               Repo,
+               "SELECT EXISTS (SELECT FROM support_binding_circuits WHERE binding_id = $1 AND permanent_epoch IS NOT NULL)",
+               [Ecto.UUID.dump!(ctx.binding_id)]
+             )
+
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
   test "an auth failure requires revalidated configuration and one explicit admin probe", ctx do
     id = SupportDBCase.prepare_reply(ctx)
     SupportDBCase.write_mode(ctx, :forbidden)

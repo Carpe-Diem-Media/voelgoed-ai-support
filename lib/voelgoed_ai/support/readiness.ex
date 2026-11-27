@@ -43,7 +43,7 @@ defmodule VoelgoedAi.Support.Readiness do
   defp mode_readiness(_, _, _), do: {:error, :configuration}
 
   if Mix.env() == :test do
-    alias VoelgoedAi.Support.ChatwootAdapter
+    alias VoelgoedAi.Support.{ChatwootAdapter, Configuration}
 
     defp configured?(mode) do
       with %{
@@ -54,19 +54,18 @@ defmodule VoelgoedAi.Support.Readiness do
              fixture <- ChatwootAdapter.fixture(),
            {:ok, assistant} <- Ecto.UUID.dump(fixture[:assistant_id]),
            true <- fixture_for_mode?(fixture, mode),
-           {:ok, %{rows: [[true]]}} <-
+           {:ok, %{rows: [[revision_id]]}} <-
              SQL.query(
                Repo,
                """
-               SELECT EXISTS (
-                 SELECT 1 FROM inbox_bindings b JOIN assistants a ON a.id = b.assistant_id
-                 JOIN assistant_revisions r ON r.id = a.active_revision_id
-                 WHERE b.installation_ref = $1 AND b.external_account_id = $2
-                   AND b.external_inbox_id = $3 AND b.operating_mode = ANY($4)
-                   AND b.status = 'enabled' AND a.status = 'active' AND a.audience = 'public'
-                   AND r.status = 'published'
-                   AND a.id = $5 AND b.credential_ref = $6 AND b.handoff_team_id = $7
-               )
+               SELECT r.id::text
+               FROM inbox_bindings b JOIN assistants a ON a.id = b.assistant_id
+               JOIN assistant_revisions r ON r.id = a.active_revision_id AND r.assistant_id = a.id
+               WHERE b.installation_ref = $1 AND b.external_account_id = $2
+                 AND b.external_inbox_id = $3 AND b.operating_mode = ANY($4)
+                 AND b.status = 'enabled' AND a.status = 'active' AND a.audience = 'public'
+                 AND r.status = 'published'
+                 AND a.id = $5 AND b.credential_ref = $6 AND b.handoff_team_id = $7
                """,
                [
                  installation,
@@ -80,8 +79,15 @@ defmodule VoelgoedAi.Support.Readiness do
                timeout: @timeout,
                log: false,
                telemetry_event: nil
+             ),
+           {:ok, revision} <-
+             Repo.transact(fn -> Configuration.qualified_revision(revision_id, @timeout) end,
+               timeout: @timeout
              ) do
-        true
+        {mode, revision.response_policy} in [
+          {"fake", :fixed_reply},
+          {"shadow_test", :shadow_decision}
+        ]
       else
         _ -> false
       end

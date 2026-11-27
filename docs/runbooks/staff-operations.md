@@ -17,6 +17,8 @@ rules. VGAS-28 supplies the purge and replay rules.
   Settlement values apply to the current UTC day and month. Outstanding
   exposure includes all reserved and UNKNOWN holds. The cap labels identify
   the generation and embedding configurations that supply those values.
+  Disable automation stays available when the separately authorized
+  accounting read reports unavailable totals.
 - A current support operator can inspect the qualified queue, delivery
   uncertainty and local attention history. Open a session by the internal
   reference in the queue. An unavailable session can indicate that the
@@ -54,7 +56,8 @@ acceptance work.
 `GET /health` checks HTTP liveness. `GET /ready` returns generic ready or
 unavailable JSON and prevents caching. It reads the control row and Oban
 storage with short query timeouts, checks the local Oban supervisor and
-checks the required configuration for a selected TEST mode. Neither route
+checks that the published revision still qualifies for the selected TEST
+mode, including its current configuration hash. Neither route
 calls Chatwoot or a provider, enqueues work or reserves money.
 
 Set `VGAS_EMERGENCY_DISABLE=true` at startup for emergency inhibition. The
@@ -82,7 +85,8 @@ reference in the qualified inbox. A bounded observation runs outside the
 transaction after audit and reservation commit. The final transaction
 rechecks role and epochs and settles only that leased generation. A
 transient circuit retains its existing timed recovery. A failed or stale
-probe grants no dispatch authority.
+probe grants no dispatch authority. An outcome from an earlier binding
+epoch can settle its own delivery claim without updating the current circuit.
 
 A queue episode opens when a pending receipt reaches its original intake
 deadline. Repeated sweeps keep one open episode per inbox. A clear scan

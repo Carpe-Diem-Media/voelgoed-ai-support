@@ -8,7 +8,9 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
 
   @endpoint VoelgoedAiWeb.Endpoint
 
+  alias Ecto.Adapters.SQL
   alias VoelgoedAi.{Accounts, StaffEntraFixture, StaffFixtures}
+  alias VoelgoedAi.{Repo, SupportDBCase}
 
   setup do
     StaffFixtures.setup()
@@ -62,5 +64,40 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
 
     assert {:error, {:redirect, %{to: "/staff/knowledge/denied"}}} =
              render_click(view, "refresh", %{})
+  end
+
+  test "an admin can disable automation while exposure is unavailable" do
+    %{admin: admin} = SupportDBCase.setup()
+
+    assert %{rows: [["enabled", false, nil]]} =
+             SQL.query!(
+               Repo,
+               "SELECT status, embedding_inhibited, embedding_inhibit_occurrence FROM automation_controls WHERE singleton"
+             )
+
+    SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = true WHERE singleton")
+
+    try do
+      page = read_page(admin, "/staff/operations")
+      session = %{"staff" => {admin.id, admin.generation, admin.expiry, admin.binding}}
+      page = put_private(page, :live_view_connect_info, %{session: session})
+      assert {:ok, view, html} = live(page)
+      unavailable? = String.contains?(html, "Accounting totals are unavailable")
+      assert unavailable?
+      assert has_element?(view, "button[phx-click=disable]")
+
+      render_click(view, "disable", %{})
+
+      assert %{rows: [["disabled", true]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT status, embedding_inhibited FROM automation_controls WHERE singleton"
+               )
+    after
+      SQL.query!(
+        Repo,
+        "UPDATE automation_controls SET embedding_inhibited = false WHERE singleton"
+      )
+    end
   end
 end
