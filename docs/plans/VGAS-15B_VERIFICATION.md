@@ -138,6 +138,20 @@ when present in the cited evidence. The disposable runner removed its
 container and volume. These are literal fact checks. PR D owns semantic
 evaluation of the replies.
 
+Independent review at `f0b9e6c` found that a spaced minus and a minor
+currency suffix could be omitted from a matched fact. Four bilingual
+completion tests reproduced the omissions with ExUnit exit 2. The
+corrected matcher keeps the spaced sign and recognized cents or pence
+abbreviations with the full amount. All four cases now deny the proposed
+decision and produce zero writes, including when the shadow handoff
+worker runs. Cited `− 55 rand` and `75c` pass without changing the reply
+bytes. The existing `R25` automatic and `40 rand` shadow controls pass.
+
+The focused command above exited 0 at seed 0 with 159 passing tests.
+Formatting, forced strict TEST compile and snapshot checks exited 0. The
+disposable container and volume were removed. Compatibility was checked
+against `e2aa3aa`, which includes the contributor verification PR #24.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.

@@ -84,16 +84,18 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
     end
   end
 
-  for {locale, opts, unsupported_scale, unsupported_price} <- [
-        {"af-ZA", [], "Kaartjies kos R25 mln.", "Kaartjies kos 25 rand."},
-        {"en-ZA", [shadow: :en], "Tickets cost R25 mln.", "Tickets cost 25 rand."}
+  for {locale, opts, price_prefix} <- [
+        {"af-ZA", [], "Kaartjies kos"},
+        {"en-ZA", [shadow: :en], "Tickets cost"}
       ],
-      {label, reply} <- [
-        {"abbreviated scale", unsupported_scale},
-        {"currency suffix", unsupported_price}
+      {label, amount} <- [
+        {"abbreviated scale", "R25 mln"},
+        {"currency suffix", "25 rand"},
+        {"spaced minus sign", "− 40 rand"},
+        {"cents suffix", "25c"}
       ] do
     @opts opts
-    @reply reply
+    @reply "#{price_prefix} #{amount}."
 
     test "grounded #{locale} completion rejects an unsupported #{label}" do
       ctx = prepare(:grounded, @opts)
@@ -120,23 +122,29 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
     end
   end
 
-  test "grounded English shadow completion accepts a cited currency suffix verbatim" do
-    ctx = prepare(:grounded, shadow: :en)
+  for {label, reply} <- [
+        {"currency suffix", "Late bookings cost 40 rand."},
+        {"spaced minus sign", "The adjustment is − 55 rand."},
+        {"cents suffix", "The processing fee is 75c."}
+      ] do
+    @reply reply
 
-    with_ranked(ctx, fn target ->
-      reply = "Late bookings cost 40 rand."
+    test "grounded English shadow completion accepts a cited #{label} verbatim" do
+      ctx = prepare(:grounded, shadow: :en)
 
-      assert {:ok, %SupportRun{decision: :no_send} = completed} =
-               RunProcessing.complete_evidence_fixture(
-                 ctx.claim,
-                 proposal(target, "answer_grounded", reply),
-                 [target.citation_id]
-               )
+      with_ranked(ctx, fn target ->
+        assert {:ok, %SupportRun{decision: :no_send} = completed} =
+                 RunProcessing.complete_evidence_fixture(
+                   ctx.claim,
+                   proposal(target, "answer_grounded", @reply),
+                   [target.citation_id]
+                 )
 
-      assert completed.typed_decision.reply_text == reply
-      assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
-      assert SupportDBCase.writes(ctx.support) == []
-    end)
+        assert completed.typed_decision.reply_text == @reply
+        assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
+        assert SupportDBCase.writes(ctx.support) == []
+      end)
+    end
   end
 
   test "a selected revision cannot be replaced by a decoy or an invented citation" do
@@ -552,10 +560,12 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
               answer =
                 case variant["locale"] do
                   "af-ZA" ->
-                    "Kaartjieprys R25 per persoon. Daar is 25 plekke. Laat besprekings kos 40 rand."
+                    "Kaartjieprys R25 per persoon. Daar is 25 plekke. Laat besprekings kos 40 rand. " <>
+                      "Die aanpassing is − 55 rand. Die verwerkingsfooi is 75c."
 
                   "en-ZA" ->
-                    "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand."
+                    "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
+                      "The adjustment is − 55 rand. The processing fee is 75c."
                 end
 
               Map.put(variant, "approved_answer", answer)

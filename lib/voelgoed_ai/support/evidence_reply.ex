@@ -13,15 +13,16 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @currency_name ~S"(?:(?:South\s+African|Suid[-‑ ]Afrikaanse|Australian|Canadian|New\s+Zealand|US|U\.S\.|British)\s+)?(?:rande?|dollars?|euros?|pounds?|ponde?|cents?|sente?|penny|pennies|pence|yen|yuan|rupees?|roepees?|francs?|franke?)"
   @currency_label "(?:#{@currency_code}|#{@currency_name})"
   @currency_prefix "(?:\\p{Sc}|(?<![\\p{L}\\p{N}_])#{@currency_label})"
+  @minor_currency_suffix ~S"(?:c|ct|cts|p)"
 
   # Keep signs, currencies and scales in the same fact as the digits. A cited
   # count of 25 cannot validate 25 rand, and R25 cannot validate R25 mln.
   @facts ~r/
     #{@link_fact}
     |
-    (?:[-+−]\s*#{@currency_prefix}\s*|#{@currency_prefix}\s*[-+−]?\s*|[-+−]?)
+    (?:[-+−]\s*#{@currency_prefix}\s*|#{@currency_prefix}\s*(?:[-+−]\s*)?|(?:[-+−]\s*)?)
     \p{N}+(?:(?:[.,:\/-]|\h+)\p{N}+)*
-    (?:(?:\s+|[-‑])?(?:#{@amount_scale}|\p{Sc}|#{@currency_label})(?![\p{L}\p{N}_]))*
+    (?:(?:\s+|[-‑])?(?:#{@amount_scale}|\p{Sc}|#{@currency_label}|#{@minor_currency_suffix})(?![\p{L}\p{N}_]))*
     (?:\s*%)?
   /iux
   @bare_host ~r|\b[a-z][a-z0-9+.-]*://|iu
