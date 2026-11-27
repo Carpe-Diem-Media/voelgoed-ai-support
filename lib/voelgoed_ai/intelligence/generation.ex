@@ -60,10 +60,38 @@ defmodule VoelgoedAi.Intelligence.Generation do
   defp permitted?(_, _, _, _), do: false
 
   if Mix.env() == :test do
+    alias VoelgoedAi.Knowledge.Retrieval
+
+    @doc false
+    def propose(owner, run, context, evidence, observation) do
+      with %{shadow_inference: %{generation_wire: wire}} <- ChatwootAdapter.fixture(),
+           true <- is_function(wire, 1),
+           {:ok, guard} <- Retrieval.generation_guard(owner, evidence, observation) do
+        args = %{
+          run_id: run.id,
+          claim_generation: run.claim_generation,
+          context: context,
+          evidence: evidence
+        }
+
+        with_scope(run.id, run.claim_generation, %{wire: wire, evidence_guard: guard}, fn actor ->
+          SupportProposal
+          |> Ash.ActionInput.for_action(:generate, args, actor: actor)
+          |> Ash.run_action()
+        end)
+      else
+        _ -> {:error, :generation_disabled}
+      end
+    end
+
     @doc "Issue a process-bound generation capability for one synthetic shadow claim."
     def with_fixture(id, claim, %{wire: wire} = options, operation)
         when is_binary(id) and is_integer(claim) and is_function(wire, 1) and
                is_function(operation, 1) do
+      with_scope(id, claim, Map.delete(options, :evidence_guard), operation)
+    end
+
+    defp with_scope(id, claim, options, operation) do
       if is_nil(Process.get(@scope_key)) and not Repo.in_transaction?() do
         ref = make_ref()
         settings = Map.put(options, :shadow_enabled?, &Ownership.shadow_evaluation_enabled?/1)
@@ -85,7 +113,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
     with false <- Repo.in_transaction?(),
          {^ref, _, _, fixture} <- Process.get(@scope_key),
          {:ok, {attempt, payload}} <-
-           qualified(args, fixture.shadow_enabled?, fn config, run, revision, now, cutoff ->
+           qualified(args, fixture, fn config, run, revision, now, cutoff ->
              with {:ok, payload} <- payload(args, run, revision),
                   {:ok, attempt} <- reserve(config.control, run, now, cutoff, fixture) do
                {:ok, {attempt, payload}}
@@ -124,14 +152,15 @@ defmodule VoelgoedAi.Intelligence.Generation do
     end
   end
 
-  defp qualified(%{run_id: id, claim_generation: claim}, shadow_enabled?, work) do
+  defp qualified(%{run_id: id, claim_generation: claim}, settings, work) do
     RunProcessing.with_run(id, fn config, session, run, _now ->
-      with true <- shadow_enabled?.(config),
+      with true <- settings.shadow_enabled?.(config),
            true <- RunProcessing.valid_run?(config, session, run),
            true <- run.state == :running and run.claim_generation == claim,
            {:ok, revision} <- Configuration.current_revision(config.assistant),
            true <- revision.id == run.assistant_revision_id,
            true <- revision.response_policy == :shadow_decision,
+           :ok <- current_evidence(settings, config, session, run, revision),
            cutoff = Enum.min([run.lease_expires_at, run.deadline_at], DateTime),
            now = ChatwootAdapter.now(),
            true <- DateTime.before?(now, cutoff) do
@@ -141,6 +170,16 @@ defmodule VoelgoedAi.Intelligence.Generation do
       end
     end)
   end
+
+  defp current_evidence(%{evidence_guard: guard}, config, session, run, revision) do
+    with {:ok, _} <- guard.(config, session, run, revision) do
+      :ok
+    else
+      _ -> {:error, :stale_evidence}
+    end
+  end
+
+  defp current_evidence(_, _, _, _, _), do: :ok
 
   defp payload(args, run, revision) do
     context = args.context
@@ -245,7 +284,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
   defp execute(attempt, payload, args, fixture) do
     barrier(fixture, :after_claim, attempt)
 
-    case qualified(args, fixture.shadow_enabled?, fn config, _, revision, _, cutoff ->
+    case qualified(args, fixture, fn config, _, revision, _, cutoff ->
            with {:ok, dispatched} <- dispatch(config, attempt, cutoff),
                 do: {:ok, {dispatched, locale(revision)}}
          end) do
@@ -257,7 +296,11 @@ defmodule VoelgoedAi.Intelligence.Generation do
                settle(control, current, hold, outcome)
              end) do
           {:ok, {:proposal, decision}} ->
-            qualified(args, fixture.shadow_enabled?, fn _config, _run, revision, now, _cutoff ->
+            qualified(args, Map.delete(fixture, :evidence_guard), fn _config,
+                                                                     _run,
+                                                                     revision,
+                                                                     now,
+                                                                     _cutoff ->
               if DateTime.before?(now, dispatched.deadline_at) and
                    decision.locale == locale(revision),
                  do: {:ok, decision},
@@ -311,10 +354,10 @@ defmodule VoelgoedAi.Intelligence.Generation do
 
   # The closure is bound to the committed attempt and runs in ReqLLM's request
   # task. Use the same lock order as dispatch and return only after commit.
-  defp wire_cutoff(%{dispatched_at: %DateTime{}} = attempt, shadow_enabled?) do
+  defp wire_cutoff(%{dispatched_at: %DateTime{}} = attempt, settings) do
     scope = %{run_id: attempt.support_run_id, claim_generation: attempt.claim_generation}
 
-    qualified(scope, shadow_enabled?, fn config, _run, _revision, _now, cutoff ->
+    qualified(scope, settings, fn config, _run, _revision, _now, cutoff ->
       with {:ok, _, _} <- dispatch_ready(config, attempt, cutoff), do: {:ok, cutoff}
     end)
   end
@@ -325,7 +368,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
            DateTime.diff(attempt.deadline_at, ChatwootAdapter.now(), :millisecond) do
       ref = make_ref()
       timeout = min(remaining, 45_000)
-      authorize_entry = fn -> wire_cutoff(attempt, fixture.shadow_enabled?) end
+      authorize_entry = fn -> wire_cutoff(attempt, fixture) end
 
       opts =
         GenerationTransport.options(

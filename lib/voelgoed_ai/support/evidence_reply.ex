@@ -239,7 +239,14 @@ defmodule VoelgoedAi.Support.EvidenceReply do
     end
   end
 
-  @doc "Commit to the exact rendered bytes and the qualified immutable decision."
+  @doc """
+  Commit to the exact rendered bytes and the qualified immutable decision.
+
+  Version one hashes a deterministic Erlang External Term Format tuple.
+  The field order, decision/reference terms and original text bytes are part
+  of the format. Changes to this encoding need an explicit compatibility path
+  because an existing prepared intent carries only the digest.
+  """
   def digest(run, text) do
     body =
       {1, run.id, run.claim_generation, run.typed_decision, run.evidence_refs, run.context_digest,

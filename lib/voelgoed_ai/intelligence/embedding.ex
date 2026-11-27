@@ -211,16 +211,22 @@ defmodule VoelgoedAi.Intelligence.Embedding do
 
     def query(ref, input, qualify) do
       with false <- Repo.in_transaction?(),
-           true <- Retrieval.authorize_query(ref),
-           {:ok, attempt} when is_struct(attempt, InferenceRun) <- qualify.(&claim_query/3) do
+           {:ok, mode} <- Retrieval.authorize_query(ref),
+           {:ok, attempt} when is_struct(attempt, InferenceRun) <-
+             qualify.(fn control, run, deadline ->
+               with :ok <- query_lineage(mode, run), do: claim_query(control, run, deadline)
+             end) do
         hook(:after_claim, attempt)
 
         case consume(fn ->
                qualify.(fn control, run, _ -> dispatch_query(control, run, attempt) end)
              end) do
-          {:ok, {:dispatch, transport}} ->
-            hook(:after_dispatch, attempt)
-            outcome = invoke(input, transport, attempt)
+          {:ok, {:dispatch, transport, dispatched}} ->
+            hook(:after_dispatch, dispatched)
+
+            outcome =
+              invoke(input, query_transport(mode, transport, qualify, dispatched), dispatched)
+
             hook(:before_settlement, attempt)
 
             query_transaction(attempt, attempt.dispatch_fence, fn control, current, hold ->
@@ -242,6 +248,71 @@ defmodule VoelgoedAi.Intelligence.Embedding do
         _ -> {:error, :unavailable}
       end
     end
+
+    defp query_lineage(:shadow, %{parent_run_id: parent} = run) when not is_nil(parent) do
+      with {:ok, previous} <-
+             query(
+               InferenceRun,
+               :query_attempt,
+               %{support_run_id: parent},
+               false,
+               &Ash.read_one/1
+             ),
+           {:ok, slots} <-
+             query(InferenceRun, :generation_slots, %{turn_ref: run.turn_ref}, false, &Ash.read/1),
+           true <- Enum.all?(Enum.reject([previous | slots], &is_nil/1), &known_query_lineage?/1) do
+        :ok
+      else
+        _ -> {:error, :unresolved_inference}
+      end
+    end
+
+    defp query_lineage(_, _), do: :ok
+
+    defp known_query_lineage?(%{state: state}), do: state in [:succeeded, :failed, :rejected]
+
+    defp query_transport(:shadow, {:fixture, wire}, qualify, dispatched) do
+      latch = :atomics.new(1, [])
+
+      {:query_fixture,
+       fn request ->
+         with false <- Repo.in_transaction?(),
+              :ok <- :atomics.compare_exchange(latch, 1, 0, 1),
+              {:ok, cutoff} <-
+                qualify.(fn control, run, cutoff ->
+                  with {:ok, attempt} <-
+                         lock_query_attempt(run, dispatched, dispatched.dispatch_fence),
+                       true <-
+                         attempt.state == :running and
+                           attempt.dispatched_at == dispatched.dispatched_at,
+                       true <- attempt.claim_generation == run.claim_generation,
+                       true <- attempt.profile_id == EmbeddingProfile.id(),
+                       :ok <- allowed(control),
+                       {:ok, _} <- gate(),
+                       {:ok, %{state: :reserved}} <- reservation(attempt) do
+                    {:ok, cutoff}
+                  else
+                    _ -> {:error, :stale_request}
+                  end
+                end),
+              remaining when remaining > 0 <-
+                DateTime.diff(cutoff, VoelgoedAi.Support.ChatwootAdapter.now(), :millisecond) do
+           timeout = min(remaining, @timeout_ms)
+
+           wire.(
+             Req.merge(request,
+               receive_timeout: timeout,
+               finch: [pool_timeout: timeout],
+               connect_options: [timeout: timeout, protocols: [:http1]]
+             )
+           )
+         else
+           _ -> {request, %Req.TransportError{reason: :closed}}
+         end
+       end}
+    end
+
+    defp query_transport(_, transport, _, _), do: transport
 
     defp claim_query(control, run, deadline) do
       now = now()
@@ -302,8 +373,9 @@ defmodule VoelgoedAi.Intelligence.Embedding do
            :ok <- allowed(control),
            {:ok, config} <- gate(),
            {:ok, %{state: :reserved}} <- reservation(attempt),
-           {:ok, _} <- change(attempt, %{dispatched_at: now()}) do
-        {:ok, {:dispatch, config.transport}}
+           true <- DateTime.before?(now(), attempt.deadline_at),
+           {:ok, dispatched} <- change(attempt, %{dispatched_at: now()}) do
+        {:ok, {:dispatch, config.transport, dispatched}}
       else
         _ -> {:error, :unavailable}
       end

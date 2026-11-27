@@ -8,4 +8,4 @@ exclude =
       System.get_env(env) != "true",
       do: tag
 
-ExUnit.start(exclude: exclude)
+ExUnit.start(exclude: [:provider_smoke | exclude])

@@ -595,6 +595,89 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
     end)
   end
 
+  test "the version-one reply commitment binds exact UTF-8 bytes and deterministic term encoding" do
+    revision = "00000000-0000-7000-8000-000000000002"
+
+    assert {:ok, decision} =
+             SupportDecision.cast(%{
+               "schema_version" => 1,
+               "decision" => "answer_exact",
+               "locale" => "af-ZA",
+               "reason_code" => "supported",
+               "evidence_revision_ids" => [revision],
+               "reply_text" => nil
+             })
+
+    refs = [%{revision_id: revision}]
+
+    source = %{
+      id: "00000000-0000-7000-8000-000000000001",
+      claim_generation: 4,
+      typed_decision: decision,
+      evidence_refs: refs,
+      context_digest: String.duplicate("b", 64)
+    }
+
+    text = "Goeiemôre!\n"
+    digest = EvidenceReply.digest(source, text)
+    assert digest == "564e614c3438ed0b5c27683667088f8b775308b9f1e029aec636a280eb72402b"
+    refute EvidenceReply.digest(source, String.normalize(text, :nfd)) == digest
+    refute EvidenceReply.digest(source, String.trim_trailing(text)) == digest
+    refute EvidenceReply.digest(%{source | claim_generation: 5}, text) == digest
+    refute EvidenceReply.digest(%{source | evidence_refs: []}, text) == digest
+
+    refute EvidenceReply.digest(%{source | context_digest: String.duplicate("c", 64)}, text) ==
+             digest
+  end
+
+  for {phase, reason, attempts} <- [
+        {:after_commit, "stale_policy", 0},
+        {:before_dispatch, "dispatch_denied", 1}
+      ] do
+    test "a version-one payload mismatch at #{phase} suppresses the fake T06 write" do
+      ctx = prepare(:revocation)
+
+      with_ranked(ctx, fn target ->
+        assert {:ok, delivery} = complete(ctx, target)
+
+        mutate_digest = fn ->
+          # Simulate existing damaged data while keeping the trigger present
+          # and validating normal writes before and after the corruption.
+          assert {:ok, _} =
+                   Repo.transact(fn ->
+                     SQL.query!(Repo, """
+                     ALTER TABLE outbound_deliveries
+                     DISABLE TRIGGER outbound_deliveries_immutable_typed_intent
+                     """)
+
+                     SQL.query!(
+                       Repo,
+                       "UPDATE outbound_deliveries SET payload_digest = repeat('1', 64) WHERE id = $1",
+                       [
+                         uuid(delivery.id)
+                       ]
+                     )
+
+                     SQL.query!(Repo, """
+                     ALTER TABLE outbound_deliveries
+                     ENABLE TRIGGER outbound_deliveries_immutable_typed_intent
+                     """)
+
+                     {:ok, :corrupted}
+                   end)
+        end
+
+        assert :ok = dispatch_at(ctx, unquote(phase), delivery.id, mutate_digest)
+        assert :ok = Deliver.perform(job(delivery.id))
+
+        assert %{rows: [["cancelled", unquote(reason), unquote(attempts)]]} =
+                 SupportDBCase.delivery_rows(ctx.support, "state, reason_code, attempt_count")
+
+        assert [] = SupportDBCase.writes(ctx.support)
+      end)
+    end
+  end
+
   defp exercise(phase, change, stale?) do
     ctx = prepare(change)
 

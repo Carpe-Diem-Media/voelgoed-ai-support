@@ -47,7 +47,8 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
   # Req 0.7.5 sends returned decoder errors through the same error steps as
   # adapter errors. ReqLLM 1.31.0 wraps those errors before emitting telemetry
   # and fills a missing request_body from the request. Clear both sources.
-  defp protect_errors(request) do
+  @doc false
+  def protect_errors(request) do
     request
     |> Req.Request.prepend_error_steps(generation_safe_error: &redact_error/1)
     |> Map.update!(:response_steps, fn steps ->

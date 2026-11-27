@@ -6,6 +6,8 @@ from pathlib import Path
 
 FEASIBILITY = "test/voelgoed_ai/knowledge_feasibility_test.exs"
 FOUNDATION = "test/voelgoed_ai/repo_foundation_test.exs"
+SMOKE_FILE = "test/voelgoed_ai/support/shadow_smoke_test.exs"
+SMOKE = (SMOKE_FILE, "VoelgoedAi.Support.ShadowSmokeTest", "test owner-approved one-call smoke uses the governed proposal action")
 REPO_MODULE = "VoelgoedAi.RepoFoundationTest"
 VECTOR = (FOUNDATION, REPO_MODULE, "test the pre-provisioned vector extension executes a cosine distance query")
 PREDECESSOR = (FOUNDATION, REPO_MODULE, "test the predecessor upgrade preserves existing staff and audit facts")
@@ -28,14 +30,20 @@ def verify(results, mode, paths):
         identity = (file, module, case)
         if file not in paths or identity in observed:
             raise ValueError(f"unexpected or duplicate result for {file}: {module}.{case}")
-        expected = "excluded" if identity == PREDECESSOR and mode != "vgas001-upgrade" else "passed"
+        approved_exclusion = identity == SMOKE or (
+            identity == PREDECESSOR and mode != "vgas001-upgrade"
+        )
+        expected = "excluded" if approved_exclusion else "passed"
         if state != expected:
             raise ValueError(f"{file}: {module}.{case} finished as {state}, expected {expected}")
         observed[identity] = state
 
     passing_files = {file for (file, _, _), state in observed.items() if state == "passed"}
-    if paths != passing_files:
-        raise ValueError(f"missing passes for: {', '.join(sorted(paths - passing_files))}")
+    required_passing_files = paths - {SMOKE_FILE}
+    if required_passing_files != passing_files:
+        raise ValueError(f"missing passes for: {', '.join(sorted(required_passing_files - passing_files))}")
+    if SMOKE_FILE in paths and observed.get(SMOKE) != "excluded":
+        raise ValueError("missing explicit exclusion of the live provider smoke case")
     if FEASIBILITY in paths and sum(file == FEASIBILITY for file, _, _ in observed) != 5:
         raise ValueError("expected five passing F04/F05 feasibility cases")
     if FOUNDATION in paths and (observed.get(VECTOR) != "passed" or PREDECESSOR not in observed):
