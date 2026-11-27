@@ -44,12 +44,17 @@ defmodule VoelgoedAi.Support.DecisionTemplates do
     phrases = Enum.map(current, &normalize(&1.text))
     {decision, reason} = route(phrases, clarification_available?)
 
+    build(locale, decision, reason)
+  end
+
+  @doc false
+  def build(locale, decision, reason, revision_ids \\ []) do
     SupportDecision.cast(%{
       "schema_version" => 1,
       "locale" => if(locale == :af, do: "af-ZA", else: "en-ZA"),
       "decision" => decision,
       "reason_code" => reason,
-      "evidence_revision_ids" => [],
+      "evidence_revision_ids" => revision_ids,
       "reply_text" => nil
     })
   end

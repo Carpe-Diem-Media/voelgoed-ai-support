@@ -25,9 +25,14 @@ The workflow follows the whole-file scheduling pattern from
 The planner requires the knowledge feasibility test file. Each shard checks
 both ExUnit's exit status and a fresh case-level report. The shard that owns
 that file runs all five F04/F05 cases with `VGAS_F04_DISPOSABLE=1`. Every
-assigned file must report a pass. An unexpected skip, exclusion, failure,
-missing report or missing required case fails the job. The only approved
-exclusion is the predecessor staff and audit case outside `vgas001-upgrade`.
+assigned file must report a pass except the opt-in provider smoke file.
+An unexpected reported skip, exclusion or failure, a missing report, or
+an assigned ordinary file without a pass fails the job. The verifier has
+no inventory of individual ordinary cases. It requires all five
+feasibility results and the Repo vector probe and predecessor result when
+those files run. It also requires the exact provider smoke case to appear
+as excluded. The predecessor staff and audit case must appear as excluded
+outside `vgas001-upgrade`.
 The timing history remains a separate file.
 
 The gate also requires `mix ash.codegen --check`, all three migration lanes and a

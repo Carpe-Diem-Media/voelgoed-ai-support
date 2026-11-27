@@ -3,6 +3,7 @@ defmodule VoelgoedAi.Intelligence.EmbeddingTransport do
 
   alias VoelgoedAi.Intelligence.Embedding
   alias VoelgoedAi.Intelligence.EmbeddingProfile, as: Profile
+  alias VoelgoedAi.Intelligence.GenerationTransport
 
   @base_url "https://api.openai.com/v1"
   @fixture_key "synthetic-embedding-fixture"
@@ -23,6 +24,7 @@ defmodule VoelgoedAi.Intelligence.EmbeddingTransport do
         base_url: @base_url,
         dimensions: Profile.dimensions(),
         return_usage: true,
+        telemetry: [payloads: :none],
         total_timeout: timeout,
         req_http_options: [
           adapter: &capture(&1, wire, owner, ref),
@@ -96,9 +98,29 @@ defmodule VoelgoedAi.Intelligence.EmbeddingTransport do
      )}
   end
 
+  # Query inputs can contain public customer text. The pinned ReqLLM
+  # exception metadata can include it even when payload telemetry is off.
+  defp wire({:query_fixture, fun}), do: {@fixture_key, &private_query(&1, fun)}
   defp wire({:fixture, fun}), do: {@fixture_key, fun}
 
   # Reserved for the separately approved provider gate. Embedding never
   # selects this adapter in B1, even when OPENAI_API_KEY is present.
   defp wire({:candidate, key}), do: {key, &Req.Finch.run/1}
+
+  defp private_query(request, wire) do
+    request = GenerationTransport.protect_errors(request)
+
+    case wire.(request) do
+      {request, %Req.Response{status: status}} when status != 200 ->
+        {request,
+         ReqLLM.Error.API.Request.exception(reason: "embedding HTTP failure", status: status)}
+
+      pair ->
+        pair
+    end
+  rescue
+    _ ->
+      {GenerationTransport.protect_errors(request),
+       ReqLLM.Error.API.Request.exception(reason: "embedding request failed")}
+  end
 end

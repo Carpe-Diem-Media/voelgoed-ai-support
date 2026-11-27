@@ -315,13 +315,22 @@ defmodule VoelgoedAi.Support.Ownership do
   if Mix.env() == :test do
     @doc false
     def route_shadow_locked(config, session, observation, now) do
-      if session.state == :bot_active and shadow_evaluation_enabled?(config) and
-           eligible_bot?(config, session, observation) do
+      if session.state == :bot_active and not session.human_inhibit and
+           shadow_evaluation_enabled?(config) and
+           local_handoff_allowed?(config, session, observation) do
         stage_handoff(config, session, now, :explicit_handoff)
       else
         {:error, :scope_denied}
       end
     end
+
+    # A transient read failure grants no remote authority. For the local
+    # handoff use only the last verified bot ownership under the current locks.
+    defp local_handoff_allowed?(_, session, :observation_unavailable),
+      do: session.observed_status == :pending and session.observed_assignee == :bot
+
+    defp local_handoff_allowed?(config, session, observation),
+      do: eligible_bot?(config, session, observation)
   else
     @doc false
     def route_shadow_locked(_, _, _, _), do: {:error, :scope_denied}

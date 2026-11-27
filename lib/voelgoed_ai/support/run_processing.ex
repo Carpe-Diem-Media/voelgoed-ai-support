@@ -366,43 +366,182 @@ defmodule VoelgoedAi.Support.RunProcessing do
   @doc false
   def perform_run(id) do
     with {:ok, {:claimed, run, session, work}} <- with_run(id, &claim/4) do
-      decision = evaluate(work, session, run.lease_expires_at, run.deadline_at)
-
-      with_run(id, fn config, session, current, now ->
-        complete(config, session, current, run, now, decision)
-      end)
-      |> job_result()
+      process_claim(work, run, session)
     else
       {:ok, _} -> :ok
       error -> error
     end
   end
 
-  defp evaluate(:fixed, session, _lease, deadline) do
-    {:fixed, ChatwootAdapter.observe(session, deadline),
-     ChatwootAdapter.history(session, deadline)}
+  defp complete_claim(run, decision) do
+    with_run(run.id, fn config, session, current, now ->
+      complete(config, session, current, run, now, decision)
+    end)
+    |> job_result()
+  end
+
+  defp process_claim(:fixed, run, session) do
+    complete_claim(
+      run,
+      {:fixed, ChatwootAdapter.observe(session, run.deadline_at),
+       ChatwootAdapter.history(session, run.deadline_at)}
+    )
   end
 
   if Mix.env() == :test do
-    defp evaluate({:shadow, receipts}, session, lease, _deadline) do
-      ids = Enum.map(receipts, &elem(&1, 1))
+    alias VoelgoedAi.Intelligence.Generation
+    alias VoelgoedAi.Knowledge.{ArticleRevision, Retrieval}
+    alias VoelgoedAi.Support.DecisionTemplates
 
-      # Read twice outside the transaction. Compare ordered IDs, roles and text
-      # before accepting a projection whose messages might have been edited.
-      first = ChatwootAdapter.decision_context(session, ids, lease)
-      observation = ChatwootAdapter.observe(session, lease)
+    defp process_claim({:shadow, receipts, locale}, run, session) do
+      cutoff = run.lease_expires_at
+      original = read_evidence_context(session, receipts, cutoff)
+      observation = ChatwootAdapter.observe(session, cutoff)
+      context = compare_context(session, receipts, cutoff, original, observation)
 
-      context =
-        with {:ok, original} <- first,
-             {:ok, _} <- observation,
-             {:ok, current} <- ChatwootAdapter.decision_context(session, ids, lease),
-             true <- original.commitment == current.commitment do
-          {:ok, current}
-        else
-          _ -> {:error, :history_changed}
+      with {:ok, context} <- context,
+           {:ok, observation} <- observation,
+           {:ok, %{decision: "handoff", reason_code: "missing_evidence"}} <-
+             DecisionTemplates.decide(context, locale, true),
+           %{shadow_inference: %{} = _settings} <- ChatwootAdapter.fixture(),
+           {:ok, query} <- shadow_query(context) do
+        result =
+          Retrieval.with_shadow(
+            &evidence_owner/0,
+            run,
+            session,
+            observation,
+            receipts,
+            Atom.to_string(locale) <> "-ZA",
+            query,
+            fn search ->
+              evaluate_shadow(search, run, session, receipts, context, query, locale, observation)
+            end
+          )
+
+        case result do
+          {:error, :denied} ->
+            complete_claim(run, {:shadow, receipts, {:ok, observation}, {:ok, context}})
+
+          other ->
+            other
+        end
+      else
+        _ -> complete_claim(run, {:shadow, receipts, observation, context})
+      end
+    end
+
+    defp shadow_query(%{current: [%{text: first} | rest], prior: prior}) do
+      query = String.trim(first)
+      # A regroup may repeat the same question. Different current messages
+      # need staff to resolve the combined intent before using one FAQ.
+      if Enum.all?(rest, &(String.trim(&1.text) == query)) and
+           not String.contains?(query, <<0>>) do
+        {:ok, {query, follow_up_topic(query, List.last(prior))}}
+      else
+        :error
+      end
+    end
+
+    defp follow_up_topic(query, %{role: :contact, text: text}) do
+      if Regex.match?(~r/\A(?:and|en)\s/iu, query) and not String.contains?(text, <<0>>),
+        do: text,
+        else: ""
+    end
+
+    defp follow_up_topic(_, _), do: ""
+
+    defp compare_context(session, receipts, cutoff, original, observation) do
+      with {:ok, original} <- original,
+           {:ok, _} <- observation,
+           {:ok, current} <- read_evidence_context(session, receipts, cutoff),
+           true <- original.commitment == current.commitment do
+        {:ok, current}
+      else
+        {:error, :scope_denied} = denial -> denial
+        _ -> {:error, :history_changed}
+      end
+    end
+
+    defp evaluate_shadow(search, run, session, receipts, original, {query, _}, locale, verified) do
+      found =
+        ArticleRevision
+        |> Ash.ActionInput.for_action(:search_published, %{query: query}, actor: search)
+        |> Ash.run_action()
+
+      observation = ChatwootAdapter.observe(session, run.lease_expires_at)
+
+      if observation == {:ok, verified} do
+        propose_shadow(found, run, session, receipts, original, locale, observation)
+      else
+        # An outage on a later read must never hide a definite scope loss.
+        complete_claim(run, {:shadow, receipts, observation, {:error, :history_changed}})
+      end
+    end
+
+    defp propose_shadow(found, run, session, receipts, original, locale, observation) do
+      cutoff = run.lease_expires_at
+      context = compare_context(session, receipts, cutoff, {:ok, original}, observation)
+
+      proposal =
+        case {found, context, observation} do
+          {{:ok, %{status: :evidence, evidence: [%{mode: :exact} = item]}}, {:ok, _}, {:ok, _}} ->
+            {DecisionTemplates.build(locale, "answer_exact", "supported", [item.revision_id]),
+             [item]}
+
+          {{:ok, %{status: :evidence, evidence: items}}, {:ok, current}, {:ok, observed}} ->
+            generated = Generation.propose(&evidence_owner/0, run, current, items, observed)
+            {generated, items}
+
+          {{:ok, %{status: :no_evidence}}, _, _} ->
+            {DecisionTemplates.build(locale, "handoff", "missing_evidence"), []}
+
+          {{:ok, %{status: :denied}}, _, _} ->
+            {DecisionTemplates.build(locale, "handoff", "conflicting_evidence"), []}
+
+          _ ->
+            {{:error, :unavailable}, []}
         end
 
-      {:shadow, receipts, observation, context}
+      # Reread even when the transport is unusable: an edit, a missed
+      # receipt, or human takeover can invalidate any suggested answer.
+      observation = ChatwootAdapter.observe(session, cutoff)
+      context = compare_context(session, receipts, cutoff, context, observation)
+
+      complete_claim(
+        run,
+        shadow_result(proposal, receipts, observation, context, original.commitment, locale)
+      )
+    end
+
+    defp shadow_result(
+           {{:ok, %{decision: kind} = decision}, items},
+           receipts,
+           {:ok, _} = observation,
+           {:ok, _} = context,
+           commitment,
+           _locale
+         )
+         when kind in ["answer_exact", "answer_grounded"] do
+      by_revision = Map.new(items, &{&1.revision_id, &1.citation_id})
+      citations = Enum.map(decision.evidence_revision_ids, &Map.get(by_revision, &1))
+      {:evidenced, :shadow, receipts, observation, context, commitment, decision, citations}
+    end
+
+    defp shadow_result({proposal, _}, receipts, observation, context, _commitment, locale) do
+      decision =
+        case proposal do
+          {:ok, %{decision: "clarify"}} ->
+            DecisionTemplates.build(locale, "clarify", "ambiguous")
+
+          {:ok, %{decision: "handoff", reason_code: reason}} ->
+            DecisionTemplates.build(locale, "handoff", reason)
+
+          _ ->
+            DecisionTemplates.build(locale, "handoff", "unavailable")
+        end
+
+      {:shadow, receipts, observation, context, decision}
     end
   end
 
@@ -473,10 +612,10 @@ defmodule VoelgoedAi.Support.RunProcessing do
   if Mix.env() == :test do
     defp claim_work(config, session, run) do
       if Ownership.shadow_evaluation_enabled?(config) do
-        with {:ok, %{response_policy: :shadow_decision}} <-
+        with {:ok, %{response_policy: :shadow_decision, locale: locale}} <-
                Configuration.current_revision(config.assistant),
              {:ok, receipts} <- covered_receipts(session, run) do
-          {:ok, {:shadow, receipts}}
+          {:ok, {:shadow, receipts, locale}}
         else
           {:ok, _} -> {:error, :stale_policy}
           error -> error
@@ -509,7 +648,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
   if Mix.env() == :test do
     alias VoelgoedAi.Knowledge.Retrieval
     alias VoelgoedAi.Knowledge.Retrieval.Reference
-    alias VoelgoedAi.Support.{EvidenceReply, SupportDecision}
+    alias VoelgoedAi.Support.{DecisionTemplates, EvidenceReply, SupportDecision}
 
     @doc false
     def claim_evidence_fixture(id) do
@@ -534,7 +673,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
             run,
             claim,
             now,
-            {:evidenced, receipts, observation, context, original.commitment, decision, citations}
+            {:evidenced, :dispatch_fixture, receipts, observation, context, original.commitment,
+             decision, citations}
           )
         end)
       end
@@ -554,13 +694,13 @@ defmodule VoelgoedAi.Support.RunProcessing do
            session,
            run,
            now,
-           {:evidenced, receipts, {:ok, observation}, {:ok, context}, commitment, decision,
-            citations}
+           {:evidenced, source, receipts, {:ok, observation}, {:ok, context}, commitment,
+            decision, citations}
          ) do
       shadow? = Ownership.shadow_evaluation_enabled?(config)
 
       cond do
-        not (shadow? or Ownership.write_enabled?(config)) ->
+        not shadow? and (source == :shadow or not Ownership.write_enabled?(config)) ->
           finish(run, :cancel, now, :stale_policy)
 
         not Ownership.eligible_bot?(config, session, observation) ->
@@ -619,10 +759,36 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
-    defp finalize(_, _, run, now, {:evidenced, _, _, _, _, _, _}),
-      do: finish(run, :fail, now, :history_changed)
+    defp finalize(
+           config,
+           session,
+           run,
+           now,
+           {:evidenced, source, receipts, observation, _, _, _, _}
+         ) do
+      if source == :shadow or Ownership.shadow_evaluation_enabled?(config) do
+        finalize(
+          config,
+          session,
+          run,
+          now,
+          {:shadow, receipts, observation, {:error, :history_changed}}
+        )
+      else
+        finish(run, :fail, now, :history_changed)
+      end
+    end
 
-    defp finalize(config, session, run, now, {:shadow, receipts, {:ok, observation}, context}) do
+    defp finalize(config, session, run, now, {:shadow, receipts, observation, context}),
+      do: finalize(config, session, run, now, {:shadow, receipts, observation, context, nil})
+
+    defp finalize(
+           config,
+           session,
+           run,
+           now,
+           {:shadow, receipts, {:ok, observation}, context, decision}
+         ) do
       cond do
         not Ownership.shadow_evaluation_enabled?(config) ->
           finish(run, :cancel, now, :stale_policy)
@@ -636,7 +802,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
           with {:ok, ^receipts} <- covered_receipts(session, run),
                {:ok, false} <- Ownership.pending_input?(session),
                {:ok, revision} <- Configuration.current_revision(config.assistant) do
-            decide_shadow(config, session, run, revision, now, observation, context)
+            decide_shadow(config, session, run, revision, now, observation, context, decision)
           else
             {:ok, _} ->
               finish(run, :fail, now, :history_changed)
@@ -650,11 +816,43 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
-    defp finalize(_, _, run, now, {:shadow, _, {:error, reason}, _}) do
+    # A failed observation cannot restore scope that the history check denied.
+    defp finalize(_, _, run, now, {:shadow, _, {:error, _}, {:error, :scope_denied}, _}),
+      do: finish(run, :fail, now, :scope_denied)
+
+    defp finalize(config, session, run, now, {:shadow, receipts, {:error, reason}, _, _})
+         when reason in [:unavailable, :deadline, :rate_limited] do
+      # The completion transaction already checked the claim, cutoff and
+      # epochs. Preserve the failed run alongside the fenced staff intent.
+      with {:ok, ^receipts} <- covered_receipts(session, run),
+           {:ok, false} <- Ownership.pending_input?(session),
+           {:ok, failed} <- finish(run, :fail, now, :unavailable) do
+        case Ownership.route_shadow_locked(config, session, :observation_unavailable, now) do
+          {:ok, _} -> {:ok, failed}
+          {:error, :scope_denied} -> {:ok, failed}
+          error -> error
+        end
+      else
+        {:ok, _} -> finish(run, :fail, now, :history_changed)
+        {:error, :history_changed} -> finish(run, :fail, now, :history_changed)
+        error -> error
+      end
+    end
+
+    defp finalize(_, _, run, now, {:shadow, _, {:error, reason}, _, _}) do
       finish(run, :fail, now, if(reason == :scope_denied, do: reason, else: :unavailable))
     end
 
-    defp decide_shadow(config, session, run, revision, _now, observation, {:ok, context}) do
+    defp decide_shadow(
+           config,
+           session,
+           run,
+           revision,
+           _now,
+           observation,
+           {:ok, context},
+           proposed
+         ) do
       # Treat the same session as unresolved until a verified close creates a
       # new generation. A new phrase alone cannot reset the clarification cap.
       with {:ok, prior} <-
@@ -665,11 +863,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
            now = ChatwootAdapter.now(),
            true <- DateTime.before?(now, run.lease_expires_at),
            {:ok, decision} <-
-             VoelgoedAi.Support.DecisionTemplates.decide(
-               context,
-               revision.locale,
-               length(prior) < 2
-             ),
+             shadow_decision(proposed, context, revision.locale, length(prior) < 2),
            handoff? = decision.decision == "handoff",
            {:ok, completed} <-
              store_update(run, :complete_shadow, %{
@@ -686,11 +880,20 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
-    defp decide_shadow(config, session, run, _, now, observation, {:error, :history_changed}) do
-      with {:ok, _} <- finish(run, :fail, now, :history_changed) do
+    defp decide_shadow(config, session, run, _, now, observation, {:error, reason}, _)
+         when reason in [:history_changed, :scope_denied] do
+      with {:ok, _} <- finish(run, :fail, now, reason) do
         Ownership.route_shadow_locked(config, session, observation, now)
       end
     end
+
+    defp shadow_decision(nil, context, locale, available?),
+      do: DecisionTemplates.decide(context, locale, available?)
+
+    defp shadow_decision({:ok, %{decision: "clarify"}}, _, locale, false),
+      do: DecisionTemplates.build(locale, "handoff", "missing_evidence")
+
+    defp shadow_decision(proposal, _, _, _), do: proposal
 
     defp reject_evidence(config, session, run, observation, shadow?) do
       now = ChatwootAdapter.now()
