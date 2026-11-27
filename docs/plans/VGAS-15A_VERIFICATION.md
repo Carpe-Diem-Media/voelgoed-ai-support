@@ -211,7 +211,7 @@ The six PR A scope items have local evidence. The combined verification status i
 ## Review corrections
 
 An independent review of `63f2c89` was cut short before it gave a verdict. Before it stopped it:
-- confirmed that format, the forced TEST compile, the PROD compile and the stubs outside TEST all hold;
+- confirmed that format, the forced TEST compile and the stubs outside TEST all hold. A PROD compile with `--warnings-as-errors` exits 1 on both base and candidate with the same 17 inherited warnings, which VGAS-19 owns. This PR adds no warnings, but it is not a clean PROD compile;
 - found the same 17 inherited DEV warnings as on base;
 - ran `ash.codegen --check`, migrate, rollback and re-migrate, all with exit 0;
 - ran the full suite, which matched the record apart from the two inherited split-clock failures that VGAS-23 fixed.
@@ -231,3 +231,31 @@ Each test leaves the run `failed` with no typed decision and no wire writes.
 On disposable 18.7/0.8.7 at 55435, `shadow_decision_test.exs --seed 0` gave 31 passed. Each mutant then failed exactly its matching new test (30/31 passed), and the source was restored after each one. Together with `delivery_recovery_test.exs`, the restored source gave 96 passed.
 
 The review also noted that admission-limited input is routed to staff with the existing `:late_input` handoff reason (`ownership.ex:307`). That is a labelling NIT with no safety effect, and it is recorded in VGAS-24.
+
+### Review 2
+
+Review 2 approved `71ca00b` with nits. Its reviewer:
+- inspected the PROD beams and found that shadow paths are absent from them or fail closed;
+- killed 8 of 10 shadow mutants and both M5/M6 delivery-recovery mutants;
+- ran the full suite with `VGAS_F04_DISPOSABLE=1`: 601 passed and 1 approved exclusion at seeds 103 and 8125.
+
+LOW-2 found that the completion-time `shadow_evaluation_enabled?` recheck (`run_processing.ex:515`) survived mutation. A runtime adapter disable changes no epoch, so the AC3 claim above was untested.
+
+`shadow_decision_test.exs` now adds **"a runtime adapter disable after the claim cancels the parked decision"**. While the history read is parked, the test turns `shadow_evaluation` off in the TEST fixture. It expects `cancelled` with no typed decision, no delivery and no wire writes.
+
+On disposable 18.7/0.8.7 at 55435:
+- `shadow_decision_test.exs --seed 0` passes.
+- With the recheck replaced by `false`, 31/32 pass. Only the new test fails: the run ends `failed`, still fails closed and makes no writes.
+- After the source was restored, the shadow and delivery-recovery files pass together.
+
+The remaining findings are dispositioned in Plane:
+
+| Finding | Disposition |
+|---|---|
+| LOW-1: fences that fail the run without a local handoff | VGAS-15 PR D, which owns failure routing. |
+| NIT-1: templates accept evidence ids | VGAS-15 PR B. |
+| NIT-2: write-predicate shadow clause untested | VGAS-15 PR B. |
+| NIT-3: `:late_input` label | VGAS-24. |
+| NIT-4: inbound-event lock order comment | VGAS-15 PR B. |
+| NIT-5: PROD compile wording | Corrected above. |
+| NIT-6: rollback with shadow rows | No change, because the record already forbids schema downgrade. |

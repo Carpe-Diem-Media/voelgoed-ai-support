@@ -319,6 +319,20 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
     assert [] = SupportDBCase.writes(ctx)
   end
 
+  # The runtime adapter switch changes no epoch, so only the completion-time
+  # shadow permission recheck stops a decision that was parked before it.
+  test "a runtime adapter disable after the claim cancels the parked decision" do
+    ctx = SupportDBCase.setup(shadow: :en)
+    id = queue(ctx, "Human please")
+    {task, worker} = park(ctx, id)
+    fixture = Application.fetch_env!(:voelgoed_ai, :support_fixture)
+    Application.put_env(:voelgoed_ai, :support_fixture, %{fixture | shadow_evaluation: false})
+    assert :ok = resume(task, worker)
+    assert %{rows: [["cancelled", nil, nil]]} = run_row(id)
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "id")
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   test "a successor reuses the turn and deadline, and human request wins across the batch" do
     ctx = SupportDBCase.setup(shadow: :en)
     first = queue(ctx, "Tell me a joke")
