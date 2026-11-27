@@ -1,5 +1,5 @@
 defmodule VoelgoedAi.Governance.UsageLedger do
-  @moduledoc "Immutable embedding settlement or correction in integer nano-USD."
+  @moduledoc "Immutable inference settlement or correction in integer nano-USD."
 
   use Ash.Resource,
     domain: VoelgoedAi.Governance,
@@ -16,7 +16,10 @@ defmodule VoelgoedAi.Governance.UsageLedger do
       rate_nano_usd: :bigint,
       token_unit: :bigint,
       max_input_tokens: :bigint,
+      max_output_tokens: :bigint,
+      output_rate_nano_usd: :bigint,
       input_tokens: :bigint,
+      output_tokens: :bigint,
       amount_nano_usd: :bigint
     )
 
@@ -31,6 +34,10 @@ defmodule VoelgoedAi.Governance.UsageLedger do
       check_constraint(:entry_kind, "usage_ledger_entries_shape",
         check: """
         rate_nano_usd > 0 AND token_unit > 0 AND max_input_tokens > 0
+        AND (max_output_tokens IS NULL) = (output_rate_nano_usd IS NULL)
+        AND (max_output_tokens IS NULL OR (max_output_tokens > 0 AND output_rate_nano_usd > 0))
+        AND (output_tokens IS NULL OR output_tokens >= 0)
+        AND (output_tokens IS NOT NULL) = (max_output_tokens IS NOT NULL AND input_tokens IS NOT NULL)
         AND (input_tokens IS NULL OR input_tokens > 0)
         AND ((entry_kind = 'settlement' AND entry_key = 'settlement' AND amount_nano_usd >= 0
                AND corrects_id IS NULL)
@@ -49,6 +56,8 @@ defmodule VoelgoedAi.Governance.UsageLedger do
     attribute(:price_version, :string, allow_nil?: false)
     attribute(:rate_nano_usd, :integer, allow_nil?: false, constraints: [min: 1])
     attribute(:token_unit, :integer, allow_nil?: false, constraints: [min: 1])
+    attribute(:max_output_tokens, :integer, constraints: [min: 1])
+    attribute(:output_rate_nano_usd, :integer, constraints: [min: 1])
     attribute(:max_input_tokens, :integer, allow_nil?: false, constraints: [min: 1])
 
     attribute(:entry_kind, :atom,
@@ -59,6 +68,7 @@ defmodule VoelgoedAi.Governance.UsageLedger do
     attribute(:entry_key, :string, allow_nil?: false, constraints: [max_length: 128])
     attribute(:provider, :string, allow_nil?: false)
     attribute(:model_id, :string, allow_nil?: false)
+    attribute(:output_tokens, :integer, constraints: [min: 0])
     attribute(:input_tokens, :integer, constraints: [min: 1])
     attribute(:amount_nano_usd, :integer, allow_nil?: false)
 
@@ -68,6 +78,7 @@ defmodule VoelgoedAi.Governance.UsageLedger do
         one_of: [
           :trusted_usage,
           :invalid_vector,
+          :invalid_proposal,
           :over_reserve,
           :conservative_closure,
           :late_usage
@@ -116,11 +127,14 @@ defmodule VoelgoedAi.Governance.UsageLedger do
         :provider,
         :model_id,
         :input_tokens,
+        :output_tokens,
         :amount_nano_usd,
         :price_version,
         :rate_nano_usd,
         :token_unit,
         :max_input_tokens,
+        :max_output_tokens,
+        :output_rate_nano_usd,
         :reason_code,
         :correlation_id
       ])

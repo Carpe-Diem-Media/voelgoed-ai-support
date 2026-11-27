@@ -13,7 +13,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Accounts.StaffAccess.Session
   alias VoelgoedAi.Governance.{AuditEvent, EmbeddingAccounting, UsageReservation}
-  alias VoelgoedAi.Intelligence.{EmbeddingProfile, EmbeddingTransport, InferenceRun}
+  alias VoelgoedAi.Intelligence.{EmbeddingProfile, EmbeddingTransport, Generation, InferenceRun}
 
   alias VoelgoedAi.Knowledge.{
     Article,
@@ -26,7 +26,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   }
 
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{Configuration, Ownership, SupportRun}
+  alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, Ownership, SupportRun}
 
   @indexing_seconds 60
   @timeout_ms 5_000
@@ -163,7 +163,12 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   @doc "Process a bounded batch of expired attempts. Each item rechecks the durable fence."
   def sweep do
     with {:ok, attempts} <-
-           Repo.transact(fn -> read(InferenceRun, :recovery_candidates, %{now: now()}) end) do
+           Repo.transact(fn ->
+             read(InferenceRun, :recovery_candidates, %{
+               now: now(),
+               generation_now: ChatwootAdapter.now()
+             })
+           end) do
       Enum.reduce(attempts, :ok, fn attempt, result ->
         case recover_by_purpose(attempt) do
           :ok -> result
@@ -177,6 +182,8 @@ defmodule VoelgoedAi.Intelligence.Embedding do
 
   defp recover_by_purpose(%{purpose: :article_embedding} = attempt),
     do: recover(attempt.article_embedding_id)
+
+  defp recover_by_purpose(%{purpose: :generate, id: id}), do: Generation.recover(id)
 
   defp recover_by_purpose(%{purpose: :query_embedding} = attempt) do
     query_transaction(attempt, nil, fn control, current, reservation ->

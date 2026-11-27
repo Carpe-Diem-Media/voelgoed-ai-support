@@ -58,6 +58,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
 
     attribute(:security_epoch, :integer, allow_nil?: false, default: 0, constraints: [min: 0])
 
+    attribute(:generation_inhibited, :boolean, allow_nil?: false, default: false)
     attribute(:embedding_inhibited, :boolean, allow_nil?: false, default: false)
     create_timestamp(:inserted_at)
     update_timestamp(:updated_at)
@@ -85,6 +86,12 @@ defmodule VoelgoedAi.Governance.AutomationControl do
       filter(expr(singleton == true))
     end
 
+    update :inhibit_generation do
+      transaction?(false)
+      require_atomic?(false)
+      change(set_attribute(:generation_inhibited, true))
+    end
+
     update :inhibit_embedding do
       transaction?(false)
       require_atomic?(false)
@@ -99,7 +106,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
   end
 
   policies do
-    policy action(:inhibit_embedding) do
+    policy action([:inhibit_embedding, :inhibit_generation]) do
       authorize_if(Storage)
     end
 
