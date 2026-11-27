@@ -120,6 +120,24 @@ Independent review of `c8d8ba6` closed both dispatch findings and found that the
 
 On disposable PostgreSQL 18.7 with pgvector 0.8.7, the negative completion cases at seed 0 initially exited 2. All four new multiplier cases failed on the uncorrected matcher. With the correction, `VGAS_F04_DISPOSABLE=1 mise exec -- mix test test/voelgoed_ai/support/decision_evidence_test.exs test/voelgoed_ai/support/shadow_decision_test.exs test/voelgoed_ai/knowledge/retrieval_test.exs --seed 0` exited 0 with 148 passed, including the existing `R25` dispatch control. Format, forced strict TEST compile and `ash.codegen --check` exited 0. The disposable runner removed its container and volume. A direct render probe accepted the cited `R25 miljoen` and rejected the substituted `R25m` and truncated `R25`.
 
+The next independent review at `a22842f` verified the prior correction and
+reproduced `R25 mln` from `R25` and `25 rand` from a bare ticket count in
+both locales. All four new completion cases exited 2 on that head. The
+matcher now keeps recognized currency labels, signs and scales with the
+number. The first corrected run exposed that the English shadow cases
+asserted the automatic return shape. The tests now check the persisted
+FAILED run, the permitted local handoff intent and zero Chatwoot writes
+after the worker processes that intent. The valid `R25` dispatch and
+verbatim `40 rand` shadow controls pass.
+
+The same focused command exited 0 on the corrected tests, with 153 passed
+at seed 0. Format, forced strict TEST compile and snapshot checks passed.
+A direct render probe denied seven unattested forms covering signs,
+currency labels and multiplier spacing, then accepted the identical text
+when present in the cited evidence. The disposable runner removed its
+container and volume. These are literal fact checks. PR D owns semantic
+evaluation of the replies.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.

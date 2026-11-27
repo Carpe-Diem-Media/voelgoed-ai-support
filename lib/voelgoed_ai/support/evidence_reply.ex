@@ -8,9 +8,22 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   alias VoelgoedAi.Support.SupportDecision
 
   @link_fact "https?:\\/\\/[^\\s<>\"()\\[\\]]+|[\\p{L}\\p{N}._%+-]+@[\\p{L}\\p{N}.-]+\\.[\\p{L}]{2,}"
-  # Keep the scale with its number so a cited R25 cannot validate R25 miljoen.
-  @amount_scale ~S"(?:\s+|[-‑])?(?:hundreds?|honderde?|thousands?|duisende?|millions?|miljoene?|billions?|miljarde?|biljoene?|trillions?|triljoene?|k|m|mn|mm|b|bn|tn)(?![\p{L}\p{N}_])"
-  @facts ~r/#{@link_fact}|(?:\p{Sc}|(?<!\p{L})(?:ZAR|USD|EUR|GBP|R)\s?)?[-+]?\p{N}+(?:[.,:\/ -]\p{N}+)*(?:#{@amount_scale})*(?:\s*%)?/iu
+  @amount_scale ~S"(?:hundreds?|honderde?|thousands?|duisende?|millions?|miljoene?|billions?|miljarde?|biljoene?|trillions?|triljoene?|k|m|mn|mln|mm|b|bn|bln|tn|trn)"
+  @currency_code ~S"(?:ZAR|USD|EUR|GBP|AUD|CAD|CHF|CNY|INR|JPY|NZD|R)"
+  @currency_name ~S"(?:(?:South\s+African|Suid[-‑ ]Afrikaanse|Australian|Canadian|New\s+Zealand|US|U\.S\.|British)\s+)?(?:rande?|dollars?|euros?|pounds?|ponde?|cents?|sente?|penny|pennies|pence|yen|yuan|rupees?|roepees?|francs?|franke?)"
+  @currency_label "(?:#{@currency_code}|#{@currency_name})"
+  @currency_prefix "(?:\\p{Sc}|(?<![\\p{L}\\p{N}_])#{@currency_label})"
+
+  # Keep signs, currencies and scales in the same fact as the digits. A cited
+  # count of 25 cannot validate 25 rand, and R25 cannot validate R25 mln.
+  @facts ~r/
+    #{@link_fact}
+    |
+    (?:[-+−]\s*#{@currency_prefix}\s*|#{@currency_prefix}\s*[-+−]?\s*|[-+−]?)
+    \p{N}+(?:(?:[.,:\/-]|\h+)\p{N}+)*
+    (?:(?:\s+|[-‑])?(?:#{@amount_scale}|\p{Sc}|#{@currency_label})(?![\p{L}\p{N}_]))*
+    (?:\s*%)?
+  /iux
   @bare_host ~r|\b[a-z][a-z0-9+.-]*://|iu
   @bare_domain ~r/\b(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}\b/u
   @unsafe ~r/[\x00-\x08\x0b-\x1f\x7f<>]|!\[|(?:\]\(|\]:)|(?:javascript|data|file|mailto|tel):|\bwww\.|\b(?:password|passwd|api[_ -]?key|secret|bearer|access[_ -]?token)\b|\b(?:sk|ghp|gho)[_\-][a-zA-Z0-9_\-]{8,}/iu

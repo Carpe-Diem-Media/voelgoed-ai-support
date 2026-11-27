@@ -84,6 +84,61 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
     end
   end
 
+  for {locale, opts, unsupported_scale, unsupported_price} <- [
+        {"af-ZA", [], "Kaartjies kos R25 mln.", "Kaartjies kos 25 rand."},
+        {"en-ZA", [shadow: :en], "Tickets cost R25 mln.", "Tickets cost 25 rand."}
+      ],
+      {label, reply} <- [
+        {"abbreviated scale", unsupported_scale},
+        {"currency suffix", unsupported_price}
+      ] do
+    @opts opts
+    @reply reply
+
+    test "grounded #{locale} completion rejects an unsupported #{label}" do
+      ctx = prepare(:grounded, @opts)
+
+      with_ranked(ctx, fn target ->
+        decision = proposal(target, "answer_grounded", @reply)
+
+        assert {:ok, _} =
+                 RunProcessing.complete_evidence_fixture(ctx.claim, decision, [target.citation_id])
+
+        assert %{state: :failed, typed_decision: nil} = run(ctx)
+
+        if @opts[:shadow] do
+          assert %{rows: [[id, "handoff_status"]]} =
+                   SupportDBCase.delivery_rows(ctx.support, "id::text, purpose")
+
+          assert :ok = Deliver.perform(job(id))
+        else
+          assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
+        end
+
+        assert SupportDBCase.writes(ctx.support) == []
+      end)
+    end
+  end
+
+  test "grounded English shadow completion accepts a cited currency suffix verbatim" do
+    ctx = prepare(:grounded, shadow: :en)
+
+    with_ranked(ctx, fn target ->
+      reply = "Late bookings cost 40 rand."
+
+      assert {:ok, %SupportRun{decision: :no_send} = completed} =
+               RunProcessing.complete_evidence_fixture(
+                 ctx.claim,
+                 proposal(target, "answer_grounded", reply),
+                 [target.citation_id]
+               )
+
+      assert completed.typed_decision.reply_text == reply
+      assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
+      assert SupportDBCase.writes(ctx.support) == []
+    end)
+  end
+
   test "a selected revision cannot be replaced by a decoy or an invented citation" do
     ctx = prepare(:revocation)
 
@@ -493,7 +548,18 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
           payload()
           |> Map.put("response_mode", "grounded")
           |> Map.update!("localized_content", fn locales ->
-            Enum.map(locales, &Map.put(&1, "approved_answer", "Kaartjieprys R25 per persoon."))
+            Enum.map(locales, fn variant ->
+              answer =
+                case variant["locale"] do
+                  "af-ZA" ->
+                    "Kaartjieprys R25 per persoon. Daar is 25 plekke. Laat besprekings kos 40 rand."
+
+                  "en-ZA" ->
+                    "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand."
+                end
+
+              Map.put(variant, "approved_answer", answer)
+            end)
           end)
 
         _ ->
