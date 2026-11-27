@@ -67,19 +67,19 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
       postgres:
-        image: pgvector/pgvector:0.8.4-pg18
+        image: pgvector/pgvector@sha256:4bdc16048580b56345bca441bffe8d9b45dd2f5d76963808c853df1661df6e00
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
-          - 127.0.0.1:55433:5432
+          - 127.0.0.1:55434:5432
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
     env:
       TEST_DATABASE_HOST: 127.0.0.1
-      TEST_DATABASE_PORT: '55433'
+      TEST_DATABASE_PORT: '55434'
       TEST_DATABASE_USERNAME: vgas_test
       TEST_DATABASE_NAME: vgas_test
     steps:
@@ -100,14 +100,21 @@ jobs:
           CREATE EXTENSION vector;
           SQL
           echo "TEST_DATABASE_PASSWORD=$password" >> "$GITHUB_ENV"
+      - name: Verify the PostgreSQL baseline as the TEST role
+        run: bash .github/scripts/verify_postgres.sh 180007
       - name: Run assigned test files
         env:
           TEST_FILES: ${{ toJSON(matrix.files) }}
           CI_TIMING_OUTPUT: timing.json
+          VGAS_F04_DISPOSABLE: '1'
         run: |
+          [[ "${VGAS_F04_DISPOSABLE:-}" == 1 && "${VGAS_VERIFY_PGVECTOR:-}" == true ]]
           mapfile -d '' -t paths < <(python3 -c 'import json, os, sys; sys.stdout.buffer.write(b"".join(os.fsencode(path) + b"\0" for path in json.loads(os.environ["TEST_FILES"])))')
           (( ${#paths[@]} > 0 ))
+          export CI_TEST_RESULTS_OUTPUT
+          CI_TEST_RESULTS_OUTPUT=$(mktemp)
           mix test --seed 0 --formatter ExUnit.CLIFormatter --formatter VoelgoedAi.CITimingFormatter "${paths[@]}"
+          python3 .github/scripts/verify_test_results.py "$CI_TEST_RESULTS_OUTPUT" shard "${paths[@]}"
       - uses: actions/upload-artifact@v4
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
@@ -147,13 +154,13 @@ jobs:
         lane: [fresh, upgrade, vgas001-upgrade]
     services:
       postgres:
-        image: pgvector/pgvector:0.8.4-pg18
+        image: pgvector/pgvector@sha256:4bdc16048580b56345bca441bffe8d9b45dd2f5d76963808c853df1661df6e00
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 127.0.0.1:55433:5432
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
@@ -181,6 +188,8 @@ jobs:
           CREATE EXTENSION vector;
           SQL
           echo "TEST_DATABASE_PASSWORD=$password" >> "$GITHUB_ENV"
+      - name: Verify the PostgreSQL baseline as the TEST role
+        run: bash .github/scripts/verify_postgres.sh 180007
       - name: Install the immutable foundation before upgrade
         if: matrix.lane == 'upgrade'
         shell: bash
@@ -211,6 +220,7 @@ jobs:
         shell: bash
         env:
           VGAS_VERIFY_VGAS001_UPGRADE: ${{ matrix.lane == 'vgas001-upgrade' }}
+          MIGRATION_LANE: ${{ matrix.lane }}
         run: |
           mix ecto.migrate --strict-version-order
           migrations=$(mix ecto.migrations)
@@ -218,7 +228,11 @@ jobs:
           if [[ "$migrations" =~ (^|[[:space:]])down[[:space:]] ]]; then
             exit 1
           fi
-          mix test --seed 0 test/voelgoed_ai/repo_foundation_test.exs
+          export CI_TEST_RESULTS_OUTPUT
+          CI_TEST_RESULTS_OUTPUT=$(mktemp)
+          foundation_tests=test/voelgoed_ai/repo_foundation_test.exs
+          mix test --seed 0 --formatter ExUnit.CLIFormatter --formatter VoelgoedAi.CITimingFormatter "$foundation_tests"
+          python3 .github/scripts/verify_test_results.py "$CI_TEST_RESULTS_OUTPUT" "$MIGRATION_LANE" "$foundation_tests"
 
   secrets:
     runs-on: ubuntu-24.04
@@ -238,7 +252,7 @@ jobs:
             range="$BASE..HEAD"
           fi
           docker run --rm --user "$(id -u):$(id -g)" \
-            --volume "$PWD:/repo:ro" --workdir /repo ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            --volume "$PWD:/repo:ro" --workdir /repo ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
             git --redact=100 --log-opts="$range" --no-banner .
 
   gate:

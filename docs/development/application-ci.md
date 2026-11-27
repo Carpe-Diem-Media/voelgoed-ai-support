@@ -22,7 +22,13 @@ and compiles them locally.
 
 The workflow follows the whole-file scheduling pattern from
 [NewYou PR 322](https://github.com/Carpe-Diem-Media/NewYou/pull/322).
-Coverage relies on complete file assignment and ExUnit's exit status.
+The planner requires the knowledge feasibility test file. Each shard checks
+both ExUnit's exit status and a fresh case-level report. The shard that owns
+that file runs all five F04/F05 cases with `VGAS_F04_DISPOSABLE=1`. Every
+assigned file must report a pass. An unexpected skip, exclusion, failure,
+missing report or missing required case fails the job. The only approved
+exclusion is the predecessor staff and audit case outside `vgas001-upgrade`.
+The timing history remains a separate file.
 
 The gate also requires `mix ash.codegen --check`, all three migration lanes and a
 redacted Gitleaks 8.30.1 scan of the candidate commit range. Only the ExUnit
@@ -37,15 +43,53 @@ and verify Oban v14 on the application Repo. Tests use manual Oban and prove tha
 a separate connection cannot see an uncommitted job and that rollback removes
 it. The predecessor lane also verifies the exact staff and audit facts it
 inserted. Oban starts with no queues, plugins, peer or stager in this slice.
+Each migration lane requires a passing Repo cosine query in its case report.
+The optional Proof check is outside the Application CI gate.
 
-Use DevCore for local bootstrap and keep DEV and TEST separate. The workstation
-TEST role cannot install server extensions. On a pgvector-enabled TEST target,
-run the vector probe with `VGAS_VERIFY_PGVECTOR=true`. CI sets this flag in
-every shard and all migration lanes, so missing pgvector fails the gate.
+Both CI database jobs use the upstream linux/amd64
+`pgvector/pgvector@sha256:4bdc16048580b56345bca441bffe8d9b45dd2f5d76963808c853df1661df6e00`.
+Bootstrap installs the extension. The job then connects as the restricted
+`vgas_test` database owner and checks PostgreSQL `180007`, vector `0.8.7`,
+role privileges and an actual cosine query before running migrations or tests.
+Every database job sets `VGAS_VERIFY_PGVECTOR=true`. The runner-private shard
+uses loopback port 55434 so F04 cannot run against shared DevCore TEST on 55433.
+The migration matrix keeps its runner-private port 55433.
 
-The VGAS-003 embedding accounting migration requires a pre-provisioned
-`vector` extension. Use a disposable pgvector instance on `127.0.0.1:55434`
-with TEST database and role `vgas_test` and `VGAS_VERIFY_PGVECTOR=true` when
-the workstation allocation lacks the extension. The Entra feasibility
-fixtures accept this explicit loopback target as well as the standard TEST
-endpoint. Shared DevCore credentials remain in DevCore.
+## Disposable local workflow
+
+Run the VGAS-23 migration and vector checks with the owner-approved
+`vgas_disposable_pg.sh` attachment. It starts a fresh loopback instance
+of `devcore-postgres:18.7-vector0.8.7` and preinstalls vector using the
+container bootstrap role. The application runs as `vgas_test`, which owns
+the `vgas_test` database and has no superuser, database creation or role
+creation privilege. The runner generates throwaway credentials and passes
+them through the environment. Keep them out of steps files and logs.
+
+```sh
+ss -ltn '( sport = :55436 or sport = :55437 )'
+docker image inspect devcore-postgres:18.7-vector0.8.7 --format '{{.Id}} {{.Os}}/{{.Architecture}}'
+bash /home/jcschoeman96/.t3/userdata/attachments/vgas_disposable_pg.sh "$PWD" "$vgas_steps" 55436
+```
+
+Use a private steps file with one command per line. Use a fresh 55436
+run for each migration lane and 55437 for the full suite. Confirm the
+runner reports `cleanup: container=0 volume=0` and check port release
+with `ss -ltn` after each run. The runner removes its own container
+and volume on exit. The F04 guard accepts only loopback on 55434, 55436
+or 55437 and checks the database, role, PostgreSQL and vector versions
+before creating fixtures. The local commands, predecessor pins and
+recovery evidence are in the [VGAS-23 verification record](../plans/VGAS-23_VERIFICATION.md).
+
+Check clean rollback and reapply only before protected history exists.
+Once query or publisher failure history exists, B2b refuses rollback.
+Preserve the history and use a compatible forward fix or a separately
+approved, rehearsed restore. A synthetic custom-format `pg_dump` and
+`pg_restore --list` check confirm archive readability. Proving recovery
+requires a restore into a separately provisioned disposable target.
+
+Shared DevCore rollout is tracked in VGAS-10. Resume the standard
+`devcore-project doctor`, `devcore-project run dev -- mix setup` and
+`devcore-project run test -- mix test` workflow for authorized work after
+VGAS-10 records the rollout and both read-only probes verify the patched
+baseline, restricted role and vector access. The shared DEV and TEST
+allocations are subject to their own approval for changes and recovery.

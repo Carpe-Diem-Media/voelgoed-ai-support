@@ -10,11 +10,21 @@ defmodule VoelgoedAi.Feasibility.EntraStore do
 
     true =
       port == 55433 or
-        (port == 55434 and config[:hostname] == "127.0.0.1" and
+        (port in [55434, 55436, 55437] and config[:hostname] == "127.0.0.1" and
            System.get_env("VGAS_VERIFY_PGVECTOR") == "true")
 
     %{rows: [["vgas_test", "vgas_test"]]} =
       Repo.query!("SELECT current_database(), current_user")
+
+    if port != 55433 do
+      %{rows: [["180007", "0.8.7", false, false, false, false, false]]} =
+        Repo.query!("""
+        SELECT current_setting('server_version_num'),
+          (SELECT extversion FROM pg_extension WHERE extname = 'vector'),
+          rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
+        FROM pg_roles WHERE rolname = current_user
+        """)
+    end
 
     schema = "vgas_f08_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
 
