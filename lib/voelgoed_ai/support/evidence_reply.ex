@@ -90,13 +90,8 @@ defmodule VoelgoedAi.Support.EvidenceReply do
     (?![\p{L}\p{M}\p{N}_])
   /iux
 
-  # Compare complete calendar dates and quantity expressions. Date qualifiers,
-  # range endpoints and units cannot borrow support from separate source facts.
-  @fact_patterns [
-    calendar: ~r/(?<![\p{L}\p{M}\p{N}_])#{@calendar_fact}/iux,
-    clock: @clock,
-    quantity: ~r/#{@quantity}/iux
-  ]
+  @calendar ~r/(?<![\p{L}\p{M}\p{N}_])#{@calendar_fact}/iux
+  @quantity_fact ~r/#{@quantity}/iux
   @bare_host ~r|\b[a-z][a-z0-9+.-]*://|iu
   @bare_domain ~r/\b(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}\b/u
   @unsafe ~r/[\x00-\x08\x0b-\x1f\x7f<>]|!\[|(?:\]\(|\]:)|(?:javascript|data|file|mailto|tel):|\bwww\.|\b(?:password|passwd|api[_ -]?key|secret|bearer|access[_ -]?token)\b|\b(?:sk|ghp|gho)[_\-][a-zA-Z0-9_\-]{8,}/iu
@@ -146,31 +141,45 @@ defmodule VoelgoedAi.Support.EvidenceReply do
 
   defp facts(text) do
     links = fact_spans(text, @link_fact, :link)
+    without_links = mask_spans(text, links)
 
-    # Mask addresses before scanning other facts. The mask keeps byte offsets
-    # and stops matches at the address without discarding adjacent text.
-    without_links = Regex.replace(@link_fact, text, &:binary.copy(<<0>>, byte_size(&1)))
+    # Reserve dates and clocks before matching quantities. A preceding number
+    # can otherwise absorb the hour and hide the clock's timezone.
+    temporal =
+      (fact_spans(without_links, @calendar, :temporal) ++
+         fact_spans(without_links, @clock, :temporal))
+      |> Enum.sort()
+      |> merge_temporal_spans()
 
-    other =
-      Enum.flat_map(@fact_patterns, fn {kind, pattern} ->
-        fact_spans(without_links, pattern, kind)
-      end)
+    quantities = fact_spans(mask_spans(without_links, temporal), @quantity_fact, :quantity)
 
-    spans = Enum.sort_by(links ++ other, fn {start, length, _} -> {start, -length} end)
-
-    {_, matched} =
-      Enum.reduce(spans, {0, []}, fn
-        {start, length, kind}, {next, matches} when start >= next ->
-          {start + length, [{start, length, kind} | matches]}
-
-        _, acc ->
-          acc
-      end)
-
-    matched
-    |> Enum.reverse()
+    (links ++ temporal ++ quantities)
+    |> Enum.sort()
     |> join_ranges(text)
     |> Enum.map(&fact_text(&1, text))
+  end
+
+  defp merge_temporal_spans(spans) do
+    spans
+    |> Enum.reduce([], fn
+      {start, length, :temporal}, [{left, width, :temporal} | rest] when start < left + width ->
+        [{left, max(width, start + length - left), :temporal} | rest]
+
+      span, merged ->
+        [span | merged]
+    end)
+    |> Enum.reverse()
+  end
+
+  # The mask preserves original byte offsets and ends matches at span edges.
+  defp mask_spans(text, spans) do
+    {parts, stop} =
+      Enum.map_reduce(spans, 0, fn {start, length, _}, previous_stop ->
+        gap = binary_part(text, previous_stop, start - previous_stop)
+        {[gap, :binary.copy(<<0>>, length)], start + length}
+      end)
+
+    IO.iodata_to_binary([parts, binary_part(text, stop, byte_size(text) - stop)])
   end
 
   defp fact_spans(text, pattern, kind) do
@@ -187,8 +196,7 @@ defmodule VoelgoedAi.Support.EvidenceReply do
     stop = start + length
     separator = binary_part(text, stop, right - stop)
 
-    signed_right? =
-      right_kind == :quantity and String.starts_with?(binary_part(text, right, width), ["-", "−"])
+    signed_right? = String.starts_with?(binary_part(text, right, width), ["-", "−"])
 
     case range_start(text, start, separator, signed_right?) do
       nil -> [first | join_ranges([second | rest], text)]

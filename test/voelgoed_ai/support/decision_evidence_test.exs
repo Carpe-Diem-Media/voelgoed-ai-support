@@ -55,6 +55,25 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
     end)
   end
 
+  test "grounded dispatch preserves a cited room number and zoned clock on replay" do
+    ctx = prepare(:grounded)
+
+    with_ranked(ctx, fn target ->
+      reply = "Kamer 731 09:00 (UTC)."
+
+      assert {:ok, delivery} =
+               RunProcessing.complete_evidence_fixture(
+                 ctx.claim,
+                 proposal(target, "answer_grounded", reply),
+                 [target.citation_id]
+               )
+
+      assert :ok = Deliver.perform(job(delivery.id))
+      assert :ok = Deliver.perform(job(delivery.id))
+      assert [{:reply, _, ^reply, _}] = SupportDBCase.writes(ctx.support)
+    end)
+  end
+
   for {label, text} <- [
         {"amount", "Die kaartjies kos R250."},
         {"Afrikaans amount multiplier", "Die kaartjies kos R25 miljoen."},
@@ -191,6 +210,10 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
            "af-ZA" => "Die sessie begin 09:00 (SAST).",
            "en-ZA" => "The session starts 09:00 (SAST)."
          }},
+        {"zone after a room number",
+         %{"af-ZA" => "Kamer 731 09:00 (SAST).", "en-ZA" => "Room 731 09:00 (SAST)."}},
+        {"room number before a zoned clock",
+         %{"af-ZA" => "Kamer 991 09:00 (UTC).", "en-ZA" => "Room 991 09:00 (UTC)."}},
         {"zone with an attached offset",
          %{
            "af-ZA" => "Die sessie begin 09:00 UTC+02:00.",
@@ -260,6 +283,7 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"parenthesized URL", "See (https://faq.example.test/synthetic)."},
         {"signed clock", "The adjusted time is −9am."},
         {"parenthesized zone", "The session starts 09:00 (UTC)."},
+        {"enclosed zone after a room number", "Room 731 09:00 (UTC)."},
         {"zone and its offset", "The broadcast starts 07:00 GMT+01:00."},
         {"ISO date and clock", "The appointment is 2026-12-15T09:00Z."}
       ] do
@@ -742,7 +766,7 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "Die kantoor open om 9vm, oftewel 9am. Die toonbank sluit om 5pm. " <>
                       "Die aangepaste tyd is −9vm. Die sessie begin 09:00 (UTC). " <>
                       "Die regstreekse uitsending begin 09:00 UTC. Die tydsverskil is +02:00. " <>
-                      "Die afspraak is 2026-12-15T09:00Z."
+                      "Die afspraak is 2026-12-15T09:00Z. Kamer 731 09:00 (UTC)."
 
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
@@ -764,7 +788,7 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "The desk closes at 5pm. The reception is open from 7am to 4pm. " <>
                       "The adjusted time is −9am. The session starts 09:00 (UTC). " <>
                       "The livestream starts 09:00 UTC. The time offset is +02:00. " <>
-                      "The broadcast starts 07:00 GMT+01:00. The appointment is 2026-12-15T09:00Z."
+                      "The broadcast starts 07:00 GMT+01:00. The appointment is 2026-12-15T09:00Z. Room 731 09:00 (UTC)."
                 end
 
               Map.put(variant, "approved_answer", answer)

@@ -275,6 +275,22 @@ the modified validator. VGAS-19 owns non-TEST compilation and release
 verification after PR D. Semantic evaluation remains PR D. Hosted CI and
 independent re-review are pending for the updated candidate.
 
+The independent review of `b2f5fee` found that an adjacent room number
+could absorb the hour and hide the timezone from literal comparison. Both
+timezone substitutions failed the new regression assertions on that head.
+The correction reserves calendar and clock spans before matching quantities
+and preserves neighboring numbers. Four bilingual timezone and room-number
+denials produced zero writes. The cited English shadow reply persisted with
+zero writes. The cited Afrikaans reply reached the fake transport once with
+its original bytes across two delivery-worker calls.
+
+The four-file focused suite above passed 310 tests at seed 0 on disposable
+PostgreSQL 18.7 and pgvector 0.8.7. The database identity check, format,
+strict TEST compilation and snapshot check exited 0. Both disposable runs
+removed their containers and volumes. Strict DEV compilation exited 1 with
+the same 17 inherited application warnings tracked in VGAS-19. Hosted CI
+and independent review are pending on the corrected candidate.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.
