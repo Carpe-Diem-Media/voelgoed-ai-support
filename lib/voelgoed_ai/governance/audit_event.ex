@@ -82,7 +82,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   @gap_events [:gap_reviewed, :gap_deferred, :gap_dismissed, :gap_addressed]
   @gap_reasons [:duplicate_issue, :out_of_scope, :no_change_needed]
   @support_events [:request_handoff, :return_to_bot, :close_session, :abandon_delivery]
-  @system_events [:delivery_unknown, :missed_deadline, :handoff_failed]
+  @system_events [:delivery_unknown, :missed_deadline, :handoff_failed, :local_handoff]
   @system_target_kinds [:inbound_event, :support_run, :outbound_delivery]
   @system_reason_sql Enum.map_join(ReasonCode.values(), ",", &"'#{&1}'")
   @financial_events [
@@ -267,7 +267,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             OR (target_kind = 'support_session' AND session_target_id IS NOT NULL
               AND event IN ('request_handoff','return_to_bot','close_session'))
             OR (target_kind = 'outbound_delivery' AND delivery_target_id IS NOT NULL
-              AND event IN ('abandon_delivery','delivery_unknown','handoff_failed'))
+              AND event IN ('abandon_delivery','delivery_unknown','handoff_failed','local_handoff'))
             OR (target_kind = 'inbound_event' AND event_target_id IS NOT NULL AND event = 'missed_deadline')
             OR (target_kind = 'support_run' AND run_target_id IS NOT NULL AND event = 'missed_deadline')
           )
@@ -317,6 +317,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             AND operational_before IS NULL AND operational_after IS NULL
             AND ((event = 'delivery_unknown' AND reason_code IN (#{@system_reason_sql}))
               OR (event = 'missed_deadline' AND reason_code = 'deadline')
+              OR (event = 'local_handoff' AND target_kind = 'outbound_delivery' AND
+                reason_code IN ('human_requested','admission_limited','budget_exhausted','idle_triage'))
               OR (event = 'handoff_failed' AND reason_code IN ('deadline','read_exhausted','no_effect'))))
         """
       )

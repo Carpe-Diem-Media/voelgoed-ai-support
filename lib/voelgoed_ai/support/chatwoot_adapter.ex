@@ -186,6 +186,23 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
   if Mix.env() == :test do
     @doc false
     def decision_context(session, ids, deadline) do
+      with {:ok, messages} <- text_history(session, deadline) do
+        VoelgoedAi.Support.DecisionContext.project(messages, ids, session.contact_id)
+      end
+    end
+
+    @doc false
+    def receipt_text(event, deadline) do
+      with %{shadow_evaluation: true} <- fixture(),
+           {:ok, messages} <- text_history(event, deadline) do
+        VoelgoedAi.Support.DecisionContext.receipt_text(messages, event.contact_id)
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :unavailable}
+      end
+    end
+
+    defp text_history(session, deadline) do
       destination = destination(session)
       contact = session.contact_id
 
@@ -194,7 +211,7 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
            true <- function_exported?(module, :decision_history, 4),
            {:ok, %TextHistory{destination: ^destination, contact: ^contact, messages: messages}} <-
              call(:decision_history, destination, [15], deadline) do
-        VoelgoedAi.Support.DecisionContext.project(messages, ids, contact)
+        {:ok, messages}
       else
         {:ok, _} -> {:error, :scope_denied}
         {:error, _} = error -> error
@@ -204,6 +221,8 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
   else
     @doc false
     def decision_context(_, _, _), do: {:error, :unavailable}
+    @doc false
+    def receipt_text(_, _), do: {:error, :unavailable}
   end
 
   defp public_message?(%Message{visibility: :public, id: id, sender: sender}),

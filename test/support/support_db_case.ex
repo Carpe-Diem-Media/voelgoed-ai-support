@@ -218,9 +218,9 @@ defmodule VoelgoedAi.SupportDBCase do
           "id" => event.conversation_id,
           "account" => %{"id" => event.external_account_id},
           "inbox_id" => event.external_inbox_id,
-          "meta" => %{"sender" => %{"id" => 5}}
+          "meta" => %{"sender" => %{"id" => event.contact_id}}
         },
-        "sender" => %{"id" => 5, "account" => %{"id" => event.external_account_id}},
+        "sender" => %{"id" => event.contact_id, "account" => %{"id" => event.external_account_id}},
         "private" => false,
         "message_type" => "incoming",
         "content_type" => "text",
@@ -258,6 +258,33 @@ defmodule VoelgoedAi.SupportDBCase do
         | observation: %{state.observation | destination: destination},
           history: [%Message{id: event.message_id, sender: :contact, visibility: :public}]
       }
+    end)
+
+    %{ctx | event: event}
+  end
+
+  def add_remote_conversation(ctx, offset, contact \\ 5) do
+    event = %{
+      ctx.event
+      | conversation_id: ctx.event.conversation_id + offset,
+        message_id: ctx.event.message_id + offset,
+        contact_id: contact
+    }
+
+    Agent.update(ctx.fake, fn state ->
+      destination = %{state.observation.destination | conversation: event.conversation_id}
+
+      remote = %{
+        observation: %{state.observation | destination: destination, contact: contact},
+        history: [%Message{id: event.message_id, sender: :contact, visibility: :public}]
+      }
+
+      Map.update(
+        state,
+        :conversations,
+        %{destination => remote},
+        &Map.put(&1, destination, remote)
+      )
     end)
 
     %{ctx | event: event}
@@ -370,6 +397,7 @@ defmodule VoelgoedAi.SupportDBCase do
     for {key, subquery} <- [
           {"event_id", "SELECT id FROM inbound_events WHERE external_inbox_id = $1"},
           {"run_id", "SELECT id FROM support_runs WHERE session_id IN (#{matches})"},
+          {"idle_after", matches},
           {"delivery_id", "SELECT id FROM outbound_deliveries WHERE session_id IN (#{matches})"}
         ] do
       SQL.query!(

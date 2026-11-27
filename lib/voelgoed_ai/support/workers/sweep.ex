@@ -14,6 +14,9 @@ defmodule VoelgoedAi.Support.Workers.Sweep do
   def perform(%Oban.Job{args: %{"run_id" => id}}),
     do: valid_id(id, &Recovery.run_deadline/1)
 
+  def perform(%Oban.Job{args: %{"idle_after" => id}}),
+    do: valid_id(id, &Recovery.sweep_idle/1)
+
   def perform(%Oban.Job{args: args}) when map_size(args) == 0, do: Recovery.sweep()
   def perform(_), do: {:discard, :invalid_job}
 

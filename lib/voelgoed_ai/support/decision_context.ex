@@ -48,6 +48,28 @@ defmodule VoelgoedAi.Support.DecisionContext do
 
   def project(_, _, _), do: {:error, :history_changed}
 
+  @doc false
+  def receipt_text(messages, contact)
+      when is_list(messages) and length(messages) <= @max_history do
+    with :ok <- check_contact_scope(messages, contact),
+         true <- Enum.all?(messages, &qualified?(&1, contact)),
+         true <- unique_ids?(messages) do
+      texts =
+        for row <- messages,
+            row.sender == :contact and size(row) <= @message_chars,
+            into: %{},
+            do: {row.id, row.text}
+
+      latest = List.last(messages)
+      {:ok, %{texts: texts, latest_id: if(latest, do: latest.id)}}
+    else
+      {:error, _} = denial -> denial
+      _ -> {:error, :history_changed}
+    end
+  end
+
+  def receipt_text(_, _), do: {:error, :history_changed}
+
   # Keep a definite contact denial distinct from an edit, missing input or
   # other history drift. An observation outage cannot qualify local triage.
   defp check_contact_scope(messages, contact) do

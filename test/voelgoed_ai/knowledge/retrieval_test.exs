@@ -477,9 +477,9 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
 
     on_exit(fn -> clear_query_admission(ctx.now) end)
 
-    for budget <- [%{day_cap: 1}, %{price: %{}}] do
+    for {budget, status} <- [{%{day_cap: 1}, :budget_exhausted}, {%{price: %{}}, :unavailable}] do
       fixture(Map.merge(budget, %{wire: wire, query_admission: true, clock: fn -> ctx.now end}))
-      assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
+      assert {:ok, %{status: ^status, evidence: []}} = search(ctx.claim)
       assert query_rows(ctx) == []
       assert admission_count(ctx.now) == []
     end

@@ -140,11 +140,13 @@ defmodule VoelgoedAi.Support.Ownership do
   end
 
   @doc false
-  def pending_input?(session) do
+  def pending_input?(session, except_id \\ nil) do
     where =
       session
       |> Map.take([:installation_ref, :external_account_id, :external_inbox_id, :conversation_id])
       |> Map.merge(%{kind: :input, state: :dispatched, disposition: :pending})
+
+    where = if except_id, do: Map.put(where, :id, %{not_eq: except_id}), else: where
 
     with {:ok, rows} <- store_read(InboundEvent, :pending, %{}, where, many: true, limit: 1) do
       {:ok, rows != []}
@@ -311,13 +313,15 @@ defmodule VoelgoedAi.Support.Ownership do
 
   def route_overdue_locked(_, session, _), do: {:ok, session}
 
+  @doc false
+  def route_shadow_locked(config, session, observation, now, reason \\ :explicit_handoff)
+
   if Mix.env() == :test do
-    @doc false
-    def route_shadow_locked(config, session, observation, now) do
+    def route_shadow_locked(config, session, observation, now, reason) do
       if session.state == :bot_active and not session.human_inhibit and
            shadow_evaluation_enabled?(config) and
            local_handoff_allowed?(config, session, observation) do
-        stage_handoff(config, session, now, :explicit_handoff)
+        stage_handoff(config, session, now, reason)
       else
         {:error, :scope_denied}
       end
@@ -331,17 +335,25 @@ defmodule VoelgoedAi.Support.Ownership do
     defp local_handoff_allowed?(config, session, observation),
       do: eligible_bot?(config, session, observation)
   else
-    @doc false
-    def route_shadow_locked(_, _, _, _), do: {:error, :scope_denied}
+    def route_shadow_locked(_, _, _, _, _), do: {:error, :scope_denied}
   end
 
   defp stage_handoff(config, session, now, reason) do
     with :ok <- fence(session, now, reason),
          {:ok, session} <- store_update(session, :request_handoff, next_epoch(session)),
-         {:ok, _} <- prepare(config, session, nil, :handoff_status, DateTime.add(now, 300)) do
+         {:ok, delivery} <- prepare(config, session, nil, :handoff_status, DateTime.add(now, 300)),
+         :ok <- audit_local_route(delivery, reason) do
       {:ok, session}
     end
   end
+
+  defp audit_local_route(delivery, reason)
+       when reason in [:human_requested, :admission_limited, :budget_exhausted, :idle_triage] do
+    with {:ok, _} <- VoelgoedAi.Support.SystemAudit.append(delivery, :local_handoff, reason),
+         do: :ok
+  end
+
+  defp audit_local_route(_, _), do: :ok
 
   @doc false
   def confirm_locked(%{state: :handoff_pending} = session),

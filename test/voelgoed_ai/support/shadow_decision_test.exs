@@ -114,10 +114,6 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
   for {locale, label, text, outcome, reason, approved} <- [
         {:af, "greeting", "Hallo!", "greeting", "greeting", "Hallo! Hoe kan ons jou help?"},
         {:en, "greeting", "Hello!", "greeting", "greeting", "Hello! How can we help you?"},
-        {:af, "human request", "Mens asseblief", "handoff", "human_requested",
-         "Ons ondersteuningspan kan hiermee help."},
-        {:en, "human request", "Can I speak to a human?", "handoff", "human_requested",
-         "Our support team can help with this."},
         {:af, "clarify", "Help asseblief", "clarify", "ambiguous", "Waarmee het jy hulp nodig?"},
         {:en, "clarify", "Please help", "clarify", "ambiguous", "What do you need help with?"},
         {:af, "decline", "Vertel my 'n grap", "decline", "off_topic",
@@ -151,7 +147,7 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
       assert decision.reason_code == unquote(reason)
       assert {:ok, unquote(approved)} = DecisionTemplates.render(decision, "shadow-v1")
       assert :error = DecisionTemplates.render(decision, "unknown")
-      assert Agent.get(ctx.fake, & &1.decision_reads) == 2
+      assert Agent.get(ctx.fake, & &1.decision_reads) == 3
 
       if unquote(outcome) == "handoff" do
         assert run.shadow_disposition == :local_handoff
@@ -246,11 +242,11 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
       ]
     )
 
-    assert next_turn(ctx, 1, "Human please") == id
+    assert next_turn(ctx, 1, "Please help") == id
     assert [["handoff_pending", true, _]] = session_rows(ctx)
     assert %{rows: [[delivery]]} = SupportDBCase.delivery_rows(ctx, "id::text")
     assert :ok = Deliver.perform(job("delivery_id", delivery))
-    assert Agent.get(ctx.fake, & &1.decision_reads) == 2
+    assert Agent.get(ctx.fake, & &1.decision_reads) == 4
     assert [] = SupportDBCase.writes(ctx)
   end
 
@@ -384,7 +380,7 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
 
   test "an ownership or control epoch change fences the parked claim" do
     ctx = SupportDBCase.setup(shadow: :en)
-    id = queue(ctx, "Human please")
+    id = queue(ctx, "Check my account balance")
     {task, worker} = park(ctx, id)
     SupportDBCase.disable_automation(ctx)
     assert :ok = resume(task, worker)
@@ -397,7 +393,7 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
   # shadow permission recheck stops a decision that was parked before it.
   test "a runtime adapter disable after the claim cancels the parked decision" do
     ctx = SupportDBCase.setup(shadow: :en)
-    id = queue(ctx, "Human please")
+    id = queue(ctx, "Check my account balance")
     {task, worker} = park(ctx, id)
     fixture = Application.fetch_env!(:voelgoed_ai, :support_fixture)
     Application.put_env(:voelgoed_ai, :support_fixture, %{fixture | shadow_evaluation: false})
@@ -407,11 +403,11 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
     assert [] = SupportDBCase.writes(ctx)
   end
 
-  test "a successor reuses the turn and deadline, and human request wins across the batch" do
+  test "a successor reuses the turn and deadline across the batch" do
     ctx = SupportDBCase.setup(shadow: :en)
     first = queue(ctx, "Tell me a joke")
     {task, worker} = park(ctx, first)
-    second = next_turn(ctx, 1, "Human please")
+    second = next_turn(ctx, 1, "Check my account balance")
     assert :ok = resume(task, worker)
 
     assert %{rows: [["superseded", nil, nil]]} = run_row(first)
@@ -430,7 +426,7 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
     SupportDBCase.advance_clock(ctx, 2)
     assert :ok = perform_run(second)
 
-    assert %{rows: [["completed", "no_send", %{"reason_code" => "human_requested"}]]} =
+    assert %{rows: [["completed", "no_send", %{"reason_code" => "account_specific"}]]} =
              run_row(second)
 
     assert [] = SupportDBCase.writes(ctx)
@@ -459,7 +455,7 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
       ] do
     test "a failure inserting #{table} rolls back the shadow decision and handoff" do
       ctx = SupportDBCase.setup(shadow: :en)
-      id = queue(ctx, "Human please")
+      id = queue(ctx, "Check my account balance")
       SupportDBCase.advance_clock(ctx, 2)
       table = unquote(table)
       condition = unquote(constraint)

@@ -391,6 +391,9 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
         Process.put(@manifest_key, Map.new(evidence, &{&1.citation_id, &1}))
         outcome(if(evidence == [], do: :no_evidence, else: :evidence), evidence)
       else
+        {:error, :budget_exhausted} ->
+          outcome(:budget_exhausted)
+
         {:ok, {:gap_lookup, status}} ->
           Process.put(@gap_key, status)
           outcome(status)
@@ -561,6 +564,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
                inbox == Map.take(session, @inbox_keys) and
                  inbox == Map.take(config.binding, @inbox_keys),
              true <- RunProcessing.valid_run?(config, session, run),
+             :ok <- VoelgoedAi.Governance.MisuseProtection.allowed(config, session, now),
              :ok <- qualified_mode(context, config, session, run),
              true <- run.state == :running and run.claim_generation == claim and claim > 0,
              deadline = Enum.min([run.deadline_at, run.lease_expires_at], DateTime),

@@ -23,6 +23,8 @@ defmodule VoelgoedAi.Support.WorkStore do
   @enforce_keys [:ref]
   defstruct @enforce_keys
 
+  alias VoelgoedAi.Governance.MisuseProtection
+
   @owners %{
     Support => %{
       AuditEvent => [:append_support_operator],
@@ -51,8 +53,10 @@ defmodule VoelgoedAi.Support.WorkStore do
         :verify_owner
       ]
     },
+    MisuseProtection => %{InboundEvent => [:misuse_facts, :record_misuse]},
     RunProcessing => %{
-      InboundEvent => [:record_disposition],
+      InboundEvent => [:record_disposition, :pending],
+      SupportSession => [:mark_verified_input],
       RunInput => [:cover, :release, :set_position, :for_run],
       SupportRun => [
         :active,
@@ -84,6 +88,7 @@ defmodule VoelgoedAi.Support.WorkStore do
       SupportRun => [:active]
     },
     Recovery => %{
+      SupportSession => [:idle_candidates],
       InboundEvent => [:pending],
       OutboundDelivery => [:recoverable, :safe_retry, :record_read_exhausted],
       SupportRun => [:recoverable, :recover_expired_claim, :requeue]
