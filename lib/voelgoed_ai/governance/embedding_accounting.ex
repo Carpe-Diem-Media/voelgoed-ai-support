@@ -121,12 +121,19 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
     with %{state: :reserved} <- reservation,
          %{price: expected, day_cap: day, month_cap: month} <- config,
          true <- valid_caps?(day, month),
+         {_, %{"day_cap" => admitted_day, "month_cap" => admitted_month} = quote} <-
+           attempt_quote(attempt),
+         true <- valid_caps?(admitted_day, admitted_month),
+         admitted = %{config | day_cap: admitted_day, month_cap: admitted_month},
+         true <-
+           budget_quote(attempt.provider, attempt.model_id, attempt.profile_id, admitted) ===
+             quote,
          {:ok, ceiling} <- admission_price(attempt, control, expected),
          true <- reservation.reserved_nano_usd == ceiling,
          true <-
            price(reservation) ==
              Map.merge(%{max_output_tokens: nil, output_rate_nano_usd: nil}, expected),
-         :ok <- headroom(control, now, day, month, 0) do
+         :ok <- headroom(control, now, min(day, admitted_day), min(month, admitted_month), 0) do
       :ok
     else
       _ -> {:error, :admission_denied}

@@ -889,6 +889,39 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     refute_received :wire
   end
 
+  @tag :frozen_embedding_dispatch
+  test "query wire entry retains its admitted cap after the current cap increases" do
+    origin = ~U[2034-05-01 00:00:00Z]
+    ctx = setup_search(%{}, query_clock: origin)
+    {sibling_claim, _} = create_run(SupportDBCase.next_conversation(ctx.support, 1))
+    clock = fn -> origin end
+    owner = self()
+
+    wire = fn request ->
+      send(owner, :wire)
+      EmbeddingTransport.fixture_wire(request)
+    end
+
+    fixture(%{
+      clock: clock,
+      wire: wire,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      after_dispatch: fn _ ->
+        fixture(%{clock: clock, wire: wire})
+
+        sibling = Task.async(fn -> search(sibling_claim) end)
+        assert {:ok, %{status: :evidence}} = Task.await(sibling)
+        assert query_rows(%{claim: sibling_claim}) == [["succeeded", true, "settled", 8]]
+      end
+    })
+
+    assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
+    assert_received :wire
+    refute_received :wire
+    assert query_rows(ctx) == [["unknown", true, "unknown", nil]]
+  end
+
   defp set_run_cutoff(claim, field, cutoff) do
     assert %{num_rows: 1} =
              SQL.query!(Repo, "UPDATE support_runs SET #{field} = $2 WHERE id = $1", [

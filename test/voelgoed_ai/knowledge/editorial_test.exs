@@ -954,6 +954,41 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     refute_received :wire
   end
 
+  @tag :requires_pgvector
+  @tag :embedding_index
+  @tag :frozen_embedding_dispatch
+  test "article wire entry retains its admitted cap after the current cap increases", ctx do
+    {_collection, revision} = approved(ctx)
+    clock = fn -> ~U[2034-05-01 00:00:00Z] end
+    owner = self()
+
+    wire = fn request ->
+      send(owner, :wire)
+      EmbeddingTransport.fixture_wire(request)
+    end
+
+    fixture(%{clock: clock})
+    [id, sibling] = request_index(ctx, revision)
+
+    fixture(%{
+      clock: clock,
+      wire: wire,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      after_dispatch: fn _ ->
+        fixture(%{clock: clock, wire: wire})
+        assert :ok = Embedding.index(sibling)
+        assert [["succeeded", true, "settled", 81_920, 8]] = reservation_rows(sibling)
+      end
+    })
+
+    assert :ok = Embedding.index(id)
+    assert_received :wire
+    refute_received :wire
+    assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+    assert [] == ledger_rows(id)
+  end
+
   defp set_legacy_generation_inhibit do
     assert %{rows: [[false, nil, nil]]} =
              SQL.query!(Repo, """
