@@ -352,18 +352,25 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
     assert rows(ctx) == [[1, "unknown", true, "unknown", @ceiling, nil, nil, nil]]
     assert ledger(ctx) == []
 
-    for _ <- 1..2 do
-      approved = %{wire: &response/1, closure_approved_by: ctx.support.admin.id}
+    assert {:error, %Ash.Error.Unknown{} = wrong_lane} =
+             VoelgoedAi.SupportFixtures.financial_decision(
+               InferenceRun,
+               :close_unknown_embedding,
+               %{id: id, reason: :conservative_closure},
+               ctx.support.admin
+             )
 
+    assert Exception.message(wrong_lane) =~ "embedding closure denied"
+    assert ledger(ctx) == []
+
+    for _ <- 1..2 do
       assert {:ok, %{state: :abandoned}} =
-               Generation.with_fixture(ctx.run_id, 1, approved, fn _ ->
-                 invoke(
-                   InferenceRun,
-                   :close_unknown_generation,
-                   %{id: id, reason: :conservative_closure},
-                   ctx.support.admin
-                 )
-               end)
+               VoelgoedAi.SupportFixtures.financial_decision(
+                 InferenceRun,
+                 :close_unknown_generation,
+                 %{id: id, reason: :conservative_closure},
+                 ctx.support.admin
+               )
     end
 
     assert [[settlement, "settlement", @ceiling, nil]] = ledger_identity(ctx)
@@ -386,6 +393,28 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
            ]
 
     assert SupportDBCase.writes(ctx.support) == []
+  end
+
+  @tag :generation
+  test "generation settlement wins over a later qualified close", ctx do
+    {caller, id, adapter, barrier} = park(ctx)
+    operation = :close_unknown_generation
+    args = %{id: id, reason: :conservative_closure}
+    admin = ctx.support.admin
+
+    assert {:error, _} =
+             VoelgoedAi.SupportFixtures.financial_decision(InferenceRun, operation, args, admin)
+
+    SupportDBCase.advance_clock(ctx.support, 30)
+    assert :ok = Generation.recover(id)
+    send(adapter, {:resume, barrier})
+    assert {:error, _} = Task.await(caller)
+
+    assert {:error, _} =
+             VoelgoedAi.SupportFixtures.financial_decision(InferenceRun, operation, args, admin)
+
+    assert [[_, "settlement", @actual, nil]] = ledger_identity(ctx)
+    assert [[1, "succeeded", true, "settled", @ceiling, @actual, 10, 5]] = rows(ctx)
   end
 
   @tag :generation
@@ -498,7 +527,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
                  })
              })
 
-    assert [[1, "succeeded", true, "settled", @ceiling, actual, 1_050_001, 500]] = rows(ctx)
+    assert [[1, "failed", true, "settled", @ceiling, actual, 1_050_001, 500]] = rows(ctx)
     assert actual == @ceiling + 500
 
     assert [[true]] =
@@ -634,6 +663,23 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
     assert rows(ctx) == [[1, "unknown", true, "unknown", @ceiling, nil, nil, nil]]
     assert ledger(ctx) == []
     refute_received :wire
+  end
+
+  @tag :generation
+  test "generation denies an unverified price and either exhausted cap before transport", ctx do
+    owner = self()
+
+    wire = fn req ->
+      send(owner, :wire)
+      response(req)
+    end
+
+    for config <- [%{price: %{}}, %{day_cap: @ceiling - 1}, %{month_cap: @ceiling - 1}] do
+      assert {:error, _} = generate(ctx, Map.put(config, :wire, wire))
+      assert rows(ctx) == []
+      assert ledger(ctx) == []
+      refute_received :wire
+    end
   end
 
   @tag :generation
@@ -1004,6 +1050,17 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
 
       SQL.query!(
         Repo,
+        """
+        DELETE FROM audit_events WHERE settlement_target_id IN (
+          SELECT l.id FROM usage_ledger_entries l JOIN inference_runs i ON i.id = l.inference_run_id
+          WHERE i.turn_ref = $1
+        )
+        """,
+        [id]
+      )
+
+      SQL.query!(
+        Repo,
         "DELETE FROM usage_ledger_entries WHERE inference_run_id IN (SELECT id FROM inference_runs WHERE turn_ref = $1) AND corrects_id IS NOT NULL",
         [id]
       )
@@ -1030,7 +1087,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
 
       SQL.query!(
         Repo,
-        "UPDATE automation_controls SET generation_inhibited = FALSE WHERE generation_inhibited"
+        "UPDATE automation_controls SET generation_inhibited = FALSE, generation_inhibit_occurrence = NULL"
       )
 
       {:ok, :cleaned}

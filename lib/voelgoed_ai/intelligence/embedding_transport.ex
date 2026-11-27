@@ -15,48 +15,103 @@ defmodule VoelgoedAi.Intelligence.EmbeddingTransport do
     owner = self()
     ref = make_ref()
     {key, wire} = wire(mode)
+    latch = :atomics.new(1, [])
 
     result =
-      ReqLLM.embed("openai:" <> @model, input,
-        api_key: key,
-        base_url: @base_url,
-        dimensions: Profile.dimensions(),
-        return_usage: true,
-        telemetry: [payloads: :none],
-        total_timeout: timeout,
-        req_http_options: [
-          adapter: &capture(&1, wire, owner, ref),
-          redirect: false,
-          retry: false,
-          max_retries: 0,
-          receive_timeout: timeout,
-          finch: [pool_timeout: timeout],
-          connect_options: [timeout: timeout, protocols: [:http1]]
-        ]
-      )
+      try do
+        ReqLLM.embed("openai:" <> @model, input,
+          api_key: key,
+          base_url: @base_url,
+          dimensions: Profile.dimensions(),
+          provider_options: [encoding_format: "float"],
+          return_usage: true,
+          telemetry: [payloads: :none],
+          total_timeout: timeout,
+          req_http_options: [
+            adapter: &capture(&1, wire, input, latch, owner, ref),
+            redirect: false,
+            retry: false,
+            max_retries: 0,
+            receive_timeout: timeout,
+            finch: [pool_timeout: timeout],
+            connect_options: [timeout: timeout, protocols: [:http1]]
+          ]
+        )
+      rescue
+        _ -> :invalid
+      catch
+        :exit, _ -> :invalid
+      end
 
     receive do
       {^ref, {:ok, request_id, tokens}} -> {:usage, request_id, tokens, vector(result)}
     after
       0 -> :unknown
     end
-  rescue
-    _ -> :unknown
-  catch
-    :exit, _ -> :unknown
   end
 
   defp vector({:ok, %{embedding: vector}}), do: Profile.vector(vector)
   defp vector(_), do: {:error, :invalid_vector}
 
-  defp capture(request, wire, owner, ref) do
-    case wire.(request) do
-      {request, %Req.Response{status: 200} = response} ->
-        send(owner, {ref, evidence(response)})
-        {request, response}
+  defp capture(request, wire, input, latch, owner, ref) do
+    with true <- valid_request?(request, input),
+         :ok <- :atomics.compare_exchange(latch, 1, 0, 1) do
+      case wire.(request) do
+        {request, %Req.Response{status: 200} = response} ->
+          send(owner, {ref, evidence(response)})
+          {request, response}
 
-      pair ->
-        pair
+        pair ->
+          pair
+      end
+    else
+      _ -> {request, %Req.TransportError{reason: :closed}}
+    end
+  end
+
+  defp valid_request?(
+         %Req.Request{
+           method: :post,
+           url: %{
+             scheme: "https",
+             host: "api.openai.com",
+             port: 443,
+             path: "/v1/embeddings",
+             query: nil
+           },
+           body: body
+         },
+         input
+       ),
+       do: valid_body?(body, input)
+
+  defp valid_request?(_, _), do: false
+
+  defp valid_body?(body, input) when is_map(body) do
+    valid_body_fields?(Map.new(body, fn {key, value} -> {to_string(key), value} end), input)
+  end
+
+  defp valid_body?(body, input) when is_binary(body) or is_list(body) do
+    with true <- IO.iodata_length(body) <= 200_000,
+         {:ok, decoded} <- body |> IO.iodata_to_binary() |> Jason.decode() do
+      valid_body_fields?(decoded, input)
+    else
+      _ -> false
+    end
+  end
+
+  defp valid_body?(_, _), do: false
+
+  defp valid_body_fields?(decoded, input) do
+    with true <- Profile.bounded_input?(input) do
+      decoded == %{
+        "model" => @model,
+        "input" => input,
+        "dimensions" => Profile.dimensions(),
+        "encoding_format" => "float"
+      }
+    else
+      _ -> false
     end
   end
 
@@ -75,7 +130,7 @@ defmodule VoelgoedAi.Intelligence.EmbeddingTransport do
   end
 
   defp decode(body) when is_map(body), do: {:ok, body}
-  defp decode(body) when is_binary(body), do: Jason.decode(body)
+  defp decode(body) when is_binary(body) and byte_size(body) <= 131_072, do: Jason.decode(body)
   defp decode(_), do: :error
 
   if Mix.env() == :test do

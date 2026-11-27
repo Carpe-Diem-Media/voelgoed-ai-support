@@ -1183,9 +1183,9 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
         assert query_rows(ctx) == [["rejected", false, "released", nil]]
         refute_received :wire
       else
-        assert {:ok, %{status: :no_evidence, evidence: []}} = search(ctx.claim)
-        assert query_rows(ctx) == [["succeeded", true, "settled", 8]]
-        assert_received :wire
+        assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
+        assert query_rows(ctx) == [["unknown", true, "unknown", nil]]
+        refute_received :wire
       end
     end
   end
@@ -1277,17 +1277,91 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     args = %{id: id, reason: :conservative_closure}
 
     assert {:error, _} = invoke(InferenceRun, :close_unknown_embedding, args, ctx.knowledge.admin)
-    fixture(%{closure_approved_by: ctx.knowledge.admin.id})
 
     assert {:error, _} =
              invoke(InferenceRun, :close_unknown_embedding, args, ctx.knowledge.reviewer)
 
     for _ <- 1..2 do
       assert {:ok, %{state: :abandoned}} =
-               invoke(InferenceRun, :close_unknown_embedding, args, ctx.knowledge.admin)
+               VoelgoedAi.SupportFixtures.financial_decision(
+                 InferenceRun,
+                 :close_unknown_embedding,
+                 args,
+                 ctx.knowledge.admin
+               )
     end
 
     assert query_rows(ctx) == [["abandoned", true, "conservatively_settled", 81_920]]
+  end
+
+  for order <- [:closure_first, :settlement_first] do
+    @tag closure_order: order
+    test "query accounting serializes #{order} without rank or duplicate charge", tags do
+      ctx = setup_search()
+      owner = self()
+      barrier = make_ref()
+      {:ok, clock} = Agent.start_link(fn -> ctx.now end)
+
+      fixture(%{
+        clock: fn -> Agent.get(clock, & &1) end,
+        wire: parking_wire(owner, barrier, &wire_result(&1, :correlated_usage))
+      })
+
+      worker =
+        on_connection(fn ->
+          Retrieval.with_rank_measurement(fn _, _, _ -> send(owner, :query_ranked) end, fn ->
+            search(ctx.claim)
+          end)
+        end)
+
+      assert_receive {:embedding_parked, ^barrier, adapter}, 5_000
+      Agent.update(clock, fn _ -> DateTime.add(ctx.now, 35, :day) end)
+      assert :ok = Embedding.sweep()
+
+      %{rows: [[id]]} =
+        SQL.query!(Repo, "SELECT id::text FROM inference_runs WHERE support_run_id = $1", [
+          uuid(ctx.claim.run_id)
+        ])
+
+      close = fn ->
+        VoelgoedAi.SupportFixtures.financial_decision(
+          InferenceRun,
+          :close_unknown_embedding,
+          %{id: id, reason: :conservative_closure},
+          ctx.knowledge.admin
+        )
+      end
+
+      if tags.closure_order == :closure_first do
+        assert {:ok, %{state: :abandoned}} = close.()
+      end
+
+      send(adapter, {:complete_embedding, barrier})
+      assert {:ok, %{status: :unavailable}} = Task.await(worker, 5_000)
+      refute_received :query_ranked
+
+      if tags.closure_order == :settlement_first do
+        assert {:error, _} = close.()
+        assert [["succeeded", true, "settled", 18]] = query_rows(ctx)
+      else
+        assert [
+                 ["abandoned", true, "conservatively_settled", 81_920],
+                 ["abandoned", true, "conservatively_settled", -81_902]
+               ] = query_rows(ctx)
+      end
+
+      assert %{rows: [[18, count]]} =
+               SQL.query!(
+                 Repo,
+                 """
+                 SELECT sum(amount_nano_usd)::bigint, count(*) FROM usage_ledger_entries
+                 WHERE inference_run_id = $1
+                 """,
+                 [uuid(id)]
+               )
+
+      assert count == if(tags.closure_order == :closure_first, do: 2, else: 1)
+    end
   end
 
   for state <- [:running, :unknown] do

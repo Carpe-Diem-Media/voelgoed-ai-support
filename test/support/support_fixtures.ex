@@ -53,6 +53,28 @@ defmodule VoelgoedAi.SupportFixtures do
     |> Ash.run_action()
   end
 
+  def financial_decision(resource, operation, args, actor) do
+    target = Map.get_lazy(args, :id, fn -> {args.lane, args.occurrence} end)
+
+    VoelgoedAi.Governance.FinancialControl.with_decision(operation, actor.id, target, fn ->
+      invoke(resource, operation, args, actor)
+    end)
+  end
+
+  def reject_financial_audit(event, work)
+      when event in [:close_unknown_inference, :reset_embedding_inhibit] do
+    SQL.query!(Repo, """
+    ALTER TABLE audit_events ADD CONSTRAINT reject_financial_audit
+    CHECK (event <> '#{event}') NOT VALID
+    """)
+
+    try do
+      work.()
+    after
+      SQL.query!(Repo, "ALTER TABLE audit_events DROP CONSTRAINT reject_financial_audit")
+    end
+  end
+
   def create(session, slug) do
     assert {:ok, assistant} =
              invoke(

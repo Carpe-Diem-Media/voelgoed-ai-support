@@ -22,6 +22,8 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
   ]
   @audit_actions [
     append: :create,
+    append_financial: :create,
+    financial_closure: :read,
     append_knowledge: :create,
     append_publication_failure: :create,
     append_publication_transition: :create,
@@ -78,6 +80,10 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
             %VoelgoedAi.Knowledge.Storage{
               ref: make_ref(),
               owner: VoelgoedAi.Knowledge.Publication
+            },
+            %VoelgoedAi.Knowledge.Storage{
+              ref: make_ref(),
+              owner: VoelgoedAi.Governance.FinancialControl
             },
             %VoelgoedAi.Support.WorkStore{ref: make_ref()},
             %Scope{action: wrong_action, target: context.target.id},
@@ -153,6 +159,22 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
       correlation_id: Ash.UUIDv7.generate()
     }
   end
+
+  defp arguments(:append_financial, %{session: session}) do
+    %{
+      actor_kind: :staff,
+      actor_staff_id: session.id,
+      target_kind: :usage_settlement,
+      settlement_target_id: Ash.UUIDv7.generate(),
+      event: :close_unknown_inference,
+      reason_code: :local_admin,
+      operational_before: %{status: :unknown},
+      operational_after: %{status: :abandoned},
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:financial_closure, _), do: %{settlement_id: Ash.UUIDv7.generate()}
 
   defp arguments(:append_support_operator, %{session: session}) do
     %{

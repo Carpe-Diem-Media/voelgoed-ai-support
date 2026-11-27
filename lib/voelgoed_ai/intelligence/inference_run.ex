@@ -6,7 +6,7 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
     data_layer: AshPostgres.DataLayer,
     authorizers: [Ash.Policy.Authorizer]
 
-  alias VoelgoedAi.Intelligence.Embedding
+  alias VoelgoedAi.Governance.FinancialControl
   alias VoelgoedAi.Knowledge.Storage
 
   postgres do
@@ -61,6 +61,15 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
     end
 
     check_constraints do
+      check_constraint(:overflow_evidence, "inference_runs_overflow_shape",
+        check: """
+        (overflow_evidence IS NULL AND overflow_resolved_at IS NULL)
+        OR (overflow_evidence IS NOT NULL AND dispatched_at IS NOT NULL
+          AND (overflow_resolved_at IS NULL AND state IN ('unknown', 'abandoned')
+            OR overflow_resolved_at IS NOT NULL AND state IN ('succeeded', 'failed', 'abandoned')))
+        """
+      )
+
       check_constraint(:state, "inference_runs_shape",
         check: """
         ((purpose = 'article_embedding' AND article_embedding_id IS NOT NULL
@@ -154,6 +163,21 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
       ]
     )
 
+    attribute(:overflow_evidence, :map,
+      sensitive?: true,
+      constraints: [
+        fields: [
+          provider_request_id: [type: :string, allow_nil?: false, constraints: [max_length: 128]],
+          provider_response_id: [type: :string, constraints: [max_length: 128]],
+          input_tokens: [type: :integer, allow_nil?: false, constraints: [min: 1]],
+          output_tokens: [type: :integer, constraints: [min: 0]],
+          duration_us: [type: :integer, constraints: [min: 0]]
+        ]
+      ]
+    )
+
+    attribute(:overflow_resolved_at, :utc_datetime_usec)
+
     attribute(:correlation_id, :uuid, allow_nil?: false)
     create_timestamp(:inserted_at)
     update_timestamp(:updated_at)
@@ -174,7 +198,7 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
     action :close_unknown_embedding, :map do
       argument(:id, :uuid, allow_nil?: false)
       argument(:reason, :atom, allow_nil?: false, constraints: [one_of: [:conservative_closure]])
-      run(Embedding)
+      run(VoelgoedAi.Intelligence.Embedding)
     end
 
     action :close_unknown_generation, :map do
@@ -287,6 +311,8 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
         :output_tokens,
         :duration_us,
         :input_tokens,
+        :overflow_evidence,
+        :overflow_resolved_at,
         :reason_code
       ])
     end
@@ -294,11 +320,11 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
 
   policies do
     policy action(:close_unknown_embedding) do
-      authorize_if(Embedding)
+      authorize_if(FinancialControl)
     end
 
     policy action(:close_unknown_generation) do
-      authorize_if(Embedding)
+      authorize_if(FinancialControl)
     end
 
     policy action([

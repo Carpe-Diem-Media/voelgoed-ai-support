@@ -5,7 +5,7 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
   each current cap, whatever its origin. Settlement always uses its origin dates.
   """
   alias Ecto.Adapters.SQL
-  alias VoelgoedAi.Governance.{SpendWindow, UsageLedger, UsageReservation}
+  alias VoelgoedAi.Governance.{AuditEvent, SpendWindow, UsageLedger, UsageReservation}
   alias VoelgoedAi.Intelligence.{Embedding, Generation}
   alias VoelgoedAi.Knowledge.Storage
   alias VoelgoedAi.Repo
@@ -117,6 +117,109 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
   def reserve(_, _, _, _, _), do: {:error, :invalid_budget}
 
   @doc false
+  def validate_dispatch(attempt, control, reservation, now, config) do
+    with %{state: :reserved} <- reservation,
+         %{price: expected, day_cap: day, month_cap: month} <- config,
+         true <- valid_caps?(day, month),
+         {:ok, ceiling} <- admission_price(attempt, control, expected),
+         true <- reservation.reserved_nano_usd == ceiling,
+         true <-
+           price(reservation) ==
+             Map.merge(%{max_output_tokens: nil, output_rate_nano_usd: nil}, expected),
+         :ok <- headroom(now, day, month, 0) do
+      :ok
+    else
+      _ -> {:error, :admission_denied}
+    end
+  end
+
+  @doc false
+  def reset_headroom(lane, now, %{price: price, day_cap: day, month_cap: month}) do
+    purpose = if lane == :generation, do: :generate, else: :article_embedding
+    control = %{generation_inhibited: false, embedding_inhibited: false}
+
+    with true <- valid_caps?(day, month),
+         {:ok, ceiling} <- admission_price(%{purpose: purpose}, control, price),
+         {:ok, %{rows: [[false]]}} <-
+           SQL.query(
+             Repo,
+             """
+             SELECT EXISTS (
+               SELECT 1 FROM inference_runs i JOIN usage_reservations r ON r.inference_run_id = i.id
+               WHERE (i.purpose = 'generate') = $1
+               AND (r.state = 'unknown' OR (r.state = 'reserved' AND i.dispatched_at IS NOT NULL))
+             )
+             """,
+             [lane == :generation]
+           ) do
+      headroom(now, day, month, ceiling)
+    else
+      _ -> {:error, :unresolved_exposure}
+    end
+  end
+
+  defp valid_caps?(day, month),
+    do:
+      is_integer(day) and day in 1..@max_bigint and is_integer(month) and month in 1..@max_bigint
+
+  defp headroom(now, day_cap, month_cap, additional) do
+    %{day_window: day, month_window: month} = dates(now)
+
+    with {:ok, risk} <- exposure(),
+         {:ok, daily} <- projected(:day, day, 0),
+         {:ok, monthly} <- projected(:month, month, 0),
+         true <- daily + risk + additional <= day_cap and monthly + risk + additional <= month_cap do
+      :ok
+    else
+      _ -> {:error, :budget_exhausted}
+    end
+  end
+
+  @doc false
+  def overflow_matches?(%{overflow_evidence: nil}, _usage), do: true
+
+  def overflow_matches?(attempt, usage) do
+    attempt
+    |> recorded_usage()
+    |> Map.delete(:duration_us)
+    |> Kernel.==(usage |> overflow_evidence() |> Map.delete(:duration_us))
+  end
+
+  @doc false
+  def overflow_evidence(usage) do
+    usage
+    |> Map.take([
+      :provider_request_id,
+      :provider_response_id,
+      :input_tokens,
+      :output_tokens,
+      :duration_us
+    ])
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  @doc false
+  def recorded_usage(%{overflow_evidence: nil}), do: nil
+
+  def recorded_usage(attempt) do
+    keys = [
+      :provider_request_id,
+      :provider_response_id,
+      :input_tokens,
+      :output_tokens,
+      :duration_us
+    ]
+
+    for key <- keys,
+        value =
+          Map.get(attempt.overflow_evidence, key) ||
+            Map.get(attempt.overflow_evidence, Atom.to_string(key)),
+        not is_nil(value),
+        into: %{},
+        do: {key, value}
+  end
+
+  @doc false
   def lock_reservation(capability, attempt) do
     with :ok <- authorize(capability, attempt, :lock_reservation),
          {:ok, %UsageReservation{} = reservation} <-
@@ -201,11 +304,12 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
 
   defp settle(
          control,
-         attempt,
+         %{state: :unknown, dispatched_at: %DateTime{}} = attempt,
          %{state: :unknown} = reservation,
          now,
          {:conservative_closure, staff_id}
-       ) do
+       )
+       when reservation.reason_code != :amount_overflow or not is_nil(attempt.overflow_evidence) do
     entry = %{
       entry_kind: :settlement,
       entry_key: "settlement",
@@ -215,6 +319,24 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
     }
 
     record(control, attempt, reservation, now, entry, :conservatively_settled, false)
+  end
+
+  defp settle(
+         _control,
+         %{state: :abandoned, dispatched_at: %DateTime{}},
+         %{state: :conservatively_settled} = reservation,
+         _now,
+         {:conservative_closure, staff_id}
+       ) do
+    with {:ok, history} <- read(UsageLedger, :for_reservation, %{id: reservation.id}),
+         %{id: id, closure_approved_by_id: ^staff_id} <-
+           Enum.find(history, &(&1.entry_kind == :settlement)),
+         {:ok, %{actor_staff_id: ^staff_id}} <-
+           query(AuditEvent, :financial_closure, %{settlement_id: id}, &Ash.read_one/1, false) do
+      {:ok, :conservative_closure}
+    else
+      _ -> {:error, :conflicting_decision}
+    end
   end
 
   defp settle(
@@ -261,7 +383,7 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
       end
     else
       {:error, :amount_overflow} ->
-        with {:ok, _} <- inhibit(control, attempt), do: {:ok, :amount_overflow}
+        inhibit_and_hold(control, attempt, reservation, now)
 
       error ->
         error
@@ -276,18 +398,50 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
     # windows only once all earlier-tier writes have succeeded.
     with {:ok, day} <- projected(:day, reservation.day_window, entry.amount_nano_usd),
          {:ok, month} <- projected(:month, reservation.month_window, entry.amount_nano_usd),
-         {:ok, _} <- append(attempt, reservation, entry),
+         {:ok, ledger} <- append(attempt, reservation, entry),
          {:ok, _} <- update_reservation(reservation, entry, terminal, now),
          :ok <- maybe_inhibit(control, attempt, discrepancy?),
          {:ok, windows} <- lock_windows(reservation),
          {:ok, _} <- change(windows.day, %{settled_nano_usd: day}),
-         {:ok, _} <- change(windows.month, %{settled_nano_usd: month}) do
+         {:ok, _} <- change(windows.month, %{settled_nano_usd: month}),
+         :ok <- audit_closure(attempt, ledger, entry, now) do
       {:ok, entry.reason_code}
     else
-      {:error, :amount_overflow} -> inhibit_and_hold(control, attempt, reservation, now)
-      error -> error
+      {:error, :amount_overflow} when entry.reason_code == :conservative_closure ->
+        with {:ok, _} <- inhibit(control, attempt), do: {:ok, :amount_overflow}
+
+      {:error, :amount_overflow} ->
+        inhibit_and_hold(control, attempt, reservation, now)
+
+      error ->
+        error
     end
   end
+
+  defp audit_closure(attempt, ledger, %{reason_code: :conservative_closure} = entry, now) do
+    attrs = %{
+      actor_kind: :staff,
+      actor_staff_id: entry.closure_approved_by_id,
+      target_kind: :usage_settlement,
+      settlement_target_id: ledger.id,
+      event: :close_unknown_inference,
+      reason_code: :local_admin,
+      operational_before: %{status: :unknown},
+      operational_after: %{status: :abandoned},
+      correlation_id: attempt.correlation_id,
+      occurred_at: now
+    }
+
+    with {:ok, _} <-
+           storage(
+             AuditEvent,
+             :append_financial,
+             &Ash.create(AuditEvent, attrs, action: :append_financial, actor: &1)
+           ),
+         do: :ok
+  end
+
+  defp audit_closure(_, _, _, _), do: :ok
 
   defp projected(kind, start, amount) do
     with {:ok, row} <-
@@ -308,6 +462,9 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
   end
 
   defp update_reservation(reservation, _entry, _terminal, _now), do: {:ok, reservation}
+
+  defp inhibit_and_hold(_control, %{overflow_evidence: evidence}, _reservation, _now)
+       when not is_nil(evidence), do: {:ok, :amount_overflow}
 
   defp inhibit_and_hold(control, attempt, reservation, now) do
     with {:ok, _} <- inhibit(control, attempt) do
@@ -362,17 +519,27 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
 
   defp exposure do
     case SQL.query(Repo, """
-         SELECT COALESCE(sum(reserved_nano_usd::numeric), 0)::text
-         FROM usage_reservations WHERE state IN ('reserved', 'unknown')
+         SELECT COALESCE(sum(r.reserved_nano_usd::numeric)
+           FILTER (WHERE r.state IN ('reserved', 'unknown')), 0)::text,
+           COALESCE(bool_or(i.overflow_evidence IS NOT NULL AND i.overflow_resolved_at IS NULL
+             OR r.state = 'unknown' AND r.reason_code = 'amount_overflow'), false)
+         FROM usage_reservations r JOIN inference_runs i ON i.id = r.inference_run_id
          """) do
-      {:ok, %{rows: [[total]]}} -> {:ok, String.to_integer(total)}
+      {:ok, %{rows: [[total, false]]}} -> {:ok, String.to_integer(total)}
+      {:ok, %{rows: [[_, true]]}} -> {:error, :amount_overflow}
       {:error, _} -> {:error, :accounting_storage}
     end
   end
 
   defp price(row) do
     row
-    |> Map.take([:rate_nano_usd, :token_unit, :max_input_tokens, :output_rate_nano_usd])
+    |> Map.take([
+      :rate_nano_usd,
+      :token_unit,
+      :max_input_tokens,
+      :max_output_tokens,
+      :output_rate_nano_usd
+    ])
     |> Map.put(:version, row.price_version)
   end
 

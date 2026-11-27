@@ -83,7 +83,13 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   @system_events [:delivery_unknown, :missed_deadline, :handoff_failed]
   @system_target_kinds [:inbound_event, :support_run, :outbound_delivery]
   @system_reason_sql Enum.map_join(ReasonCode.values(), ",", &"'#{&1}'")
+  @financial_events [
+    :close_unknown_inference,
+    :reset_embedding_inhibit,
+    :reset_generation_inhibit
+  ]
   @operational_fields [
+    inhibited: [type: :boolean],
     ownership_epoch: [type: :integer, constraints: [min: 0]],
     status: [
       type: :atom,
@@ -168,6 +174,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     repo(VoelgoedAi.Repo)
 
     references do
+      reference(:settlement_target, on_delete: :restrict, on_update: :restrict)
       reference(:target, on_delete: :restrict, on_update: :restrict)
       reference(:actor_staff, on_delete: :restrict, on_update: :restrict)
       reference(:assistant_target, on_delete: :restrict, on_update: :restrict)
@@ -194,7 +201,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
 
       check_constraint(:target_kind, "audit_events_exact_target",
         check: """
-          num_nonnulls(target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id, session_target_id, delivery_target_id, event_target_id, run_target_id, knowledge_collection_target_id, article_target_id, article_revision_target_id) = 1
+          num_nonnulls(settlement_target_id, target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id, session_target_id, delivery_target_id, event_target_id, run_target_id, knowledge_collection_target_id, article_target_id, article_revision_target_id) = 1
           AND (
             (target_kind = 'staff_user' AND target_id IS NOT NULL
               AND event IN ('provisioned','activated','signed_in','roles_changed','disabled','reactivated','retired')
@@ -206,7 +213,9 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             OR (target_kind = 'inbox_binding' AND binding_target_id IS NOT NULL
               AND event IN ('create_draft','enable','disable','rebind','change_mode','retire'))
             OR (target_kind = 'automation_control' AND control_target_id IS NOT NULL
-              AND event IN ('enable_automation','disable_automation'))
+              AND event IN ('enable_automation','disable_automation','reset_embedding_inhibit','reset_generation_inhibit'))
+            OR (target_kind = 'usage_settlement' AND settlement_target_id IS NOT NULL
+              AND event = 'close_unknown_inference' AND reason_code = 'local_admin')
             OR (target_kind = 'knowledge_collection' AND knowledge_collection_target_id IS NOT NULL
               AND event IN ('create','enable','disable','retire') AND reason_code = 'local_admin')
             OR (target_kind = 'knowledge_article' AND article_target_id IS NOT NULL
@@ -287,6 +296,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       constraints: [
         one_of: [
           :staff_user,
+          :usage_settlement,
           :support_session | @system_target_kinds ++ @target_kinds ++ @knowledge_targets
         ]
       ]
@@ -299,7 +309,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           :request_index_rollback
           | @publication_events ++
               @staff_events ++
-              @operational_events ++ @support_events ++ @system_events ++ @knowledge_events
+              @operational_events ++
+              @support_events ++ @system_events ++ @knowledge_events ++ @financial_events
         ]
       ]
     )
@@ -332,6 +343,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   end
 
   relationships do
+    belongs_to(:settlement_target, VoelgoedAi.Governance.UsageLedger)
     belongs_to(:target, StaffUser)
     belongs_to(:assistant_target, VoelgoedAi.Intelligence.Assistant)
     belongs_to(:revision_target, VoelgoedAi.Intelligence.AssistantRevision)
@@ -347,7 +359,43 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     belongs_to(:actor_staff, StaffUser)
   end
 
+  identities do
+    identity(:settlement_audit, [:settlement_target_id])
+  end
+
   actions do
+    create :append_financial do
+      description("Write the TEST financial decision in the same transaction as its disposition.")
+      transaction?(false)
+
+      accept([
+        :actor_kind,
+        :actor_staff_id,
+        :target_kind,
+        :settlement_target_id,
+        :control_target_id,
+        :event,
+        :reason_code,
+        :operational_before,
+        :operational_after,
+        :correlation_id,
+        :occurred_at
+      ])
+
+      validate(attribute_equals(:actor_kind, :staff))
+      validate(attribute_equals(:reason_code, :local_admin))
+      validate(attribute_in(:event, @financial_events))
+      validate(present([:operational_before, :operational_after]))
+    end
+
+    read :financial_closure do
+      argument(:settlement_id, :uuid, allow_nil?: false)
+
+      filter(
+        expr(settlement_target_id == ^arg(:settlement_id) and event == :close_unknown_inference)
+      )
+    end
+
     create :append do
       transaction?(false)
 
@@ -608,6 +656,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   end
 
   policies do
+    policy action([:append_financial, :financial_closure]) do
+      authorize_if(Storage)
+    end
+
     policy action([
              :append_publication_failure,
              :append_publication_transition,

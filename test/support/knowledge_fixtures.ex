@@ -18,8 +18,11 @@ defmodule VoelgoedAi.KnowledgeFixtures do
 
     original_inhibit =
       if tags[:embedding_index] do
-        %{rows: [[value]]} =
-          SQL.query!(Repo, "SELECT embedding_inhibited FROM automation_controls")
+        %{rows: [value]} =
+          SQL.query!(
+            Repo,
+            "SELECT embedding_inhibited, embedding_inhibit_occurrence FROM automation_controls"
+          )
 
         value
       end
@@ -156,7 +159,11 @@ defmodule VoelgoedAi.KnowledgeFixtures do
     SQL.query!(Repo, "DELETE FROM inference_runs WHERE id IN (#{attempt})", params)
     SQL.query!(Repo, "DELETE FROM article_embeddings WHERE id IN (#{embedding})", params)
 
-    SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = $1", [original_inhibit])
+    SQL.query!(
+      Repo,
+      "UPDATE automation_controls SET embedding_inhibited = $1, embedding_inhibit_occurrence = $2",
+      original_inhibit
+    )
   end
 
   def cleanup_query_attempts(run_id) do
@@ -167,6 +174,16 @@ defmodule VoelgoedAi.KnowledgeFixtures do
   end
 
   defp delete_accounting_fixture(attempt, params) do
+    SQL.query!(
+      Repo,
+      """
+      DELETE FROM audit_events WHERE settlement_target_id IN (
+        SELECT id FROM usage_ledger_entries WHERE inference_run_id IN (#{attempt})
+      )
+      """,
+      params
+    )
+
     SQL.query!(
       Repo,
       """

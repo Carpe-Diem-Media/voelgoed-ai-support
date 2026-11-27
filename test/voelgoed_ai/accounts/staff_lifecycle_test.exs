@@ -69,6 +69,7 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
     assert Ash.Resource.Info.actions(AuditEvent) |> Enum.map(& &1.name) |> Enum.sort() ==
              [
                :append,
+               :append_financial,
                :append_knowledge,
                :append_operational,
                :append_publication_failure,
@@ -76,6 +77,7 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
                :append_rollback_request,
                :append_support_operator,
                :append_system,
+               :financial_closure,
                :knowledge_history,
                :knowledge_rows,
                :operational_history,

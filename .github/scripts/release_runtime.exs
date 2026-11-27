@@ -25,6 +25,9 @@ for {module, function, arity} <- [
       {Retrieval, :sort_fixture_ranks, 1},
       {Generation, :with_fixture, 4},
       {Generation, :propose, 5},
+      {Generation, :fixture_budget, 1},
+      {Embedding, :fixture_budget, 0},
+      {VoelgoedAi.Governance.FinancialControl, :with_decision, 4},
       {RunProcessing, :claim_evidence_fixture, 1},
       {RunProcessing, :complete_evidence_fixture, 3},
       {Publication, :record_fixture_evaluation, 2},
@@ -84,7 +87,7 @@ attempt = %{
 }
 
 adapter =
-  GenerationTransport.options(attempt, {owner, ref}, wire, 1_000, fn ->
+  GenerationTransport.options(attempt, {owner, ref}, wire, args.text, 1_000, fn ->
     {:ok, attempt.deadline_at}
   end)[:adapter]
 

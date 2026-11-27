@@ -8,11 +8,8 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   """
 
   use Ash.Resource.Actions.Implementation
-  use Ash.Policy.SimpleCheck
 
-  alias VoelgoedAi.Accounts.StaffAccess
-  alias VoelgoedAi.Accounts.StaffAccess.Session
-  alias VoelgoedAi.Governance.{AuditEvent, EmbeddingAccounting, UsageReservation}
+  alias VoelgoedAi.Governance.{AuditEvent, EmbeddingAccounting}
   alias VoelgoedAi.Intelligence.{EmbeddingProfile, EmbeddingTransport, Generation, InferenceRun}
 
   alias VoelgoedAi.Knowledge.{
@@ -31,70 +28,63 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   @indexing_seconds 60
   @timeout_ms 5_000
 
-  @impl Ash.Policy.Check
-  def describe(_opts), do: "a staff session presented for scoped financial closure"
+  if Mix.env() == :test do
+    alias VoelgoedAi.Governance.FinancialControl
 
-  @impl Ash.Policy.SimpleCheck
-  def match?(%Session{}, %{subject: %Ash.ActionInput{}}, _opts), do: true
-  def match?(_, _, _), do: false
-
-  @impl Ash.Resource.Actions.Implementation
-  def run(%{arguments: %{id: id, reason: :conservative_closure}}, _opts, %{actor: session}) do
-    with_fixture_settings(fn _settings ->
-      StaffAccess.with_current(session, :admin, fn staff ->
-        with true <- Enum.any?(approved_closers(), &(&1 == staff.id)),
-             {:ok, control} <- Configuration.lock_control(),
-             {:ok, candidate} <- get(InferenceRun, id),
+    @impl Ash.Resource.Actions.Implementation
+    def run(%{arguments: %{id: id, reason: :conservative_closure}} = input, _opts, %{
+          actor: session
+        }) do
+      FinancialControl.with_authority(input, session, fn control, staff_id ->
+        with {:ok, candidate} <- get(InferenceRun, id),
              {:ok, _context, attempt} <- lock_recovery(candidate, nil),
              {:ok, reservation} <- reservation(attempt) do
-          close_unknown(control, attempt, reservation, staff.id)
-        else
-          false -> {:error, :denied}
-          error -> error
+          close_unknown(control, attempt, reservation, staff_id)
         end
       end)
-    end)
-    |> case do
-      {:ok, value} -> {:ok, value}
-      {:error, _} -> {:error, "embedding closure denied"}
-    end
-  end
-
-  defp close_unknown(control, %{state: :unknown} = attempt, reservation, staff_id) do
-    closed_at = now()
-
-    with {:ok, settlement} <-
-           account(attempt, :finish, fn ref ->
-             EmbeddingAccounting.finish(
-               ref,
-               control,
-               attempt,
-               reservation,
-               closed_at,
-               {:conservative_closure, staff_id}
-             )
-           end) do
-      case settlement do
-        :amount_overflow ->
-          {:ok, %{id: attempt.id, state: :unknown}}
-
-        :conservative_closure ->
-          with {:ok, _} <-
-                 change(attempt, %{
-                   state: :abandoned,
-                   finished_at: closed_at,
-                   reason_code: :conservative_closure
-                 }) do
-            {:ok, %{id: attempt.id, state: :abandoned}}
-          end
+      |> case do
+        {:ok, value} -> {:ok, value}
+        {:error, _} -> {:error, "embedding closure denied"}
       end
     end
+
+    defp close_unknown(control, attempt, reservation, staff_id) do
+      closed_at = now()
+
+      with {:ok, settlement} <-
+             account(attempt, :finish, fn ref ->
+               EmbeddingAccounting.finish(
+                 ref,
+                 control,
+                 attempt,
+                 reservation,
+                 closed_at,
+                 {:conservative_closure, staff_id}
+               )
+             end) do
+        case settlement do
+          :amount_overflow ->
+            {:ok, %{id: attempt.id, state: :unknown}}
+
+          :conservative_closure when attempt.state == :abandoned ->
+            {:ok, %{id: attempt.id, state: :abandoned}}
+
+          :conservative_closure ->
+            with {:ok, _} <-
+                   change(attempt, %{
+                     state: :abandoned,
+                     finished_at: closed_at,
+                     reason_code: :conservative_closure
+                   }) do
+              {:ok, %{id: attempt.id, state: :abandoned}}
+            end
+        end
+      end
+    end
+  else
+    @impl Ash.Resource.Actions.Implementation
+    def run(_, _, _), do: {:error, "embedding closure denied"}
   end
-
-  defp close_unknown(_control, %{state: :abandoned} = attempt, _reservation, _staff_id),
-    do: {:ok, %{id: attempt.id, state: :abandoned}}
-
-  defp close_unknown(_, _, _, _), do: {:error, :invalid_settlement}
 
   @doc false
   def publication_deadline(content) do
@@ -114,14 +104,22 @@ defmodule VoelgoedAi.Intelligence.Embedding do
          {:ok, %{id: attempt_id, dispatch_fence: fence} = attempt} <- claim(id) do
       hook(:after_claim, attempt)
 
-      with {:ok, input, transport} <- consume(fn -> dispatch(id, attempt_id, fence) end) do
-        hook(:after_dispatch, attempt)
-        outcome = invoke(input, transport, attempt)
+      with {:ok, input, transport, dispatched} <-
+             consume(fn -> dispatch(id, attempt_id, fence) end) do
+        hook(:after_dispatch, dispatched)
+        outcome = invoke(input, transport, dispatched)
         hook(:before_settlement, attempt)
         result(finish(id, attempt_id, fence, outcome))
       else
         {:error, reason}
-        when reason in [:deadline, :stale_request, :embedding_inhibited, :disabled] ->
+        when reason in [
+               :deadline,
+               :stale_request,
+               :embedding_inhibited,
+               :disabled,
+               :admission_denied,
+               :invalid_price
+             ] ->
           result(reject_before_dispatch(id, attempt_id, fence, reason))
 
         other ->
@@ -181,6 +179,15 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     end
   end
 
+  @doc "Reapply previously captured query usage to its original financial windows."
+  def recover_query(id) do
+    Repo.transact(fn -> get(InferenceRun, id) end)
+    |> case do
+      {:ok, %{purpose: :query_embedding} = attempt} -> recover_by_purpose(attempt)
+      _ -> {:error, :indexing_storage}
+    end
+  end
+
   defp recover_by_purpose(%{purpose: :article_embedding} = attempt),
     do: recover(attempt.article_embedding_id)
 
@@ -191,6 +198,9 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       now = now()
 
       cond do
+        current.overflow_evidence && is_nil(current.overflow_resolved_at) ->
+          replay_embedding(control, nil, current, reservation, now)
+
         current.state != :running or DateTime.compare(now, current.deadline_at) == :lt ->
           {:ok, :noop}
 
@@ -212,6 +222,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
 
     def query(ref, input, qualify) do
       with false <- Repo.in_transaction?(),
+           true <- EmbeddingProfile.bounded_input?(input),
            {:ok, mode} <- Retrieval.authorize_query(ref),
            {:ok, attempt} when is_struct(attempt, InferenceRun) <-
              qualify.(fn control, run, deadline ->
@@ -272,7 +283,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
 
     defp known_query_lineage?(%{state: state}), do: state in [:succeeded, :failed, :rejected]
 
-    defp query_transport(:shadow, {:fixture, wire}, qualify, dispatched) do
+    defp query_transport(_mode, {:fixture, wire} = transport, qualify, dispatched) do
       latch = :atomics.new(1, [])
 
       {:query_fixture,
@@ -289,8 +300,16 @@ defmodule VoelgoedAi.Intelligence.Embedding do
                        true <- attempt.claim_generation == run.claim_generation,
                        true <- attempt.profile_id == EmbeddingProfile.id(),
                        :ok <- allowed(control),
-                       {:ok, _} <- gate(),
-                       {:ok, %{state: :reserved}} <- reservation(attempt) do
+                       {:ok, %{transport: ^transport} = config} <- gate(),
+                       {:ok, hold} <- reservation(attempt),
+                       :ok <-
+                         EmbeddingAccounting.validate_dispatch(
+                           attempt,
+                           control,
+                           hold,
+                           now(),
+                           config
+                         ) do
                     {:ok, cutoff}
                   else
                     _ -> {:error, :stale_request}
@@ -312,8 +331,6 @@ defmodule VoelgoedAi.Intelligence.Embedding do
          end
        end}
     end
-
-    defp query_transport(_, transport, _, _), do: transport
 
     defp claim_query(control, run, deadline) do
       now = now()
@@ -373,7 +390,8 @@ defmodule VoelgoedAi.Intelligence.Embedding do
            true <- DateTime.compare(now(), attempt.deadline_at) == :lt,
            :ok <- allowed(control),
            {:ok, config} <- gate(),
-           {:ok, %{state: :reserved}} <- reservation(attempt),
+           {:ok, hold} <- reservation(attempt),
+           :ok <- EmbeddingAccounting.validate_dispatch(attempt, control, hold, now(), config),
            true <- DateTime.before?(now(), attempt.deadline_at),
            {:ok, dispatched} <- change(attempt, %{dispatched_at: now()}) do
         {:ok, {:dispatch, config.transport, dispatched}}
@@ -427,6 +445,8 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       error -> error
     end
   end
+
+  defp lock_recovery(_, _), do: {:error, :invalid_purpose}
 
   defp lock_query_attempt(run, candidate, fence) do
     with {:ok, attempt} <- get(InferenceRun, candidate.id, true),
@@ -505,22 +525,50 @@ defmodule VoelgoedAi.Intelligence.Embedding do
         with_fixture_settings(fn config ->
           with :ok <- eligible(context, now),
                :ok <- allowed(control),
-               {:ok, %UsageReservation{state: :reserved}} <- reservation(attempt),
+               {:ok, hold} <- reservation(attempt),
+               :ok <- EmbeddingAccounting.validate_dispatch(attempt, control, hold, now, config),
                {:ok, input} <-
                  EmbeddingProfile.input(context.revision.content, context.row.locale),
-               {:ok, _} <- change(attempt, %{dispatched_at: now}) do
-            {:ok, {input, config.transport}}
-          else
-            {:ok, %UsageReservation{}} -> {:error, :stale_request}
-            error -> error
+               {:ok, dispatched} <- change(attempt, %{dispatched_at: now}) do
+            {:ok, {input, article_transport(id, dispatched, config.transport), dispatched}}
           end
         end)
       end
     end)
     |> case do
-      {:ok, {input, transport}} -> {:ok, input, transport}
+      {:ok, {input, transport, attempt}} -> {:ok, input, transport, attempt}
       error -> error
     end
+  end
+
+  defp article_transport(id, dispatched, {:fixture, wire} = transport) do
+    {:fixture,
+     fn request ->
+       authorized =
+         transaction(id, fn control, context ->
+           with {:ok, attempt} <-
+                  locked_attempt(context, dispatched.id, dispatched.dispatch_fence),
+                true <-
+                  attempt.state == :running and attempt.dispatched_at == dispatched.dispatched_at,
+                :ok <- eligible(context, now()),
+                {:ok, hold} <- reservation(attempt) do
+             with_fixture_settings(fn config ->
+               with true <- config.transport == transport,
+                    :ok <-
+                      EmbeddingAccounting.validate_dispatch(attempt, control, hold, now(), config),
+                    do: {:ok, :authorized},
+                    else: (_ -> {:error, :admission_denied})
+             end)
+           else
+             _ -> {:error, :admission_denied}
+           end
+         end)
+
+       case authorized do
+         {:ok, :authorized} -> wire.(request)
+         _ -> {request, %Req.TransportError{reason: :closed}}
+       end
+     end}
   end
 
   defp finish(id, attempt_id, fence, outcome) do
@@ -636,8 +684,25 @@ defmodule VoelgoedAi.Intelligence.Embedding do
   defp recover_attempt(control, context, attempt_id) do
     now = now()
 
-    with {:ok, attempt} <- locked_attempt(context, attempt_id, nil),
-         true <- attempt.state == :running and DateTime.compare(now, attempt.deadline_at) != :lt,
+    with {:ok, attempt} <- locked_attempt(context, attempt_id, nil) do
+      recover_embedding(control, context, attempt, now)
+    end
+  end
+
+  defp recover_embedding(
+         control,
+         context,
+         %{overflow_evidence: evidence, overflow_resolved_at: nil} = attempt,
+         now
+       )
+       when not is_nil(evidence) do
+    with {:ok, hold} <- reservation(attempt) do
+      replay_embedding(control, context, attempt, hold, now)
+    end
+  end
+
+  defp recover_embedding(control, context, %{state: :running} = attempt, now) do
+    with true <- DateTime.compare(now, attempt.deadline_at) != :lt,
          {:ok, reservation} <- reservation(attempt) do
       if attempt.dispatched_at do
         hold(control, context, attempt, reservation, now, :deadline)
@@ -648,6 +713,22 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       false -> {:ok, :noop}
       error -> error
     end
+  end
+
+  defp recover_embedding(_, _, _, _), do: {:ok, :noop}
+
+  defp replay_embedding(control, context, attempt, hold, now) do
+    %{provider_request_id: request, input_tokens: tokens} =
+      EmbeddingAccounting.recorded_usage(attempt)
+
+    settle(
+      control,
+      context,
+      attempt,
+      hold,
+      now,
+      {:usage, request, tokens, {:error, :invalid_vector}}
+    )
   end
 
   defp reject_before_dispatch(id, attempt_id, fence, reason) do
@@ -705,7 +786,10 @@ defmodule VoelgoedAi.Intelligence.Embedding do
                (state == :abandoned and is_nil(attempt.provider_request_id))) and not is_nil(time) do
     vector_status = if match?({:ok, _}, vector), do: :valid, else: :invalid_vector
 
-    with {:ok, accounting} <-
+    usage = %{provider_request_id: request_id, input_tokens: tokens}
+
+    with true <- EmbeddingAccounting.overflow_matches?(attempt, usage),
+         {:ok, accounting} <-
            account(
              attempt,
              :finish,
@@ -720,20 +804,24 @@ defmodule VoelgoedAi.Intelligence.Embedding do
            ) do
       case accounting do
         :amount_overflow when state == :abandoned ->
-          {:ok, :noop}
+          change(attempt, %{overflow_evidence: attempt.overflow_evidence || usage})
 
         :amount_overflow ->
           with {:ok, _} <-
                  change(attempt, %{
                    state: :unknown,
                    finished_at: now,
-                   reason_code: :amount_overflow
+                   reason_code: :amount_overflow,
+                   overflow_evidence: attempt.overflow_evidence || usage
                  }) do
             fail_publication(context, :transport_unknown)
           end
 
         result ->
-          changes = %{provider_request_id: request_id, input_tokens: tokens}
+          changes =
+            if attempt.overflow_evidence,
+              do: Map.put(usage, :overflow_resolved_at, now),
+              else: usage
 
           case state do
             :abandoned ->
@@ -755,8 +843,21 @@ defmodule VoelgoedAi.Intelligence.Embedding do
               end
           end
       end
+    else
+      false -> {:error, :conflicting_evidence}
+      error -> error
     end
   end
+
+  defp settle(
+         _,
+         _,
+         %{provider_request_id: request, input_tokens: tokens},
+         _,
+         _,
+         {:usage, request, tokens, _}
+       )
+       when not is_nil(request), do: {:ok, :noop}
 
   defp settle(_, _, %{state: state}, _, _, {:usage, _, _, _})
        when state in [:succeeded, :failed, :abandoned], do: {:error, :conflicting_evidence}
@@ -994,7 +1095,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     defp fixture_settings do
       case gate() do
         {:ok, settings} -> [settings]
-        {:error, :disabled} -> []
+        {:error, _} -> []
       end
     end
 
@@ -1009,7 +1110,12 @@ defmodule VoelgoedAi.Intelligence.Embedding do
           transport: {:fixture, Map.get(config, :wire, &EmbeddingTransport.fixture_wire/1)}
         }
 
-        {:ok, Map.merge(settings, Map.take(config, [:price, :day_cap, :month_cap]))}
+        if Map.get(config, :price, @fixture_price) == @fixture_price and
+             is_function(elem(settings.transport, 1), 1) do
+          {:ok, Map.merge(settings, Map.take(config, [:day_cap, :month_cap]))}
+        else
+          {:error, :invalid_price}
+        end
       else
         {:error, :disabled}
       end
@@ -1019,14 +1125,14 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       do:
         Map.get(fixture(), :enqueue_finalisation, &Publication.enqueue_finalisation/1).(revision)
 
-    defp approved_closers, do: [fixture()[:closure_approved_by]]
+    @doc false
+    def fixture_budget, do: gate()
     def now, do: Map.get(fixture(), :clock, &DateTime.utc_now/0).()
     defp hook(stage, attempt), do: Map.get(fixture(), stage, fn _ -> :ok end).(attempt)
     defp consume(fence), do: Map.get(fixture(), :consume_dispatch, fn fun -> fun.() end).(fence)
   else
     defp fixture_settings, do: []
     defp enqueue_finalisation(revision), do: Publication.enqueue_finalisation(revision)
-    defp approved_closers, do: []
     def now, do: DateTime.utc_now()
     defp hook(_, _), do: :ok
     defp consume(fence), do: fence.()
