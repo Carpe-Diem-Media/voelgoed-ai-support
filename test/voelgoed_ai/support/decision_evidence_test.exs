@@ -92,10 +92,16 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"abbreviated scale", "R25 mln"},
         {"currency suffix", "25 rand"},
         {"spaced minus sign", "− 40 rand"},
-        {"cents suffix", "25c"}
+        {"cents suffix", "25c"},
+        {"written percentage unit", %{"af-ZA" => "25 persent", "en-ZA" => "25 percent"}},
+        {"written price", %{"af-ZA" => "vyftig rand", "en-ZA" => "fifty rand"}},
+        {"written compound price",
+         %{"af-ZA" => "vyf-en-twintig rand", "en-ZA" => "twenty-five rand"}},
+        {"written percentage", %{"af-ZA" => "vyftig persent", "en-ZA" => "fifty per cent"}}
       ] do
     @opts opts
-    @reply "#{price_prefix} #{amount}."
+    @amount if is_map(amount), do: Map.fetch!(amount, locale), else: amount
+    @reply "#{price_prefix} #{@amount}."
 
     test "grounded #{locale} completion rejects an unsupported #{label}" do
       ctx = prepare(:grounded, @opts)
@@ -125,7 +131,9 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
   for {label, reply} <- [
         {"currency suffix", "Late bookings cost 40 rand."},
         {"spaced minus sign", "The adjustment is − 55 rand."},
-        {"cents suffix", "The processing fee is 75c."}
+        {"cents suffix", "The processing fee is 75c."},
+        {"written percentage unit", "The early booking discount is 15 percent."},
+        {"written price", "The printed programme costs sixty rand."}
       ] do
     @reply reply
 
@@ -565,7 +573,8 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
 
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
-                      "The adjustment is − 55 rand. The processing fee is 75c."
+                      "The adjustment is − 55 rand. The processing fee is 75c. " <>
+                      "The early booking discount is 15 percent. The printed programme costs sixty rand."
                 end
 
               Map.put(variant, "approved_answer", answer)

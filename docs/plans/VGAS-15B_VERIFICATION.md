@@ -152,6 +152,22 @@ Formatting, forced strict TEST compile and snapshot checks exited 0. The
 disposable container and volume were removed. Compatibility was checked
 against `e2aa3aa`, which includes the contributor verification PR #24.
 
+The independent review at `aebf001` closed the signed and minor-unit
+findings, then reproduced percentages with written units and prices written
+in words. Eight new Afrikaans and English completion cases failed on the
+old matcher. They cover digit percentages, written and compound prices, and
+written percentages. The corrected matcher compares recognized number
+words and their currencies or percentage units together, preserving the
+verbatim text. The cited `15 percent` and `sixty rand` shadow controls pass.
+The denial cases still produce zero fake writes after operational handoff.
+
+The focused command exited 0 with 169 passing tests at seed 0 on disposable
+PostgreSQL 18.7 and pgvector 0.8.7. Format, forced strict TEST compile and
+snapshot checks passed. A direct render probe denied eight unattested
+compound and signed phrases, then accepted each exact phrase when cited.
+The disposable container and volume were removed. Independent review and
+hosted CI are required for the corrected head.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.
