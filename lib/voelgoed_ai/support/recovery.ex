@@ -284,13 +284,16 @@ defmodule VoelgoedAi.Support.Recovery do
                {:ok, {:eligible, Ownership.epoch_snapshot(config, session), DateTime.add(now, 5)}}
              end),
            {:ok, observation} <- ChatwootAdapter.observe(candidate, deadline),
-           {:ok, %{latest_id: last_id, texts: texts}} <-
-             ChatwootAdapter.receipt_text(candidate, deadline),
-           true <- last_id == candidate.verified_input_id and Map.has_key?(texts, last_id) do
+           {:ok, action} <- idle_action(candidate, observation, deadline) do
         with_idle(candidate, fn config, session, now ->
-          if DateTime.before?(now, deadline) and Ownership.current?(config, session, snapshot) and
-               Ownership.eligible_bot?(config, session, observation) do
-            Ownership.route_shadow_locked(config, session, observation, now, :idle_triage)
+          if DateTime.before?(now, deadline) and Ownership.current?(config, session, snapshot) do
+            case action do
+              :observe ->
+                Ownership.observe(config, session, observation, now)
+
+              :route ->
+                Ownership.route_shadow_locked(config, session, observation, now, :idle_triage)
+            end
           else
             {:ok, :ineligible}
           end
@@ -305,6 +308,18 @@ defmodule VoelgoedAi.Support.Recovery do
 
         result ->
           result
+      end
+    end
+
+    # A qualified assignment or resolution is independent of idle text proof.
+    defp idle_action(_, %{assignee: :human}, _), do: {:ok, :observe}
+    defp idle_action(_, %{status: :resolved}, _), do: {:ok, :observe}
+
+    defp idle_action(candidate, _, deadline) do
+      with {:ok, %{latest_id: last_id, texts: texts}} <-
+             ChatwootAdapter.receipt_text(candidate, deadline),
+           true <- last_id == candidate.verified_input_id and Map.has_key?(texts, last_id) do
+        {:ok, :route}
       end
     end
 

@@ -97,6 +97,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
   defp decide_event(config, session, event, now, deadline, observation, history, text) do
     cond do
       DateTime.compare(now, deadline) != :lt ->
+        observation = if text == {:error, :scope_denied}, do: text, else: observation
+
         with {:ok, session} <- route_overdue(config, session, event, now, observation) do
           disposition(event, session, :triage, :deadline, now)
         end
@@ -139,6 +141,9 @@ defmodule VoelgoedAi.Support.RunProcessing do
   defp qualify_input(_, session, %{kind: kind} = event, now, _, _, _, _) when kind != :input,
     do: disposition(event, session, :observed, :accepted, now)
 
+  defp qualify_input(_, session, event, now, _, _, _, {:error, :scope_denied}),
+    do: disposition(event, session, :triage, :scope_denied, now)
+
   defp qualify_input(config, session, event, now, deadline, observation, history, text) do
     with true <-
            session.state == :bot_active and Ownership.eligible_bot?(config, session, observation),
@@ -177,15 +182,15 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
 
     defp before_admission(config, session, input, now, _, _),
-      do: admit(config, session, input, now, nil)
+      do: admit(config, session, input, now)
 
     defp before_shadow_admission(config, session, input, now, history, proof) do
-      with :ok <- admit_slot(input.delivery),
+      with {:ok, session} <- mark_activity(session, input.event, now, history, proof),
+           :ok <- admit_slot(input.delivery),
            {:ok, request} <- pending_human_request(input.event, now, history, proof.texts),
            :ok <- route_explicit_request(config, session, input, now, request),
            :ok <- record_standalone_misuse(config, session, input, now, history, proof) do
-        activity = if latest_verified?(input.event, history, proof), do: input.event.message_id
-        admit(config, session, input, now, activity)
+        admit(config, session, input, now)
       else
         {:error, :ai_cooldown} ->
           disposition(input.event, session, :ignored, :ai_cooldown, now)
@@ -286,24 +291,22 @@ defmodule VoelgoedAi.Support.RunProcessing do
         match?(%{id: id, sender: :contact} when id == event.message_id, List.last(history))
     end
 
-    defp mark_activity(_, nil, _), do: :ok
-
-    defp mark_activity(%SupportSession{} = session, id, now) do
-      with {:ok, _} <-
-             store_update(session, :mark_verified_input, %{
-               verified_input_at: now,
-               verified_input_id: id
-             }),
-           do: :ok
+    defp mark_activity(%SupportSession{} = session, event, now, history, proof) do
+      if latest_verified?(event, history, proof) do
+        store_update(session, :mark_verified_input, %{
+          verified_input_at: now,
+          verified_input_id: event.message_id
+        })
+      else
+        {:ok, session}
+      end
     end
   else
     defp before_admission(config, session, input, now, _, _),
-      do: admit(config, session, input, now, nil)
-
-    defp mark_activity(_, _, _), do: :ok
+      do: admit(config, session, input, now)
   end
 
-  defp admit(config, session, input, now, activity) do
+  defp admit(config, session, input, now) do
     %{event: event, batch: batch, delivery: delivery, deadline: deadline, position: position} =
       input
 
@@ -312,8 +315,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
          :ok <- MisuseProtection.allowed(config, session, now),
          :ok <- authorize_capacity(batch),
          :ok <- qualify_fixture_input(batch, config, session, event, now),
-         {:ok, run} <- schedule(config, session, revision, batch, delivery, now, deadline),
-         :ok <- mark_activity(session, activity, now) do
+         {:ok, run} <- schedule(config, session, revision, batch, delivery, now, deadline) do
       with {:ok, _} <-
              store_create(RunInput, :cover, %{
                run_id: run.id,

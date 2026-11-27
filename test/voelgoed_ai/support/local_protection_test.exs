@@ -102,6 +102,25 @@ defmodule VoelgoedAi.Support.LocalProtectionTest do
     assert daily_counts(ctx) == [40, 1]
   end
 
+  test "a definite text contact mismatch cannot route at zero allowance" do
+    ctx = SupportDBCase.setup(shadow: :en)
+    exhaust_turns(ctx, 40)
+    before = admission_counts(ctx)
+    id = register(ctx, "Hello")
+
+    Agent.update(ctx.fake, fn state ->
+      put_in(state.decision_messages[ctx.event.message_id][:contact_id], ctx.event.contact_id + 1)
+    end)
+
+    assert :ok = RunProcessing.process_event(id)
+    assert :ok = RunProcessing.process_event(id)
+    assert reason(id) == "scope_denied"
+    assert admission_counts(ctx) == before
+    assert counts(ctx) == {0, 1}
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "id")
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   test "concurrent strikes count once, fence queued AI, and allow a human during cooldown" do
     ctx = SupportDBCase.setup(shadow: :en)
     assert {_, "accepted"} = receipt(ctx, "Hello")
@@ -185,6 +204,51 @@ defmodule VoelgoedAi.Support.LocalProtectionTest do
     assert :ok = Sweep.perform(job(%{}))
     send(worker, :resume_chatwoot_read)
     assert :ok = Task.await(parked)
+    assert_idle_audits(ctx, 1)
+    assert_local_handoff(ctx)
+  end
+
+  test "human ownership observed by the idle sweep stays sticky after a bot observation" do
+    ctx = ready_for_idle()
+    SupportDBCase.advance_clock(ctx, 1800)
+    Agent.update(ctx.fake, &put_in(&1.observation.assignee, :human))
+    assert :ok = Sweep.perform(job(%{}))
+
+    assert %{rows: [["human_active", true, nil]]} =
+             SQL.query!(
+               Repo,
+               "SELECT state, human_inhibit, verified_input_at FROM support_sessions WHERE id = $1",
+               [session(ctx)]
+             )
+
+    Agent.update(ctx.fake, &put_in(&1.observation.assignee, :bot))
+    assert :ok = Sweep.perform(job(%{}))
+    assert {_, "scope_denied"} = receipt(next(ctx, 1), "Hello")
+    assert_idle_audits(ctx, 0)
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "id")
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  test "verified input during cooldown sets the idle deadline without spending AI allowance" do
+    ctx = ready_for_idle()
+
+    for offset <- 1..3 do
+      assert {_, "verified_misuse"} = receipt(add_remote_conversation(ctx, offset), @misuse)
+    end
+
+    SupportDBCase.advance_clock(ctx, 20)
+    before = admission_counts(ctx)
+    {id, "ai_cooldown"} = receipt(next(ctx, 4), "Where is the magazine?")
+    assert :ok = RunProcessing.process_event(id)
+    assert admission_counts(ctx) == before
+
+    SupportDBCase.advance_clock(ctx, 1799)
+    assert :ok = Sweep.perform(job(%{}))
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx, "id")
+
+    SupportDBCase.advance_clock(ctx, 1)
+    assert :ok = Sweep.perform(job(%{}))
+    assert :ok = Sweep.perform(job(%{}))
     assert_idle_audits(ctx, 1)
     assert_local_handoff(ctx)
   end

@@ -11,8 +11,9 @@ synthetic time, qualified Chatwoot fakes and disposable PostgreSQL.
   pending signed receipt to verified public contact text. An exact English or
   Afrikaans human request wins over other qualified pending input even when no
   AI allowance remains. A current bot-owned session stages one local T05
-  handoff without a debit, run or inference reservation. First and unverified
-  overdue receipts follow the existing audit and alert path.
+  handoff without a debit, run or inference reservation. A definite contact
+  mismatch blocks local routing, including the allowance fallback. First and
+  unverified overdue receipts follow the existing audit and alert path.
 - Allowance and inference budget exhaustion have distinct reasons. Only a
   cap denial during the reservation transaction can reach T04 as
   `budget_exhausted`. The denied stage leaves no attempt or reservation.
@@ -33,10 +34,13 @@ synthetic time, qualified Chatwoot fakes and disposable PostgreSQL.
   unverified or edited text and model or transport errors do not add facts.
   The transport circuit keeps its separate recovery path.
 - The sweep checks the last qualified input marker after 30 minutes of
-  inactivity. Marks apply to one bot ownership epoch and clear when the
-  session leaves that state. The sweep checks current work and delivery
-  before and after fresh reads, then compares the current epochs and latest
-  input. It checks at most 25 idle candidates per job and queues an ID cursor
+  inactivity. A verified input updates the marker even during AI cooldown.
+  Marks apply to one bot ownership epoch and clear when the session leaves
+  that state. The sweep checks current work and delivery before and after
+  fresh reads, then compares the current epochs. A verified human takeover
+  or resolution updates local ownership under that lock. An idle handoff
+  also needs matching latest input. The sweep checks at most 25 candidates
+  per job and queues an ID cursor
   for the next page. An unmarked predecessor is ineligible. T05 records the
   audit, ownership transition, intent and jobs atomically. Replayed or
   overlapping jobs cannot stage the same handoff again.
