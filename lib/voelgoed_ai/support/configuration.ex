@@ -16,7 +16,7 @@ defmodule VoelgoedAi.Support.Configuration do
   alias VoelgoedAi.Intelligence.{Assistant, AssistantKnowledgeGrant, AssistantRevision}
   alias VoelgoedAi.Knowledge.KnowledgeCollection
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ActionScope, InboxBinding, Ownership}
+  alias VoelgoedAi.Support.{ActionScope, InboxBinding}
   alias VoelgoedAi.Support.ActionScope.Storage
 
   @revision_fields [:workflow_version, :template_version, :locale, :response_policy]
@@ -385,19 +385,21 @@ defmodule VoelgoedAi.Support.Configuration do
 
   defp control_transition(_, _, _), do: {:error, :invalid_transition}
 
-  defp control_mode(%{operating_mode: :automatic}) do
-    if match?(%{response_policy: :shadow_decision}, fixture()),
-      do: {:error, :invalid_transition},
-      else: {:ok, :fake}
-  end
+  if Mix.env() == :test do
+    defp control_mode(%{operating_mode: :automatic}) do
+      if match?(%{response_policy: :shadow_decision}, fixture()),
+        do: {:error, :invalid_transition},
+        else: {:ok, :fake}
+    end
 
-  defp control_mode(%{operating_mode: :shadow} = binding) do
-    with true <- Ownership.shadow_fixture?(binding),
-         {:ok, assistant} <- get(Assistant, binding.assistant_id),
-         {:ok, %{response_policy: :shadow_decision}} <- current_revision(assistant) do
-      {:ok, :shadow_test}
-    else
-      _ -> {:error, :unverified_test_binding}
+    defp control_mode(%{operating_mode: :shadow} = binding) do
+      with true <- VoelgoedAi.Support.Ownership.shadow_fixture?(binding),
+           {:ok, assistant} <- get(Assistant, binding.assistant_id),
+           {:ok, %{response_policy: :shadow_decision}} <- current_revision(assistant) do
+        {:ok, :shadow_test}
+      else
+        _ -> {:error, :unverified_test_binding}
+      end
     end
   end
 

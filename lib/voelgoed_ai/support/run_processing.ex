@@ -380,25 +380,30 @@ defmodule VoelgoedAi.Support.RunProcessing do
      ChatwootAdapter.history(session, deadline)}
   end
 
-  defp evaluate({:shadow, receipts}, session, lease, _deadline) do
-    ids = Enum.map(receipts, &elem(&1, 1))
+  if Mix.env() == :test do
+    defp evaluate({:shadow, receipts}, session, lease, _deadline) do
+      ids = Enum.map(receipts, &elem(&1, 1))
 
-    # Read twice outside the transaction. Compare ordered IDs, roles and text
-    # before accepting a projection whose messages might have been edited.
-    first = ChatwootAdapter.decision_context(session, ids, lease)
-    observation = ChatwootAdapter.observe(session, lease)
+      # Read twice outside the transaction. Compare ordered IDs, roles and text
+      # before accepting a projection whose messages might have been edited.
+      first = ChatwootAdapter.decision_context(session, ids, lease)
+      observation = ChatwootAdapter.observe(session, lease)
 
-    context =
-      with {:ok, original} <- first,
-           {:ok, _} <- observation,
-           {:ok, current} <- ChatwootAdapter.decision_context(session, ids, lease),
-           true <- original.commitment == current.commitment do
-        {:ok, current}
-      else
-        _ -> {:error, :history_changed}
-      end
+      context =
+        with {:ok, original} <- first,
+             {:ok, _} <- observation,
+             {:ok, current} <- ChatwootAdapter.decision_context(session, ids, lease),
+             true <- original.commitment == current.commitment do
+          {:ok, current}
+        else
+          _ -> {:error, :history_changed}
+        end
 
-    {:shadow, receipts, observation, context}
+      {:shadow, receipts, observation, context}
+    end
+  else
+    defp evaluate({:shadow, receipts}, _, _, _),
+      do: {:shadow, receipts, {:error, :unavailable}, {:error, :history_changed}}
   end
 
   @doc false

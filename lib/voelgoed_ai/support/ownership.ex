@@ -97,19 +97,24 @@ defmodule VoelgoedAi.Support.Ownership do
       not match?(%{response_policy: :shadow_decision}, ChatwootAdapter.fixture())
   end
 
-  @doc false
-  def shadow_fixture?(binding) do
-    ChatwootAdapter.in_scope?(binding) and
-      match?(
-        %{
-          shadow_evaluation: true,
-          response_policy: :shadow_decision,
-          assistant_id: id,
-          adapter: {_, _}
-        }
-        when id == binding.assistant_id,
-        ChatwootAdapter.fixture()
-      )
+  if Mix.env() == :test do
+    @doc false
+    def shadow_fixture?(binding) do
+      ChatwootAdapter.in_scope?(binding) and
+        match?(
+          %{
+            shadow_evaluation: true,
+            response_policy: :shadow_decision,
+            assistant_id: id,
+            adapter: {_, _}
+          }
+          when id == binding.assistant_id,
+          ChatwootAdapter.fixture()
+        )
+    end
+  else
+    @doc false
+    def shadow_fixture?(_binding), do: false
   end
 
   @doc false
