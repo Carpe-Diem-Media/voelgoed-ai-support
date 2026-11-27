@@ -13,6 +13,7 @@ defmodule VoelgoedAi.MixProject do
       start_permanent: Mix.env() == :prod,
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
       aliases: aliases(),
+      releases: [voelgoed_ai: [cookie: "NODISTRIBUTION"]],
       deps: deps()
     ]
   end

@@ -257,10 +257,33 @@ jobs:
             --volume "$PWD:/repo:ro" --workdir /repo ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
             git --redact=100 --log-opts="$range" --no-banner .
 
+  prod_compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: docker build --platform linux/amd64 --no-cache --progress=plain --target compile .
+
+  release_package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: bash .github/scripts/test_application_gate.sh
+      - run: docker build --platform linux/amd64 --no-cache --progress=plain --tag vgas-release:ci .
+      - run: bash .github/scripts/verify_release.sh vgas-release:ci
+      - run: docker build --platform linux/amd64 --no-cache --progress=plain --tag vgas-release:repeat .
+      - run: bash .github/scripts/compare_release_payloads.sh vgas-release:ci vgas-release:repeat
+
   gate:
     name: Application CI gate
     if: always()
-    needs: [plan, build, test, snapshots, migrations, secrets]
+    needs: [plan, build, test, snapshots, migrations, secrets, prod_compile, release_package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
@@ -271,12 +294,10 @@ jobs:
       SECRETS: ${{ needs.secrets.result }}
       TEST: ${{ needs.test.result }}
       HAS_TESTS: ${{ needs.plan.outputs.has_tests }}
+      PROD_COMPILE: ${{ needs.prod_compile.result }}
+      RELEASE_PACKAGE: ${{ needs.release_package.result }}
     steps:
-      - run: |
-          [[ "$PLAN" == success && "$BUILD" == success && "$SNAPSHOTS" == success &&
-             "$MIGRATIONS" == success && "$SECRETS" == success ]] || exit 1
-          if [[ "$HAS_TESTS" == true ]]; then
-            [[ "$TEST" == success ]]
-          else
-            [[ "$HAS_TESTS" == false && "$TEST" == skipped ]]
-          fi
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/check_application_gate.sh

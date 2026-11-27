@@ -35,6 +35,15 @@ as excluded. The predecessor staff and audit case must appear as excluded
 outside `vgas001-upgrade`.
 The timing history remains a separate file.
 
+The `prod_compile` job builds the pinned Linux amd64 compiler stage without
+reusing the TEST dependency cache. The `release_package` job builds the image,
+runs the packaged migrator and startup checks on a private PostgreSQL/pgvector
+network, then compares a second clean build's release payload. Both must
+report `success` to the `always()` gate. The gate test exercises failure, skip,
+cancellation and absent result for each new required job, plus both ordinary
+success and the planner's zero-test case. See the
+[release runbook](../runbooks/release-verification.md) for the same local commands.
+
 The gate also requires `mix ash.codegen --check`, all three migration lanes and a
 redacted Gitleaks 8.30.1 scan of the candidate commit range. Only the ExUnit
 matrix may be skipped, and only when the planner emits `has_tests=false`.

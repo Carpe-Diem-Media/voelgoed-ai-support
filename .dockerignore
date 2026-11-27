@@ -1,0 +1,12 @@
+**
+!mix.exs
+!mix.lock
+!.tool-versions
+!config/
+!config/**
+!lib/
+!lib/**
+!priv/
+!priv/**
+!rel/
+!rel/**

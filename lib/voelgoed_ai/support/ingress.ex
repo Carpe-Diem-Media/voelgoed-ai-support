@@ -23,17 +23,25 @@ defmodule VoelgoedAi.Support.Ingress do
   def accept(event) do
     scope = Map.take(event, @inbox)
 
-    with %{} = fixture <- ChatwootAdapter.fixture(),
-         true <- Map.take(fixture, @inbox) == scope do
-      receipt_transaction(event, scope)
-    else
-      _ -> {:error, :scope_denied}
-    end
+    accept_in_scope(event, scope, &receipt_transaction/2)
   rescue
     # Oban's storage may raise, including when PostgreSQL aborts an insert.
     # The transaction has rolled back before the HTTP boundary sees failure.
     _ in [Ecto.ConstraintError, Postgrex.Error, DBConnection.ConnectionError] ->
       {:error, :receipt_storage}
+  end
+
+  if Mix.env() == :test do
+    defp accept_in_scope(event, scope, persist) do
+      with %{} = fixture <- ChatwootAdapter.fixture(),
+           true <- Map.take(fixture, @inbox) == scope do
+        persist.(event, scope)
+      else
+        _ -> {:error, :scope_denied}
+      end
+    end
+  else
+    defp accept_in_scope(_event, _scope, _persist), do: {:error, :scope_denied}
   end
 
   defp receipt_transaction(event, scope) do
