@@ -14,13 +14,53 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
   @impl Ash.Policy.Check
   def describe(_), do: "the current support claim holds the capability for this action"
 
+  alias Ecto.Adapters.SQL
+  alias VoelgoedAi.Intelligence.EmbeddingProfile
+  alias VoelgoedAi.Knowledge.Content
+  alias VoelgoedAi.Knowledge.Retrieval.Reference
+  alias VoelgoedAi.Repo
+  alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, Delivery}
+
+  # All entry points use this CTE. Control is locked before it runs, and
+  # editorial and grant changes take the same lock before writing.
+  @eligible """
+  WITH eligible AS MATERIALIZED (
+    SELECT r.id AS revision_id, a.id AS article_id, a.article_ref, c.id AS collection_id,
+           c.security_epoch AS collection_epoch, r.content_hash, r.active_index_generation,
+           r.index_epoch, v.vector, r.content, variant.value AS variant
+    FROM assistant_knowledge_grants pinned
+    JOIN assistant_knowledge_grants live
+      ON live.collection_id = pinned.collection_id AND live.assistant_revision_id = $2
+    JOIN knowledge_collections c ON c.id = live.collection_id
+    JOIN articles a ON a.collection_id = c.id
+    JOIN article_revisions r ON r.id = a.current_revision_id AND r.article_id = a.id
+    JOIN article_embeddings v ON v.revision_id = r.id AND v.generation = r.active_index_generation
+    CROSS JOIN LATERAL jsonb_array_elements(r.content->'localized_content') AS variant(value)
+    WHERE pinned.assistant_revision_id = $1 AND c.audience = 'public' AND c.status = 'active'
+      AND a.status = 'active' AND r.status = 'published' AND r.review_hash = r.content_hash
+      AND r.approved_at IS NOT NULL AND r.approved_by_id IS NOT NULL
+      AND v.state = 'ready' AND v.vector IS NOT NULL AND v.locale = $3
+      AND variant.value->>'locale' = $3 AND v.content_hash = r.content_hash
+      AND r.active_index_profile_id = $4 AND v.profile_id = $4
+      AND r.content->>'response_mode' IN ('exact', 'grounded')
+      AND coalesce(r.content->>'sensitive', 'false') = 'false'
+      AND (r.content->>'effective_from')::timestamptz <= $5
+      AND (r.content->>'expires_at' IS NULL OR (r.content->>'expires_at')::timestamptz > $5)
+      AND NOT EXISTS (
+        SELECT 1 FROM jsonb_each(r.content->'applicability') AS restriction(key, allowed)
+        WHERE NOT coalesce(restriction.allowed ? ($6::jsonb->>restriction.key), false)
+      )
+  )
+  """
+  @projection """
+    e.revision_id, e.article_id, e.article_ref, e.collection_id, e.collection_epoch,
+    e.content_hash, e.active_index_generation, e.index_epoch, e.content
+  """
   if Mix.env() == :test do
-    alias Ecto.Adapters.SQL
-    alias VoelgoedAi.Intelligence.{Embedding, EmbeddingProfile}
-    alias VoelgoedAi.Knowledge.{ArticleRevision, Content}
+    alias VoelgoedAi.Intelligence.Embedding
+    alias VoelgoedAi.Knowledge.ArticleRevision
     alias VoelgoedAi.Knowledge.Retrieval.Scope
-    alias VoelgoedAi.Repo
-    alias VoelgoedAi.Support.{Configuration, Ownership, RunProcessing}
+    alias VoelgoedAi.Support.{Ownership, RunProcessing}
 
     @scope_keys [:brand, :product, :event, :service]
     @fixture_key {__MODULE__, :authority}
@@ -29,41 +69,6 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     @query_key {__MODULE__, :query}
     @rank_measurement_key {__MODULE__, :rank_measurement}
 
-    # All entry points use this CTE. Control is locked before it runs, and
-    # editorial and grant changes take the same lock before writing.
-    @eligible """
-    WITH eligible AS MATERIALIZED (
-      SELECT r.id AS revision_id, a.id AS article_id, a.article_ref, c.id AS collection_id,
-             c.security_epoch AS collection_epoch, r.content_hash, r.active_index_generation,
-             r.index_epoch, v.vector, r.content, variant.value AS variant
-      FROM assistant_knowledge_grants pinned
-      JOIN assistant_knowledge_grants live
-        ON live.collection_id = pinned.collection_id AND live.assistant_revision_id = $2
-      JOIN knowledge_collections c ON c.id = live.collection_id
-      JOIN articles a ON a.collection_id = c.id
-      JOIN article_revisions r ON r.id = a.current_revision_id AND r.article_id = a.id
-      JOIN article_embeddings v ON v.revision_id = r.id AND v.generation = r.active_index_generation
-      CROSS JOIN LATERAL jsonb_array_elements(r.content->'localized_content') AS variant(value)
-      WHERE pinned.assistant_revision_id = $1 AND c.audience = 'public' AND c.status = 'active'
-        AND a.status = 'active' AND r.status = 'published' AND r.review_hash = r.content_hash
-        AND r.approved_at IS NOT NULL AND r.approved_by_id IS NOT NULL
-        AND v.state = 'ready' AND v.vector IS NOT NULL AND v.locale = $3
-        AND variant.value->>'locale' = $3 AND v.content_hash = r.content_hash
-        AND r.active_index_profile_id = $4 AND v.profile_id = $4
-        AND r.content->>'response_mode' IN ('exact', 'grounded')
-        AND coalesce(r.content->>'sensitive', 'false') = 'false'
-        AND (r.content->>'effective_from')::timestamptz <= $5
-        AND (r.content->>'expires_at' IS NULL OR (r.content->>'expires_at')::timestamptz > $5)
-        AND NOT EXISTS (
-          SELECT 1 FROM jsonb_each(r.content->'applicability') AS restriction(key, allowed)
-          WHERE NOT coalesce(restriction.allowed ? ($6::jsonb->>restriction.key), false)
-        )
-    )
-    """
-    @projection """
-      e.revision_id, e.article_id, e.article_ref, e.collection_id, e.collection_epoch,
-      e.content_hash, e.active_index_generation, e.index_epoch, e.content
-    """
     @rank """
     , words AS (
       SELECT to_tsquery('simple', string_agg(quote_literal(lexeme), ' | ')) AS query
@@ -283,82 +288,37 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     defp rrf(semantic, lexical), do: {120 + semantic + lexical, (60 + semantic) * (60 + lexical)}
 
     defp revalidate(context, selected) do
-      ids = Enum.map(selected, &uuid(&1.revision_id))
-
       qualified(context, fn config, run, revision, now, _ ->
-        with {:ok, %{rows: rows}} <-
-               sql(
-                 @eligible <>
-                   "SELECT #{@projection} FROM eligible e WHERE e.revision_id = ANY($7::uuid[])",
-                 params(context, config, run, now) ++ [ids]
-               ) do
-          by_id = Map.new(rows, &{hd(&1), &1})
-
-          if Enum.all?(selected, fn item ->
-               project(by_id[uuid(item.revision_id)], context, run, revision, item.citation_id) ==
-                 {:ok, item}
-             end) do
-            {:ok, selected}
-          else
-            {:error, :stale_evidence}
-          end
+        with {:ok, current} <- reproject(config, run, revision, selected, now),
+             true <- current == selected do
+          {:ok, selected}
+        else
+          false -> {:error, :stale_evidence}
+          error -> error
         end
       end)
     end
 
-    defp project(
-           [id, article, ref, collection, epoch, hash, generation, index_epoch, raw],
-           context,
-           run,
-           revision,
-           citation
-         ) do
-      with {:ok, content} <- Content.parse(raw),
-           true <- raw == content and Content.hash(content) == hash,
-           %{"title" => title, "approved_answer" => answer} = variant <-
-             Enum.find(content["localized_content"], &(&1["locale"] == context.locale)) do
-        links =
-          content["source_references"]
-          |> Enum.map(& &1["public_link"])
-          |> Enum.filter(&Content.public_link_allowed?/1)
-          |> Enum.uniq()
-
-        {:ok,
-         %{
-           citation_id: citation,
-           run_id: run.id,
-           claim_generation: run.claim_generation,
-           assistant_revision_id: revision.id,
-           assistant_hash: revision.config_hash,
-           article_id: Ecto.UUID.load!(article),
-           revision_id: Ecto.UUID.load!(id),
-           article_ref: ref,
-           locale: context.locale,
-           content_hash: hash,
-           mode: mode(content["response_mode"]),
-           profile_id: EmbeddingProfile.id(),
-           generation: generation,
-           index_epoch: index_epoch,
-           collection_id: Ecto.UUID.load!(collection),
-           collection_epoch: epoch,
-           scope: context.scope,
-           assistant_epoch: run.assistant_epoch,
-           binding_epoch: run.binding_epoch,
-           control_epoch: run.control_epoch,
-           ownership_epoch: run.ownership_epoch,
-           title: title,
-           answer: answer,
-           steps: Map.get(variant, "steps", []),
-           links: links
-         }}
+    @doc false
+    def at_decision(owner, config, run, citations) when is_list(citations) do
+      with true <- stage_owner?(owner, RunProcessing),
+           %{run_id: id, claim_generation: claim} = context <- authority(),
+           true <- id == run.id and claim == run.claim_generation and claim > 0,
+           true <- run.state == :running,
+           true <- length(citations) in 1..4 and Enum.uniq(citations) == citations,
+           manifest = Process.get(@manifest_key, %{}),
+           selected = Enum.map(citations, &Map.get(manifest, &1)),
+           false <- Enum.any?(selected, &is_nil/1),
+           {:ok, revision} <- Configuration.current_revision(config.assistant),
+           true <- revision.config_hash == context.pin_hash,
+           {:ok, current} <- reproject(config, run, revision, selected, ChatwootAdapter.now()),
+           true <- current == selected do
+        {:ok, current}
       else
-        _ -> :error
+        {:error, error} when is_exception(error) -> {:error, error}
+        _ -> {:error, :stale_evidence}
       end
     end
-
-    defp project(_, _, _, _, _), do: :error
-    defp mode("exact"), do: :exact
-    defp mode("grounded"), do: :grounded
 
     defp qualified(%{run_id: id, inbox: inbox, claim_generation: claim} = context, work) do
       RunProcessing.with_run(id, fn config, session, run, now ->
@@ -367,7 +327,8 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
                inbox == Map.take(session, @inbox_keys) and
                  inbox == Map.take(config.binding, @inbox_keys),
              true <-
-               Ownership.write_enabled?(config) and RunProcessing.valid_run?(config, session, run),
+               (Ownership.write_enabled?(config) or Ownership.shadow_evaluation_enabled?(config)) and
+                 RunProcessing.valid_run?(config, session, run),
              true <- run.state == :running and run.claim_generation == claim and claim > 0,
              deadline = Enum.min([run.deadline_at, run.lease_expires_at], DateTime),
              :lt <- DateTime.compare(now, deadline),
@@ -393,33 +354,11 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
 
     defp qualified(_, _), do: {:error, :stale_claim}
 
-    defp params(context, config, run, now) do
-      [
-        uuid(run.assistant_revision_id),
-        uuid(config.assistant.active_revision_id),
-        context.locale,
-        EmbeddingProfile.id(),
-        now,
-        context.scope
-      ]
-    end
-
     defp has_eligible(params) do
       case sql(@eligible <> "SELECT EXISTS (SELECT 1 FROM eligible)", params) do
         {:ok, %{rows: [[true]]}} -> :ok
         {:ok, %{rows: [[false]]}} -> {:ok, :no_evidence}
         error -> error
-      end
-    end
-
-    defp sql(statement, params) do
-      with {:ok, _} <-
-             SQL.query(Repo, "SET LOCAL statement_timeout = '750ms'", [],
-               log: false,
-               telemetry_event: nil,
-               timeout: 1_000
-             ) do
-        SQL.query(Repo, statement, params, log: false, telemetry_event: nil, timeout: 1_000)
       end
     end
 
@@ -432,7 +371,6 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
 
     defp minimize(_), do: :error
 
-    defp uuid(id), do: Ecto.UUID.dump!(id)
     defp outcome(status, evidence \\ []), do: {:ok, %{status: status, evidence: evidence}}
   else
     @impl Ash.Policy.SimpleCheck
@@ -441,4 +379,151 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     @impl Ash.Resource.Actions.Implementation
     def run(_, _, _), do: {:error, "support retrieval is disabled"}
   end
+
+  @doc false
+  def at_dispatch(owner, config, %{state: :completed, claim_generation: claim} = run)
+      when claim > 0 do
+    with true <- stage_owner?(owner, Delivery),
+         refs when is_list(refs) and length(refs) in 1..4 <- run.evidence_refs,
+         {:ok, revision} <- Configuration.current_revision(config.assistant),
+         true <- revision.id == run.assistant_revision_id,
+         {:ok, current} <- reproject(config, run, revision, refs, ChatwootAdapter.now()),
+         true <- Enum.map(current, &Reference.from_evidence/1) == refs do
+      {:ok, current}
+    else
+      {:error, error} when is_exception(error) -> {:error, error}
+      _ -> {:error, :stale_evidence}
+    end
+  end
+
+  def at_dispatch(_, _, _), do: {:error, :stale_evidence}
+
+  defp stage_owner?(owner, module) when is_function(owner, 0) do
+    info = Function.info(owner)
+
+    Repo.in_transaction?() and info[:type] == :local and info[:module] == module and
+      info[:name] == :evidence_owner
+  end
+
+  defp stage_owner?(_, _), do: false
+
+  defp reproject(config, run, revision, [first | _] = selected, now) do
+    ids = Enum.map(selected, &uuid(&1.revision_id))
+
+    with true <- Enum.uniq(ids) == ids,
+         true <- Enum.all?(selected, &(&1.locale == first.locale and &1.scope == first.scope)),
+         {:ok, %{rows: rows}} <-
+           sql(
+             @eligible <>
+               "SELECT #{@projection} FROM eligible e WHERE e.revision_id = ANY($7::uuid[])",
+             params(first, config, run, now) ++ [ids]
+           ) do
+      by_id = Map.new(rows, &{hd(&1), &1})
+      observed_at = ChatwootAdapter.now()
+
+      Enum.zip(ids, selected)
+      |> Enum.reduce_while({:ok, []}, fn {id, item}, {:ok, evidence} ->
+        row = by_id[id]
+
+        with true <- current_at?(row, observed_at),
+             {:ok, current} <- project(row, first, run, revision, Map.get(item, :citation_id)) do
+          {:cont, {:ok, [current | evidence]}}
+        else
+          _ -> {:halt, {:error, :stale_evidence}}
+        end
+      end)
+      |> case do
+        {:ok, items} -> {:ok, Enum.reverse(items)}
+        error -> error
+      end
+    else
+      false -> {:error, :stale_evidence}
+      error -> error
+    end
+  end
+
+  defp current_at?([_, _, _, _, _, _, _, _, %{"expires_at" => expires}], now)
+       when is_binary(expires) do
+    with {:ok, expiry, _} <- DateTime.from_iso8601(expires), do: DateTime.before?(now, expiry)
+  end
+
+  defp current_at?(row, _now), do: is_list(row)
+
+  defp project(
+         [id, article, ref, collection, epoch, hash, generation, index_epoch, raw],
+         context,
+         run,
+         revision,
+         citation
+       ) do
+    with {:ok, content} <- Content.parse(raw),
+         true <- raw == content and Content.hash(content) == hash,
+         %{"title" => title, "approved_answer" => answer} = variant <-
+           Enum.find(content["localized_content"], &(&1["locale"] == context.locale)) do
+      links =
+        content["source_references"]
+        |> Enum.map(& &1["public_link"])
+        |> Enum.filter(&Content.public_link_allowed?/1)
+        |> Enum.uniq()
+
+      {:ok,
+       %{
+         citation_id: citation,
+         run_id: run.id,
+         claim_generation: run.claim_generation,
+         assistant_revision_id: revision.id,
+         assistant_hash: revision.config_hash,
+         article_id: Ecto.UUID.load!(article),
+         revision_id: Ecto.UUID.load!(id),
+         article_ref: ref,
+         locale: context.locale,
+         content_hash: hash,
+         mode: mode(content["response_mode"]),
+         profile_id: EmbeddingProfile.id(),
+         generation: generation,
+         index_epoch: index_epoch,
+         collection_id: Ecto.UUID.load!(collection),
+         collection_epoch: epoch,
+         scope: context.scope,
+         assistant_epoch: run.assistant_epoch,
+         binding_epoch: run.binding_epoch,
+         control_epoch: run.control_epoch,
+         ownership_epoch: run.ownership_epoch,
+         title: title,
+         answer: answer,
+         steps: Map.get(variant, "steps", []),
+         links: links
+       }}
+    else
+      _ -> :error
+    end
+  end
+
+  defp project(_, _, _, _, _), do: :error
+  defp mode("exact"), do: :exact
+  defp mode("grounded"), do: :grounded
+
+  defp params(context, config, run, now) do
+    [
+      uuid(run.assistant_revision_id),
+      uuid(config.assistant.active_revision_id),
+      context.locale,
+      EmbeddingProfile.id(),
+      now,
+      context.scope
+    ]
+  end
+
+  defp sql(statement, params) do
+    with {:ok, _} <-
+           SQL.query(Repo, "SET LOCAL statement_timeout = '750ms'", [],
+             log: false,
+             telemetry_event: nil,
+             timeout: 1_000
+           ) do
+      SQL.query(Repo, statement, params, log: false, telemetry_event: nil, timeout: 1_000)
+    end
+  end
+
+  defp uuid(id), do: Ecto.UUID.dump!(id)
 end

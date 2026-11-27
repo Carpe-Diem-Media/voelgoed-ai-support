@@ -343,8 +343,15 @@ defmodule VoelgoedAi.Support.Ownership do
 
   @doc false
   def prepare(config, session, run, purpose, deadline) do
+    {purpose, payload_digest} =
+      case purpose do
+        {:typed_reply, digest} -> {:public_reply, digest}
+        other -> {other, nil}
+      end
+
     delivery = %{
       session_id: session.id,
+      payload_digest: payload_digest,
       purpose: purpose,
       visibility: if(purpose == :public_reply, do: :public, else: :operational),
       operation_ref: Ash.UUIDv7.generate(),
@@ -366,6 +373,13 @@ defmodule VoelgoedAi.Support.Ownership do
   end
 
   defp template(%{purpose: :handoff_status} = attrs, _config, _run), do: {:ok, attrs}
+
+  defp template(%{payload_digest: digest} = attrs, config, %{decision: :typed_reply} = run)
+       when is_binary(digest) do
+    if write_enabled?(config),
+      do: {:ok, Map.put(attrs, :run_id, run.id)},
+      else: {:error, :stale_policy}
+  end
 
   defp template(attrs, config, run) do
     with {:ok, revision} <- Configuration.current_revision(config.assistant),

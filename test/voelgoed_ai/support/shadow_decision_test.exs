@@ -40,6 +40,77 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
     end
   end
 
+  test "fixed decisions reject cited evidence" do
+    for {outcome, reason} <- [
+          {"greeting", "greeting"},
+          {"handoff", "human_requested"},
+          {"decline", "off_topic"}
+        ] do
+      assert :error =
+               SupportDecision.cast(%{
+                 "schema_version" => 1,
+                 "decision" => outcome,
+                 "locale" => "en-ZA",
+                 "reason_code" => reason,
+                 "evidence_revision_ids" => [Ash.UUIDv7.generate()],
+                 "reply_text" => nil
+               })
+    end
+  end
+
+  test "publishing a shadow revision onto an automatic binding denies writes" do
+    import VoelgoedAi.SupportFixtures, only: [allow_fixture: 2, invoke: 4]
+    alias VoelgoedAi.Intelligence.AssistantRevision
+    alias VoelgoedAi.Support.Configuration
+
+    ctx = SupportDBCase.setup()
+    id = queue(ctx, "Hello")
+
+    workflow = %{
+      workflow_version: "shadow-v1",
+      template_version: "shadow-v1",
+      locale: :en,
+      response_policy: :shadow_decision,
+      shadow_evaluation: true
+    }
+
+    allow_fixture(
+      ctx.assistant,
+      Map.merge(VoelgoedAi.Support.ChatwootAdapter.fixture(), workflow)
+    )
+
+    assert {:ok, revision} =
+             invoke(
+               AssistantRevision,
+               :create_draft,
+               workflow
+               |> Map.delete(:shadow_evaluation)
+               |> Map.put(:assistant_id, ctx.assistant.id),
+               ctx.admin
+             )
+
+    assert {:ok, _} =
+             invoke(
+               AssistantRevision,
+               :publish,
+               %{id: revision.id, expected_active_revision_id: ctx.revision.id},
+               ctx.admin
+             )
+
+    assert {:ok, false} =
+             RunProcessing.with_run(id, fn config, _, _, _ ->
+               assert config.binding.operating_mode == :automatic
+               assert config.control.mode == :fake and config.control.status == :enabled
+
+               assert {:ok, %{id: published, response_policy: :shadow_decision}} =
+                        Configuration.current_revision(config.assistant)
+
+               assert published == revision.id
+               assert Ownership.permitted?(config)
+               {:ok, Ownership.write_enabled?(config)}
+             end)
+  end
+
   for {locale, label, text, outcome, reason, approved} <- [
         {:af, "greeting", "Hallo!", "greeting", "greeting", "Hallo! Hoe kan ons jou help?"},
         {:en, "greeting", "Hello!", "greeting", "greeting", "Hello! How can we help you?"},

@@ -47,7 +47,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
     end
 
     check_constraints do
-      check_constraint(:purpose, "outbound_deliveries_lifecycle",
+      check_constraint(:purpose, "outbound_deliveries_intent_lifecycle",
         check: """
         ownership_epoch >= 0 AND assistant_epoch >= 0 AND binding_epoch >= 0 AND control_epoch >= 0 AND
         claim_generation >= 0 AND attempt_count BETWEEN 0 AND 1 AND read_sequence >= 0 AND read_count >= 0 AND
@@ -57,12 +57,50 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         (state <> 'unknown' OR uncertainty_reason IS NOT NULL) AND
         (state = 'sent') = (confirmed_at IS NOT NULL) AND
         ((purpose = 'public_reply' AND visibility = 'public' AND run_id IS NOT NULL AND
-          template_version IS NOT NULL AND template_hash ~ '^[a-f0-9]{64}$' AND
+          ((payload_digest IS NULL AND template_version IS NOT NULL AND template_hash ~ '^[a-f0-9]{64}$')
+            OR (payload_digest IS NOT NULL AND payload_digest ~ '^[a-f0-9]{64}$' AND template_version IS NULL AND template_hash IS NULL)) AND
           (state <> 'sent' OR (external_message_id IS NOT NULL AND external_message_id > 0))) OR
          (purpose = 'handoff_status' AND visibility = 'operational' AND template_version IS NULL AND
-          template_hash IS NULL AND external_message_id IS NULL))
+          template_hash IS NULL AND payload_digest IS NULL AND external_message_id IS NULL))
         """
       )
+    end
+
+    custom_statements do
+      statement :guard_typed_intent do
+        after_tables(["outbound_deliveries"])
+
+        up("""
+        CREATE FUNCTION guard_outbound_typed_intent() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'typed reply intent is immutable' USING ERRCODE = 'check_violation';
+        END
+        $$;
+        """)
+
+        down("DROP FUNCTION guard_outbound_typed_intent()")
+      end
+
+      statement :guard_typed_intent_trigger do
+        after_tables(["outbound_deliveries"])
+
+        up("""
+        CREATE TRIGGER outbound_deliveries_immutable_typed_intent
+          BEFORE UPDATE OF payload_digest, run_id, session_id, operation_ref, purpose,
+            visibility, ownership_epoch, assistant_epoch, binding_epoch, control_epoch,
+            deadline_at ON outbound_deliveries
+          FOR EACH ROW WHEN (OLD.payload_digest IS DISTINCT FROM NEW.payload_digest OR
+            (OLD.payload_digest IS NOT NULL AND
+             ROW(OLD.run_id, OLD.session_id, OLD.operation_ref, OLD.purpose, OLD.visibility,
+               OLD.ownership_epoch, OLD.assistant_epoch, OLD.binding_epoch, OLD.control_epoch, OLD.deadline_at)
+             IS DISTINCT FROM
+             ROW(NEW.run_id, NEW.session_id, NEW.operation_ref, NEW.purpose, NEW.visibility,
+               NEW.ownership_epoch, NEW.assistant_epoch, NEW.binding_epoch, NEW.control_epoch, NEW.deadline_at)))
+          EXECUTE FUNCTION guard_outbound_typed_intent();
+        """)
+
+        down("DROP TRIGGER outbound_deliveries_immutable_typed_intent ON outbound_deliveries")
+      end
     end
   end
 
@@ -95,6 +133,8 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
       allow_nil?: true,
       constraints: [max_length: 64]
     )
+
+    attribute(:payload_digest, :string, constraints: [match: ~r/\A[a-f0-9]{64}\z/])
 
     attribute(:ownership_epoch, :integer, public?: true, allow_nil?: false, constraints: [min: 0])
     attribute(:assistant_epoch, :integer, public?: true, allow_nil?: false, constraints: [min: 0])
@@ -217,6 +257,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
         :correlation_id,
         :template_version,
         :template_hash,
+        :payload_digest,
         :ownership_epoch,
         :assistant_epoch,
         :binding_epoch,

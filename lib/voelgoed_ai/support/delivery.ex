@@ -6,12 +6,14 @@ defmodule VoelgoedAi.Support.Delivery do
 
   use VoelgoedAi.Support.WorkStore, [:read, :update]
 
+  alias VoelgoedAi.Knowledge.Retrieval
   alias VoelgoedAi.Repo
 
   alias VoelgoedAi.Support.{
     BindingCircuit,
     ChatwootAdapter,
     Configuration,
+    EvidenceReply,
     OutboundDelivery
   }
 
@@ -34,9 +36,9 @@ defmodule VoelgoedAi.Support.Delivery do
 
   @doc false
   def perform(id) do
-    with {:ok, {:read, reservation, session, generation}} <- with_delivery(id, &preflight/4),
+    with {:ok, {:read, reservation, session, generation, ids}} <- with_delivery(id, &preflight/4),
          observation <- ChatwootAdapter.observe(session, reservation.deadline_at),
-         history <- read_reply_history(session, reservation, observation),
+         history <- read_reply_history(session, reservation, observation, ids),
          {:ok, {:claimed, claim}} <-
            with_delivery(
              id,
@@ -46,9 +48,10 @@ defmodule VoelgoedAi.Support.Delivery do
          {:ok, {:authorized, authorized, text}} <-
            with_delivery(id, &authorize(&1, &2, &3, &4, claim, generation)),
          :ok <- fixture_barrier(:after_authorization),
-         {:ok, :dispatch_current} <-
+         fresh <- fresh_evidenced_read(session, authorized, ids),
+         {:ok, {:dispatch_current, text}} <-
            with_delivery(id, fn config, session, delivery, _ ->
-             dispatch_current(config, session, delivery, authorized, generation)
+             dispatch_current(config, session, delivery, authorized, generation, fresh, text)
            end) do
       result = post(session, authorized, text)
 
@@ -165,8 +168,13 @@ defmodule VoelgoedAi.Support.Delivery do
       true ->
         case BindingCircuit.reserve(config.binding, now) do
           {:closed, generation} ->
-            with {:ok, row} <- reserve_read(delivery, now),
-                 do: {:ok, {:read, row, session, generation}}
+            with {:ok, ids} <- reply_ids(config, session, delivery),
+                 {:ok, row} <- reserve_read(delivery, now) do
+              {:ok, {:read, row, session, generation, ids}}
+            else
+              {:error, :history_changed} -> fence(delivery, now, :history_changed)
+              error -> error
+            end
 
           {:probe, generation} ->
             with {:ok, _} <- fence(delivery, now, :unavailable),
@@ -180,10 +188,30 @@ defmodule VoelgoedAi.Support.Delivery do
 
   defp preflight(_, _, _, _), do: {:ok, :finished}
 
-  defp read_reply_history(session, %{purpose: :public_reply} = delivery, {:ok, _}),
-    do: ChatwootAdapter.history(session, delivery.deadline_at)
+  defp reply_ids(config, session, %{payload_digest: digest}) when is_binary(digest) do
+    with {:ok, receipts} <- RunProcessing.covered_receipts(session, config.run),
+         do: {:ok, Enum.map(receipts, &elem(&1, 1))}
+  end
 
-  defp read_reply_history(_, _, _), do: {:ok, []}
+  defp reply_ids(_, _, _), do: {:ok, nil}
+
+  defp read_reply_history(session, %{purpose: :public_reply} = delivery, {:ok, _}, ids) do
+    history = ChatwootAdapter.history(session, delivery.deadline_at)
+    context = if ids, do: ChatwootAdapter.decision_context(session, ids, delivery.deadline_at)
+    {history, {ids, context}}
+  end
+
+  defp read_reply_history(_, _, _, _), do: nil
+
+  defp fresh_evidenced_read(session, %{payload_digest: digest} = delivery, ids)
+       when is_binary(digest) do
+    deadline = earlier(delivery.deadline_at, delivery.lease_expires_at)
+
+    {ChatwootAdapter.observe(session, deadline),
+     {ids, ChatwootAdapter.decision_context(session, ids, deadline)}}
+  end
+
+  defp fresh_evidenced_read(_, _, _), do: nil
 
   defp claim(config, session, delivery, now, reservation, observation, history, generation) do
     cond do
@@ -220,7 +248,7 @@ defmodule VoelgoedAi.Support.Delivery do
          %{purpose: :public_reply} = delivery,
          now,
          {:ok, observation},
-         {:ok, history}
+         {{:ok, history}, context}
        ) do
     cond do
       observation.assignee == :human ->
@@ -231,11 +259,13 @@ defmodule VoelgoedAi.Support.Delivery do
       Ownership.eligible_bot?(config, session, observation) ->
         with {:ok, inputs} <- RunProcessing.inputs(delivery.run_id),
              :ok <- RunProcessing.check_coverage(inputs, history),
-             {:ok, false} <- Ownership.pending_input?(session) do
-          claim_delivery(delivery, now)
+             {:ok, false} <- Ownership.pending_input?(session),
+             :ok <- check_evidenced_claim(config, session, delivery, context) do
+          claim_reply(delivery, now)
         else
           {:ok, true} -> {:ok, :input_pending}
           {:error, :history_changed} -> fence(delivery, now, :history_changed)
+          {:error, :stale_evidence} -> fence(delivery, now, :stale_policy)
           error -> error
         end
 
@@ -317,6 +347,16 @@ defmodule VoelgoedAi.Support.Delivery do
 
   def audit_handoff_failure(row, _), do: {:ok, row}
 
+  defp claim_reply(%{payload_digest: digest} = delivery, _) when is_binary(digest) do
+    now = ChatwootAdapter.now()
+
+    if DateTime.before?(now, delivery.deadline_at),
+      do: claim_delivery(delivery, now),
+      else: expire_pending(delivery, now)
+  end
+
+  defp claim_reply(delivery, now), do: claim_delivery(delivery, now)
+
   defp claim_delivery(delivery, now) do
     lease = DateTime.add(now, @lease_seconds)
 
@@ -373,11 +413,50 @@ defmodule VoelgoedAi.Support.Delivery do
   defp newer_input?(_, _), do: {:ok, false}
 
   defp render(_config, %{purpose: :handoff_status}), do: {:ok, nil}
+  defp render(_config, %{payload_digest: digest}) when is_binary(digest), do: {:ok, nil}
 
   defp render(config, delivery),
     do: Configuration.render_fixed_reply(config.assistant, config.run, delivery)
 
-  defp dispatch_current(config, session, delivery, authorized, generation) do
+  defp evidence_owner, do: __MODULE__
+
+  defp check_evidenced_claim(
+         config,
+         session,
+         %{payload_digest: digest} = delivery,
+         {ids, context}
+       )
+       when is_binary(digest) do
+    with {:ok, ^ids} <- reply_ids(config, session, delivery),
+         {:ok, _} <- render_evidenced(config, delivery, context) do
+      :ok
+    else
+      {:ok, _} -> {:error, :history_changed}
+      error -> error
+    end
+  end
+
+  defp check_evidenced_claim(_, _, _, _), do: :ok
+
+  defp render_evidenced(config, delivery, {:ok, context}) do
+    run = config.run
+
+    with true <- run.decision == :typed_reply and is_nil(run.shadow_disposition),
+         true <- DateTime.compare(run.deadline_at, delivery.deadline_at) == :eq,
+         true <- Base.encode16(context.commitment, case: :lower) == run.context_digest,
+         {:ok, evidence} <- Retrieval.at_dispatch(&evidence_owner/0, config, run),
+         {:ok, text} <- EvidenceReply.render(run.typed_decision, evidence),
+         true <- EvidenceReply.digest(run, text) == delivery.payload_digest do
+      {:ok, text}
+    else
+      false -> {:error, :stale_evidence}
+      error -> error
+    end
+  end
+
+  defp render_evidenced(_, _, _), do: {:error, :history_changed}
+
+  defp dispatch_current(config, session, delivery, authorized, generation, fresh, text) do
     now = ChatwootAdapter.now()
 
     cond do
@@ -397,9 +476,46 @@ defmodule VoelgoedAi.Support.Delivery do
         store_update(delivery, :cancel, %{reason_code: :dispatch_denied})
 
       true ->
-        {:ok, :dispatch_current}
+        dispatch_payload(config, session, delivery, fresh, text)
     end
   end
+
+  defp dispatch_payload(
+         config,
+         session,
+         %{payload_digest: digest} = delivery,
+         {{:ok, %{status: status, assignee: assignee} = observation}, _},
+         _
+       )
+       when is_binary(digest) and (status == :resolved or assignee == :human) do
+    with {:ok, _} <- store_update(delivery, :cancel, %{reason_code: :dispatch_denied}) do
+      Ownership.observe(config, session, observation, ChatwootAdapter.now())
+    end
+  end
+
+  defp dispatch_payload(config, session, %{payload_digest: digest} = delivery, fresh, _)
+       when is_binary(digest) do
+    with {{:ok, observation}, {ids, context}} <- fresh,
+         true <- Ownership.eligible_bot?(config, session, observation),
+         {:ok, ^ids} <- reply_ids(config, session, delivery),
+         {:ok, false} <- newer_input?(session, delivery),
+         {:ok, text} <- render_evidenced(config, delivery, context) do
+      now = ChatwootAdapter.now()
+
+      if DateTime.diff(now, delivery.last_read_at, :millisecond) < 2_000 and
+           DateTime.diff(delivery.lease_expires_at, now, :millisecond) > @request_margin_ms and
+           DateTime.diff(delivery.deadline_at, now, :millisecond) > @request_margin_ms do
+        {:ok, {:dispatch_current, text}}
+      else
+        unknown(delivery, now, :ambiguous_write)
+      end
+    else
+      {:error, error} when is_exception(error) -> {:error, error}
+      _ -> store_update(delivery, :cancel, %{reason_code: :dispatch_denied})
+    end
+  end
+
+  defp dispatch_payload(_, _, _, _, text), do: {:ok, {:dispatch_current, text}}
 
   defp post(session, delivery, text) do
     deadline = earlier(delivery.deadline_at, delivery.lease_expires_at)
@@ -514,6 +630,7 @@ defmodule VoelgoedAi.Support.Delivery do
       case delivery.purpose do
         :public_reply ->
           config.run != nil and config.run.state == :completed and
+            (is_nil(delivery.payload_digest) or config.run.claim_generation > 0) and
             RunProcessing.valid_run?(config, session, config.run)
 
         :handoff_status ->

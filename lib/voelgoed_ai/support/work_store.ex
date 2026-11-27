@@ -61,6 +61,7 @@ defmodule VoelgoedAi.Support.WorkStore do
         :claim,
         :complete,
         :complete_shadow,
+        :complete_evidenced,
         :shadow_clarifications,
         :cancel,
         :supersede,
