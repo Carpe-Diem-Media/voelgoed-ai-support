@@ -6,6 +6,10 @@ Shadow decisions have a durable no-send disposition or stage a local staff
 handoff. A handoff inhibits the session, advances its ownership epoch and
 creates an operational status intent. Deliver, Sweep and Reconcile apply
 their normal guards. The shadow binding denies reply and status writes.
+On a transient conversation observation failure, the current claim can
+record a failed run and stage the same staff handoff in one transaction
+when the local session still has verified bot ownership. A definite scope denial or
+takeover skips this outage route.
 
 The synthetic setup uses signed requests, an ordered public-history fake,
 reviewed synthetic FAQ records indexed in PostgreSQL/pgvector, and fake
@@ -31,16 +35,19 @@ The `VGAS_EVAL` lines contain case IDs, locale, expected and observed
 outcomes, evidence selection, timing, fake wire counts and accounted usage.
 The 22 cases are versioned in
 [`test/support/shadow_cases.ex`](../../test/support/shadow_cases.ex).
-The supported cases use an authored localized title or alternative question.
-The worker requires a unique match. A condition the worker cannot resolve,
-conflicting matches or mixed current questions go to staff. Applicability
-defaults to empty. The evaluation does not estimate coverage for semantic
-query paraphrases or establish the quality of a production FAQ corpus.
-In the recorded run, all 22 cases matched their expected route and
-evidence. The first-worker p95 was 219.6 ms. There were eight query
-embedding hits, six generation hits and zero Chatwoot reply or status hits.
-Trusted usage totalled 74 input and 25 output tokens, with 43,814 synthetic
-nano-USD charged and one UNKNOWN hold of 525,375,000 nano-USD.
+The ranker combines the top 10 eligible candidates from each of the
+cosine and lexical branches and keeps the first four after rank fusion.
+A reply requires one covering revision in that shortlist. One localized
+title or alternative question must cover all current topic terms. An
+explicit continuation can use the immediately preceding public contact
+message to supply missing terms when both messages supply terms from the
+same authored topic. Unresolved conditions and competing covering revisions
+go to staff. Applicability defaults to empty.
+
+The synthetic tests include Afrikaans and English paraphrases, an
+anchored follow-up, and a conflicting pair. They exercise bounded lexical
+coverage with fake vectors. They cannot measure semantic coverage or
+ranking quality on a source-approved FAQ corpus.
 [PR D verification record](../plans/VGAS-15D_VERIFICATION.md)
 
 The shadow claim uses the original 45-second turn deadline. It allows one
@@ -73,7 +80,9 @@ VGAS_SMOKE_OWNER_APPROVED=yes VGAS_SMOKE_CAP_NANO_USD=525375000 \
 ```
 
 Set the provider project's cap before the run. The local one-shot wire
-allows one request with a 500 output-token limit and a 15-second HTTP cap.
+allows one request with a 500 output-token limit. Finch uses individual
+15-second timeouts, each clamped to the remaining turn budget. The
+governing total remains the worker's remaining turn deadline.
 The application reserves 525,375,000 nano-USD under its synthetic price
 snapshot. Record the provider's current pricing separately. Stop on a
 model or usage mismatch and retain uncertain spend for review. The test

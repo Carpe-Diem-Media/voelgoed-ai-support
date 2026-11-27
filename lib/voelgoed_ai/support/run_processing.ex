@@ -415,7 +415,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
             Atom.to_string(locale) <> "-ZA",
             query,
             fn search ->
-              evaluate_shadow(search, run, session, receipts, context, query, locale)
+              evaluate_shadow(search, run, session, receipts, context, query, locale, observation)
             end
           )
 
@@ -431,17 +431,25 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
-    defp shadow_query(%{current: [%{text: first} | rest]}) do
+    defp shadow_query(%{current: [%{text: first} | rest], prior: prior}) do
       query = String.trim(first)
       # A regroup may repeat the same question. Different current messages
       # need staff to resolve the combined intent before using one FAQ.
       if Enum.all?(rest, &(String.trim(&1.text) == query)) and
            not String.contains?(query, <<0>>) do
-        {:ok, query}
+        {:ok, {query, follow_up_topic(query, List.last(prior))}}
       else
         :error
       end
     end
+
+    defp follow_up_topic(query, %{role: :contact, text: text}) do
+      if Regex.match?(~r/\A(?:and|en)\s/iu, query) and not String.contains?(text, <<0>>),
+        do: text,
+        else: ""
+    end
+
+    defp follow_up_topic(_, _), do: ""
 
     defp compare_context(session, receipts, cutoff, original, observation) do
       with {:ok, original} <- original,
@@ -454,14 +462,24 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
-    defp evaluate_shadow(search, run, session, receipts, original, query, locale) do
+    defp evaluate_shadow(search, run, session, receipts, original, {query, _}, locale, verified) do
       found =
         ArticleRevision
         |> Ash.ActionInput.for_action(:search_published, %{query: query}, actor: search)
         |> Ash.run_action()
 
+      observation = ChatwootAdapter.observe(session, run.lease_expires_at)
+
+      if observation == {:ok, verified} do
+        propose_shadow(found, run, session, receipts, original, locale, observation)
+      else
+        # An outage on a later read must never hide a definite scope loss.
+        complete_claim(run, {:shadow, receipts, observation, {:error, :history_changed}})
+      end
+    end
+
+    defp propose_shadow(found, run, session, receipts, original, locale, observation) do
       cutoff = run.lease_expires_at
-      observation = ChatwootAdapter.observe(session, cutoff)
       context = compare_context(session, receipts, cutoff, {:ok, original}, observation)
 
       proposal =
@@ -794,6 +812,25 @@ defmodule VoelgoedAi.Support.RunProcessing do
             error ->
               error
           end
+      end
+    end
+
+    defp finalize(config, session, run, now, {:shadow, receipts, {:error, reason}, _, _})
+         when reason in [:unavailable, :deadline, :rate_limited] do
+      # The completion transaction already checked the claim, cutoff and
+      # epochs. Preserve the failed run alongside the fenced staff intent.
+      with {:ok, ^receipts} <- covered_receipts(session, run),
+           {:ok, false} <- Ownership.pending_input?(session),
+           {:ok, failed} <- finish(run, :fail, now, :unavailable) do
+        case Ownership.route_shadow_locked(config, session, :observation_unavailable, now) do
+          {:ok, _} -> {:ok, failed}
+          {:error, :scope_denied} -> {:ok, failed}
+          error -> error
+        end
+      else
+        {:ok, _} -> finish(run, :fail, now, :history_changed)
+        {:error, :history_changed} -> finish(run, :fail, now, :history_changed)
+        error -> error
       end
     end
 

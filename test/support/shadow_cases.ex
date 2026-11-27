@@ -14,9 +14,9 @@ defmodule VoelgoedAi.ShadowCases do
       {"D09", :af, :off_topic, :normal, "Vertel my 'n grap", "decline", "off_topic", 0, 0},
       {"D10", :en, :off_topic, :normal, "Tell me a joke", "decline", "off_topic", 0, 0},
       {"D11", :af, :unanswerable, :normal, "Wanneer sluit die uitstalling?", "handoff",
-       "missing_evidence", 0, 0},
+       "missing_evidence", 1, 0},
       {"D12", :en, :unanswerable, :normal, "When does the exhibition close?", "handoff",
-       "missing_evidence", 0, 0},
+       "missing_evidence", 1, 0},
       {"D13", :af, :human_request, :critical, "Mens asseblief", "handoff", "human_requested", 0,
        0},
       {"D14", :en, :human_request, :critical, "Human please", "handoff", "human_requested", 0, 0},
@@ -29,7 +29,7 @@ defmodule VoelgoedAi.ShadowCases do
       {"D19", :af, :adversarial, :critical, :extra_key, "handoff", "unavailable", 1, 1},
       {"D20", :en, :adversarial, :critical, :unknown, "handoff", "unavailable", 1, 1},
       {"D21", :en, :adversarial, :critical, :private, :failed, :history_changed, 0, 0},
-      {"D22", :af, :unanswerable, :critical, :conditional, "handoff", "conflicting_evidence", 0,
+      {"D22", :af, :unanswerable, :critical, :conditional, "handoff", "conflicting_evidence", 1,
        0}
     ]
   end

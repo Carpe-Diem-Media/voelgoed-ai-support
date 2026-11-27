@@ -69,6 +69,8 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     @query_key {__MODULE__, :query}
     @rank_measurement_key {__MODULE__, :rank_measurement}
 
+    @manifest_limit 4
+
     @rank """
     , words AS (
       SELECT to_tsquery('simple', string_agg(quote_literal(lexeme), ' | ')) AS query
@@ -77,14 +79,14 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       SELECT revision_id, row_number() OVER (ORDER BY distance, revision_id) AS rank
       FROM (
         SELECT revision_id, vector <=> $8::vector AS distance
-        FROM matching
+        FROM eligible
         ORDER BY distance, revision_id LIMIT 10
       ) ranked
     ), lexical AS (
       SELECT revision_id, row_number() OVER (ORDER BY score DESC, revision_id) AS rank
       FROM (
         SELECT revision_id, ts_rank(document, query) AS score
-        FROM matching CROSS JOIN words
+        FROM eligible CROSS JOIN words
         CROSS JOIN LATERAL (
           SELECT to_tsvector('simple', concat_ws(' ', variant->>'title',
             (SELECT string_agg(question, ' ') FROM jsonb_array_elements_text(
@@ -97,21 +99,47 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     )
     SELECT #{@projection}, semantic.rank, lexical.rank
     FROM (semantic FULL JOIN lexical USING (revision_id))
-    JOIN matching e USING (revision_id)
+    JOIN eligible e USING (revision_id)
     """
 
+    # Use the same lexemes as the ranker. Remove only function words and
+    # politeness markers, retaining negations, actions, qualifiers and IDs.
+    @function_words %{
+      "en-ZA" => ~w(a an and the please),
+      "af-ZA" => ~w('n aan asseblief die en oor)
+    }
+
     @coverage """
-    , matching AS (
-      SELECT e.* FROM eligible e
-      WHERE EXISTS (
-        SELECT 1 FROM jsonb_array_elements_text(
-          coalesce(e.variant->'alternative_questions', '[]'::jsonb)
-          || jsonb_build_array(e.variant->>'title')
-        ) AS question(value)
-        WHERE rtrim(lower(btrim(question.value)), '!?') =
-          rtrim(lower(btrim($9::text)), '!?')
-      )
+    , topic AS (
+      SELECT tsvector_to_array(to_tsvector('simple', $7::text)) AS current_words,
+             tsvector_to_array(to_tsvector('simple', $8::text)) AS prior_words
+    ), query_terms AS (
+      SELECT ARRAY(SELECT unnest(current_words) EXCEPT SELECT unnest($9::text[])) AS current_terms,
+             ARRAY(SELECT unnest(prior_words) EXCEPT SELECT unnest($9::text[])) AS prior_terms
+      FROM topic
+    ), covering AS (
+      SELECT e.revision_id,
+             jsonb_array_length(coalesce(e.variant->'escalation_conditions', '[]')) > 0
+               AS conditional,
+             bool_and(NOT (authored.terms <@ q.current_terms)) AS needs_prior
+      FROM eligible e CROSS JOIN query_terms q
+      CROSS JOIN LATERAL jsonb_array_elements_text(
+        coalesce(e.variant->'alternative_questions', '[]') || jsonb_build_array(e.variant->>'title')
+      ) AS question(value)
+      CROSS JOIN LATERAL (
+        SELECT ARRAY(
+          SELECT unnest(tsvector_to_array(to_tsvector('simple', question.value)))
+          EXCEPT SELECT unnest($9::text[])
+        ) AS terms
+      ) AS authored
+      WHERE cardinality(q.current_terms) BETWEEN 1 AND 64
+        AND cardinality(q.prior_terms) <= 64
+        AND q.current_terms <@ authored.terms
+        AND (authored.terms <@ q.current_terms
+          OR (q.prior_terms <@ authored.terms AND authored.terms <@ (q.current_terms || q.prior_terms)))
+      GROUP BY e.revision_id, conditional
     )
+    SELECT revision_id, conditional, needs_prior FROM covering ORDER BY revision_id LIMIT 2
     """
 
     @impl Ash.Policy.SimpleCheck
@@ -152,7 +180,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     def with_fixture(_, _), do: {:error, :denied}
 
     @doc false
-    def with_shadow(owner, run, session, observation, receipts, locale, query, operation) do
+    def with_shadow(owner, run, session, observation, receipts, locale, {query, prior}, operation) do
       if worker_owner?(owner) do
         context = %{
           run_id: run.id,
@@ -161,6 +189,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
           locale: locale,
           scope: %{},
           shadow_query: query,
+          prior_query: prior,
           observation: observation,
           receipts: receipts
         }
@@ -285,20 +314,23 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     end
 
     defp search(context, query) do
-      with {:ok, {lexemes, candidate}} when is_list(lexemes) <-
+      with {:ok, {query, lexemes, coverage}} <-
              qualified(context, fn config, run, _revision, now, _ ->
-               with {:ok, %{rows: [[lexemes]]}} <-
+               bindings = params(context, config, run, now)
+
+               with :ok <- has_eligible(bindings),
+                    {:ok, coverage} <- coverage(context, bindings),
+                    {:ok, query} when is_binary(query) <- rank_query(context, query, coverage),
+                    {:ok, %{rows: [[lexemes]]}} <-
                       sql("SELECT tsvector_to_array(to_tsvector('simple', $1))", [query]),
-                    true <- length(lexemes) in 1..64,
-                    {:ok, candidate} when candidate not in [:no_evidence, :denied] <-
-                      candidate(context, config, run, now) do
-                 {:ok, {lexemes, candidate}}
+                    true <- length(lexemes) in 1..64 do
+                 {:ok, {query, lexemes, coverage}}
                else
                  false -> {:ok, :no_evidence}
                  other -> other
                end
              end),
-           context = Map.put(context, :candidate, candidate),
+           context = Map.put(context, :coverage, coverage),
            {:ok, {:query_vector, vector}} <- embed(context, query),
            {:ok, evidence} when is_list(evidence) <- rank(context, lexemes, vector) do
         Process.put(@manifest_key, Map.new(evidence, &{&1.citation_id, &1}))
@@ -309,6 +341,15 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       end
     end
 
+    defp rank_query(%{prior_query: prior}, query, [{_, false, true}]) do
+      case minimize(query <> "\n" <> prior) do
+        {:ok, _} = bounded -> bounded
+        :error -> {:ok, :no_evidence}
+      end
+    end
+
+    defp rank_query(_, query, _), do: {:ok, query}
+
     defp embed(context, query) do
       ref = make_ref()
       mode = if Map.has_key?(context, :shadow_query), do: :shadow, else: :fixture
@@ -317,7 +358,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       try do
         Embedding.query(ref, query, fn work ->
           qualified(context, fn config, run, _revision, now, deadline ->
-            with :ok <- candidates(context, config, run, now),
+            with :ok <- check_search_pin(context, config, run, now),
                  true <- DateTime.before?(ChatwootAdapter.now(), deadline) do
               work.(config.control, run, deadline)
             else
@@ -332,48 +373,44 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
 
     defp rank(context, lexemes, vector) do
       qualified(context, fn config, run, revision, now, _ ->
-        with :ok <- ranked_candidate(context, config, run, now) do
-          rank_current(context, config, run, revision, now, lexemes, vector)
+        bindings = params(context, config, run, now) ++ [lexemes, vector]
+
+        with :ok <- check_rank_pin(context, config, run, now),
+             {:ok, %{rows: rows}} <- measured_rank(bindings),
+             {:ok, ranked} when is_list(ranked) <- select_ranked(context, sort_ranked(rows)) do
+          evidence =
+            Enum.flat_map(ranked, fn {_, _, row} ->
+              case project(row, context, run, revision, Ash.UUIDv7.generate()) do
+                {:ok, item} -> [item]
+                :error -> []
+              end
+            end)
+
+          {:ok, Enum.take(evidence, @manifest_limit)}
         end
       end)
     end
 
-    defp rank_current(context, config, run, revision, now, lexemes, vector) do
-      {statement, bindings} =
-        case context do
-          %{shadow_query: query} ->
-            # Both ranking branches operate only on the authored FAQ match.
-            # Nearest-neighbour similarity alone cannot authorize an answer.
-            {@eligible <> @coverage <> @rank, [lexemes, vector, query]}
-
-          _ ->
-            {@eligible <> ", matching AS (SELECT * FROM eligible)" <> @rank, [lexemes, vector]}
-        end
-
-      bindings = params(context, config, run, now) ++ bindings
+    defp measured_rank(bindings) do
+      statement = @eligible <> @rank
       result = sql(statement, bindings)
 
       if callback = Process.get(@rank_measurement_key),
         do: callback.(statement, bindings, result)
 
-      with {:ok, %{rows: rows}} <- result do
-        evidence =
-          rows
-          |> sort_ranked()
-          |> Enum.flat_map(fn {_, _, row} ->
-            case project(row, context, run, revision, Ash.UUIDv7.generate()) do
-              {:ok, item} -> [item]
-              :error -> []
-            end
-          end)
-          |> Enum.take(4)
-
-        case context do
-          %{shadow_query: _} when length(evidence) != 1 -> {:ok, []}
-          _ -> {:ok, evidence}
-        end
-      end
+      result
     end
+
+    # Ranking finds bounded candidates. A nearest neighbour, rank advantage
+    # or UUID tie break cannot supply missing coverage or resolve a conflict.
+    defp select_ranked(%{coverage: [{covered, false, _}]}, ranked) do
+      shortlist = Enum.take(ranked, @manifest_limit)
+      {:ok, Enum.filter(shortlist, fn {id, _, _} -> id == covered end)}
+    end
+
+    defp select_ranked(%{coverage: []}, _), do: {:ok, :no_evidence}
+    defp select_ranked(%{coverage: :fixture}, ranked), do: {:ok, ranked}
+    defp select_ranked(_, _), do: {:ok, :denied}
 
     @doc false
     def sort_fixture_ranks(rows), do: sort_ranked(rows)
@@ -483,9 +520,9 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     defp requalify_selected(context, config, run, revision, selected) do
       now = ChatwootAdapter.now()
 
-      with :ok <- check_coverage(context, config, run, now, selected),
-           {:ok, current} <- reproject(config, run, revision, selected, now),
-           true <- current == selected do
+      with {:ok, current} <- reproject(config, run, revision, selected, now),
+           true <- current == selected,
+           :ok <- check_coverage(context, config, run, now, selected) do
         {:ok, current}
       else
         {:error, error} when is_exception(error) -> {:error, error}
@@ -493,42 +530,31 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       end
     end
 
-    # A unique, authored title or alternative question establishes relevance
-    # for this narrow evaluation. Conditions with no trusted resolution and
-    # competing matches route to staff. Search never substitutes a decoy.
+    # Pin the bounded coverage result across embedding. An unrelated decoy
+    # may appear in either rank branch but cannot replace a lost subject.
+    defp check_search_pin(context, config, run, now) do
+      bindings = params(context, config, run, now)
 
-    defp candidate(%{shadow_query: _} = context, config, run, now) do
-      case matching(context, config, run, now) do
-        {:ok, [{id, false}]} -> {:ok, id}
-        {:ok, []} -> {:ok, :no_evidence}
-        {:ok, _} -> {:ok, :denied}
-        error -> error
+      with :ok <- has_eligible(bindings),
+           {:ok, current} <- coverage(context, bindings),
+           true <- current == context.coverage do
+        :ok
+      else
+        _ -> {:error, :stale_evidence}
       end
     end
 
-    defp candidate(context, config, run, now) do
-      case has_eligible(params(context, config, run, now)) do
-        :ok -> {:ok, :any}
-        result -> result
-      end
-    end
+    defp check_rank_pin(%{shadow_query: _} = context, config, run, now),
+      do: check_search_pin(context, config, run, now)
 
-    defp candidates(%{candidate: pin} = context, config, run, now) do
-      case candidate(context, config, run, now) do
-        {:ok, ^pin} -> :ok
-        {:ok, _} -> {:error, :stale_evidence}
-        error -> error
-      end
-    end
-
-    defp ranked_candidate(%{shadow_query: _} = context, config, run, now),
-      do: candidates(context, config, run, now)
-
-    defp ranked_candidate(_, _, _, _), do: :ok
+    defp check_rank_pin(_, _, _, _), do: :ok
 
     defp check_coverage(%{shadow_query: _} = context, config, run, now, [%{revision_id: id}]) do
-      case matching(context, config, run, now) do
-        {:ok, [{^id, false}]} -> :ok
+      selected = uuid(id)
+
+      case coverage(context, params(context, config, run, now)) do
+        {:ok, [{^selected, false, _}]} -> :ok
+        {:error, _} = error -> error
         _ -> {:error, :stale_evidence}
       end
     end
@@ -536,21 +562,18 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     defp check_coverage(%{shadow_query: _}, _, _, _, _), do: {:error, :stale_evidence}
     defp check_coverage(_, _, _, _, _), do: :ok
 
-    defp matching(context, config, run, now) do
-      statement =
-        @eligible <>
-          String.replace(@coverage, "$9", "$7") <>
-          """
-          SELECT revision_id, jsonb_array_length(
-            coalesce(variant->'escalation_conditions', '[]'::jsonb)
-          ) > 0 FROM matching LIMIT 2
-          """
-
+    # Each current term must be covered by the same authored title or
+    # alternative. Only an explicit, topically linked continuation can use
+    # prior contact terms to fill a missing part. Inspect at most two subjects
+    # so a conflicting variant outside the rank limits still forces triage.
+    defp coverage(%{shadow_query: query, prior_query: prior, locale: locale}, bindings) do
       with {:ok, %{rows: rows}} <-
-             sql(statement, params(context, config, run, now) ++ [context.shadow_query]) do
-        {:ok, Enum.map(rows, fn [id, conditions?] -> {Ecto.UUID.load!(id), conditions?} end)}
+             sql(@eligible <> @coverage, bindings ++ [query, prior, @function_words[locale]]) do
+        {:ok, Enum.map(rows, &List.to_tuple/1)}
       end
     end
+
+    defp coverage(_, _), do: {:ok, :fixture}
 
     defp has_eligible(params) do
       case sql(@eligible <> "SELECT EXISTS (SELECT 1 FROM eligible)", params) do

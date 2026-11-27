@@ -6,7 +6,8 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.{Repo, SupportDBCase}
   alias VoelgoedAi.Intelligence.{EmbeddingTransport, Generation}
-  alias VoelgoedAi.Support.{EvidenceReply, SupportDecision}
+  alias VoelgoedAi.Knowledge.Retrieval
+  alias VoelgoedAi.Support.{EvidenceReply, RunProcessing, SupportDecision}
   alias VoelgoedAi.Support.Workers.Sweep
 
   @moduletag :requires_pgvector
@@ -22,6 +23,177 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
         )
       )
     end
+  end
+
+  for {locale, text} <- [en: "FAQ, synthetic please?", af: "Vrae oor sintetiese, asseblief?"] do
+    test "#{locale} paraphrase ranks more than one eligible FAQ in both branches" do
+      locale = unquote(locale)
+      ctx = setup_faq(locale, "exact", decoy: &decoy/1)
+      id = queue(ctx, unquote(text))
+      configure(ctx)
+      owner = self()
+
+      Retrieval.with_rank_measurement(
+        fn _, _, {:ok, %{rows: rows}} ->
+          send(owner, {:ranks, Enum.map(rows, &[hd(&1) | Enum.take(&1, -2)])})
+        end,
+        fn -> assert :ok = perform(id) end
+      )
+
+      assert_receive {:ranks, rows}
+
+      assert Enum.sort(Enum.map(rows, &hd/1)) ==
+               Enum.sort([uuid(ctx.target.id), uuid(ctx.decoy.id)])
+
+      assert Enum.sort(Enum.map(rows, &Enum.at(&1, 1))) == [1, 2]
+      assert Enum.sort(Enum.map(rows, &Enum.at(&1, 2))) == [1, 2]
+
+      assert {"answer_exact", "supported", [target]} = outcome(run(id))
+      assert target == ctx.target.id
+      assert_usage(id, 1, 0, :exact)
+      assert_no_writes(ctx)
+    end
+  end
+
+  test "a qualified public follow-up uses the preceding contact topic" do
+    ctx = setup_faq(:en, "grounded", decoy: &decoy/1)
+    text = "And the FAQ?"
+    id = queue(ctx, text)
+    add_prior(ctx, "Synthetic, please")
+
+    configure(ctx,
+      embedding: fn req ->
+        input = (req.body |> IO.iodata_to_binary() |> Jason.decode!())["input"]
+        assert is_binary(input)
+        assert input =~ text
+        assert input =~ "Synthetic, please"
+        EmbeddingTransport.fixture_wire(req)
+      end,
+      generation: fn req ->
+        assert %{
+                 "prior_public_messages" => [
+                   %{"role" => "contact", "text" => "Synthetic, please"}
+                 ],
+                 "approved_evidence" => [%{"revision_id" => selected}]
+               } = wire_payload(req)
+
+        assert selected == ctx.target.id
+        response(req, ctx)
+      end
+    )
+
+    assert :ok = perform(id)
+    assert {"answer_grounded", "supported", [target]} = outcome(run(id))
+    assert target == ctx.target.id
+    assert_usage(id, 1, 1, :grounded)
+    assert_no_writes(ctx)
+  end
+
+  test "competing approved answers hand off without generation even when ranks differ" do
+    conflicting = fn raw ->
+      Map.update!(raw, "localized_content", fn locales ->
+        Enum.map(locales, &Map.put(&1, "approved_answer", "A different synthetic answer."))
+      end)
+    end
+
+    ctx = setup_faq(:en, "exact", decoy: conflicting)
+    id = queue(ctx, question(:en))
+    configure(ctx)
+    assert :ok = perform(id)
+    assert {"handoff", "conflicting_evidence", []} = outcome(run(id))
+    assert_usage(id, 1, 0, :exact)
+    assert_local_handoff(ctx)
+    assert_no_writes(ctx)
+  end
+
+  test "an unrelated follow-up cannot borrow the whole prior topic" do
+    ctx = setup_faq(:en, "exact")
+    id = queue(ctx, "And the exhibition hours?")
+    add_prior(ctx, question(:en))
+    configure(ctx)
+
+    assert :ok = perform(id)
+    assert {"handoff", "missing_evidence", []} = outcome(run(id))
+    assert_usage(id, 1, 0, :exact)
+    assert_local_handoff(ctx)
+    assert_no_writes(ctx)
+  end
+
+  for reason <- [:unavailable, :scope_denied] do
+    test "observation #{reason} after admission respects local ownership" do
+      exercise_observation_failure(unquote(reason))
+    end
+  end
+
+  defp exercise_observation_failure(reason) do
+    ctx = setup_faq(:en, "grounded")
+    id = queue(ctx, question(:en))
+    original = run(id)
+    configure(ctx)
+    Agent.update(ctx.support.fake, &Map.put(&1, :conversation_result, {:error, reason}))
+
+    assert :ok = perform(id)
+    assert {:failed, ^reason, []} = outcome(run(id))
+    assert :ok = perform(id)
+    assert :ok = Sweep.perform(job("run_id", id))
+    assert_no_writes(ctx)
+    assert :ok = perform(id)
+    assert_usage(id, 0, 0, :exact)
+
+    if reason == :unavailable do
+      assert_local_handoff(ctx)
+      assert %{rows: [[_]]} = SupportDBCase.delivery_rows(ctx.support, "id")
+      epoch = original.ownership_epoch + 1
+
+      assert %{rows: [[^epoch]]} =
+               SQL.query!(Repo, "SELECT ownership_epoch FROM support_sessions WHERE id = $1", [
+                 uuid(original.session_id)
+               ])
+    else
+      assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
+    end
+  end
+
+  test "a storage failure rolls back both the outage result and local triage" do
+    ctx = setup_faq(:en, "grounded")
+    id = queue(ctx, question(:en))
+    configure(ctx)
+    Agent.update(ctx.support.fake, &Map.put(&1, :conversation_result, {:error, :unavailable}))
+
+    SQL.query!(
+      Repo,
+      "ALTER TABLE outbound_deliveries ADD CONSTRAINT reject_outage_handoff CHECK (purpose <> 'handoff_status') NOT VALID"
+    )
+
+    try do
+      assert {:error, :storage_failure} = RunProcessing.process_run(id)
+      assert {:running, nil, []} = outcome(run(id))
+      assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
+
+      assert %{rows: [["bot_active", false]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT state, human_inhibit FROM support_sessions WHERE id = $1",
+                 [
+                   uuid(run(id).session_id)
+                 ]
+               )
+    after
+      SQL.query!(Repo, "ALTER TABLE outbound_deliveries DROP CONSTRAINT reject_outage_handoff")
+    end
+
+    assert_no_writes(ctx)
+  end
+
+  defp add_prior(ctx, text) do
+    Agent.update(ctx.support.fake, fn state ->
+      [current] = state.history
+      prior = %{current | id: current.id - 1}
+
+      %{state | history: [prior, current]}
+    end)
+
+    put_text(ctx, ctx.support.event.message_id - 1, text)
   end
 
   test "revocation after proposal dispatch denies T04 while trusted usage settles" do
@@ -115,7 +287,17 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
   end
 
   test "the pre-generation gate rejects a source changed after ranking" do
-    ctx = setup_faq(:en, "grounded", decoy: &decoy/1)
+    effective = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    ctx =
+      setup_faq(:en, "grounded",
+        decoy: &Map.put(&1, "effective_from", DateTime.to_iso8601(effective))
+      )
+
+    # Publish both FAQs, then place the support clock just before the
+    # decoy becomes effective. Once the original is selected, the decoy
+    # can fully cover the same question at the later qualification check.
+    Agent.update(ctx.support.fake, &%{&1 | now: DateTime.add(effective, -3)})
     id = queue(ctx, question(:en))
     owner = self()
 
@@ -130,12 +312,62 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
     task = Task.async(fn -> perform(id) end)
     assert_receive {:decision_history, worker}, 5_000
     revoke(ctx)
+    SupportDBCase.advance_clock(ctx.support, 1)
     send(worker, :resume_decision_history)
     assert :ok = Task.await(task, 6_000)
     assert {"handoff", "unavailable", []} = outcome(run(id))
     assert_usage(id, 1, 0, :grounded)
     assert Agent.get(ctx.hits, & &1) == %{embedding: 1, generation: 0}
     assert_local_handoff(ctx)
+    assert_no_writes(ctx)
+  end
+
+  test "an observation outage after generation persists triage and settles trusted usage" do
+    ctx = setup_faq(:en, "grounded")
+    id = queue(ctx, question(:en))
+
+    configure(ctx,
+      generation: fn req ->
+        Agent.update(ctx.support.fake, &Map.put(&1, :conversation_result, {:error, :unavailable}))
+        response(req, ctx)
+      end
+    )
+
+    assert :ok = perform(id)
+    assert {:failed, :unavailable, []} = outcome(run(id))
+    assert_local_handoff(ctx)
+    assert_usage(id, 1, 1, :grounded)
+    assert :ok = Sweep.perform(job("run_id", id))
+    assert_no_writes(ctx)
+    assert :ok = perform(id)
+    assert %{rows: [[_]]} = SupportDBCase.delivery_rows(ctx.support, "id")
+  end
+
+  test "an outage after a signed takeover cannot stage a local handoff" do
+    ctx = setup_faq(:en, "grounded")
+    id = queue(ctx, question(:en))
+
+    configure(ctx,
+      generation: fn req ->
+        assert SupportDBCase.signed_request(ctx.support, fn payload ->
+                 Map.merge(payload, %{
+                   "id" => ctx.support.event.message_id + 1,
+                   "message_type" => "outgoing",
+                   "sender" => %{"type" => "user", "id" => 82}
+                 })
+               end).status == 204
+
+        Agent.update(ctx.support.fake, &Map.put(&1, :conversation_result, {:error, :unavailable}))
+        response(req, ctx)
+      end
+    )
+
+    assert :ok = perform(id)
+    assert {:cancelled, :human_takeover, []} = outcome(run(id))
+    assert_usage(id, 1, 1, :grounded)
+    assert :ok = Sweep.perform(job("run_id", id))
+    assert :ok = perform(id)
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
     assert_no_writes(ctx)
   end
 
@@ -153,6 +385,7 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
 
     assert :ok = perform(id)
     assert {:cancelled, :scope_denied, []} = outcome(run(id))
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
     assert_usage(id, 1, 0, :grounded)
     assert Agent.get(ctx.hits, & &1) == %{embedding: 1, generation: 0}
     assert_no_writes(ctx)

@@ -7,7 +7,13 @@ Plane VGAS-15 was In Progress when read. This record covers the local D
 candidate under the [accepted plan](VGAS-15_PLAN.md), including R4, R5,
 R7, R10 and R11. No Plane or GitHub state changed.
 
-## Implementation and boundaries
+## Published candidate `b564f17`
+
+The results below describe the published candidate. See the
+[local review correction](#local-review-correction) for the changed
+retrieval and outage behavior and its verification.
+
+### Implementation and boundaries
 
 - The normal signed receipt, ProcessEvent and ProcessRun path runs the
   single shadow workflow in TEST. Its authority is a private worker
@@ -50,7 +56,7 @@ R7, R10 and R11. No Plane or GitHub state changed.
   uses the global epoch fence and compatible B/C schema. See the
   [shadow runbook](../runbooks/vgas-15-shadow.md).
 
-## Labelled synthetic results
+### Labelled synthetic results
 
 All 22 cases matched their expected route and evidence. The nearest-rank p95
 was 219.6 ms for the first worker execution. This timing includes local
@@ -291,3 +297,180 @@ checks. The owner must separately authorize VGAS-7 and VGAS-8 work.
 The source owner and staff reviewers own VGAS-11 and semantic review.
 The provider smoke remained excluded. Release and production activation
 are outside this handoff.
+
+## Local review correction
+
+The correction starts at PR #27 head
+`b564f177177173f115ee34575d21cffcfb8cc02a`, whose sole parent is
+`1cf422596aaed4c1620ef82340135c5049919f25`. No migrations, resource
+snapshots, dependencies or CI gate code changed.
+
+- Both rank branches use the eligible publication set, with the existing
+  limit of 10 per branch, reciprocal rank fusion and UUID tie break. The
+  shadow worker uses the first four fused revisions. It requires all
+  informative current terms to match one authored topic in the requested
+  locale and that topic's terms to be covered by the current turn or a
+  qualified continuation. The coverage check considers competing eligible
+  revisions even outside the shortlist. A missing match, a conflict, or
+  unresolved escalation conditions routes to staff. Rank gives no answer
+  confidence. Empty trusted applicability scope, live grant, locale,
+  profile, publication and run fences still apply.
+- The worker considers only the immediately preceding public contact
+  message for an explicit continuation. It adds that text to the bounded
+  rank query when it supplies missing terms for the unique covering
+  revision. Prior text cannot supply the entire topic or widen authority.
+  Relevance or qualification loss can invalidate a candidate across
+  embedding. Before generation and at T04, the worker reprojects the
+  selected ID and checks the same coverage. A newly eligible decoy
+  cannot replace the selected ID. T06 still checks the persisted
+  reference and render commitment at claim and final dispatch.
+- A transient Chatwoot observation failure stages one local staff intent
+  and fails the run atomically when the claim, receipts, epochs and last
+  verified local bot ownership are current. It uses the existing handoff
+  action to inhibit automation and advance the ownership epoch. A known
+  scope denial or takeover suppresses this route. Storage failure rolls
+  back the run failure and intent together.
+- The report gate requires a pass per assigned ordinary file, checks
+  reported outcomes and requires five feasibility results and the
+  explicitly named Repo cases.
+  The gate requires the one named smoke exclusion. An isolated report
+  probe removed one ordinary case from a passing multi-case file and
+  got the same acceptance on main and the correction. The verifier has
+  no ordinary case inventory. It rejected omitted, executed, skipped and
+  renamed smoke and an unexpected ordinary exclusion.
+
+### Corrected synthetic results
+
+The published-head run with the new regression tests reproduced seven
+failures, including both paraphrases producing no rank result, an
+unanswered follow-up, and the observation outage failing to stage
+triage. The paired scope denial passed.
+
+The 22 existing labels all matched expected routes and references in the
+corrected focused run. The first-worker nearest-rank p95 was 181.4 ms,
+including local SQL and fake transport. D11, D12 and D22 each added a
+query-embedding call and kept their handoff result with no evidence.
+Combined totals were 11 embedding calls, six generation calls, 83 trusted
+input tokens, 25 trusted output tokens and 43,838 synthetic nano-USD
+charged. D20 held 525,375,000 nano-USD as UNKNOWN. The matrix recorded
+zero reply and status writes.
+
+Separate signed-worker tests added two bilingual paraphrases with two
+eligible revisions ranked in each branch, a grounded follow-up with its
+qualified prior topic, a conflicting pair of approved answers, and an
+unrelated follow-up that cannot use the prior topic to answer. They also
+exercise the outage before inference and after trusted generation,
+scope denial, a signed takeover followed by an outage, and a forced
+handoff insert failure. The existing after-ranking fixture now makes a
+second revision with the same authored topic effective at the time of
+revocation. Generation remains denied even though the replacement would
+cover the query. The tests check immutable outcomes, selected IDs,
+trusted usage, and zero writes through replay, Sweep, Deliver and
+Reconcile where applicable.
+
+The paraphrases share informative terms with approved content. The fake
+embedding and small publication sets demonstrate qualification and branch
+participation. They do not measure semantic recall, prove entailment, or
+set production rank thresholds. The existing retrieval performance
+fixture measures the rank query on 192 eligible rows. It does not measure
+the shadow coverage check at production volume. Human semantic review
+and source-approved FAQ coverage remain pending. The live smoke remains
+excluded. VGAS-7, VGAS-8 and VGAS-11 remain external gates.
+
+### Correction verification
+
+The approved `vgas_disposable_pg.sh` runner provisioned PostgreSQL
+18.7 with pgvector 0.8.7 on 55435 for focused, migration and mutation
+runs and 55434 for full runs. Both used Erlang 29.1.2 and Elixir 1.20.5.
+The version and cosine check (`bash .github/scripts/verify_postgres.sh
+180007`) passed. The runner cleaned up its containers and volumes.
+
+```sh
+MIX_ENV=test HEX_OFFLINE=1 mise exec -- mix deps.get --check-locked
+MIX_ENV=test mise exec -- mix hex.audit
+MIX_ENV=test ELIXIR_ERL_OPTIONS="+S 4" mise exec -- mix compile --force --warnings-as-errors
+MIX_ENV=test mise exec -- mix format --check-formatted
+mise exec -- mix ash.codegen --check
+python3 .github/scripts/plan_tests.py
+git diff --check
+```
+
+All exited 0. Fresh migration and both Application CI upgrade
+sequences used `mix ecto.migrate --strict-version-order` and the actual
+Repo foundation report verifier. The fresh and foundation-only upgrade
+lanes passed six cases and excluded the predecessor case. The
+VGAS-001 upgrade installed the immutable predecessor migrations and
+the synthetic staff history, then passed all seven cases. Each upgrade
+confirmed zero pending migrations.
+
+```sh
+VGAS_F04_DISPOSABLE=1 VGAS_SHADOW_EVAL=1 mise exec -- mix test --no-compile --warnings-as-errors test/voelgoed_ai/support test/voelgoed_ai/knowledge test/voelgoed_ai/governance test/voelgoed_ai/intelligence/generation_test.exs test/voelgoed_ai/ash_ai_feasibility_test.exs --seed 0
+mise exec -- mix test --no-compile --warnings-as-errors test/voelgoed_ai/support/{shadow_workflow,shadow_decision,decision_evidence,shadow_smoke}_test.exs test/voelgoed_ai/intelligence/generation_test.exs --seed 0
+```
+
+The broader focused run passed 539 with one smoke exclusion before the
+signed-takeover-plus-outage test was added. The final five-file run passed
+278 with one smoke exclusion and included that case. Both exited 0.
+The decision evidence suite exercised 18 D1 loss cases and 18 paired
+controls across T04, T06 claim and T06 final dispatch. It varied
+revocation, expiry at equality, grant withdrawal, index epoch, index
+profile and signed takeover against an eligible decoy.
+
+DEV and PROD forced strict compiles (`MIX_ENV=<dev|prod> HEX_OFFLINE=1
+ELIXIR_ERL_OPTIONS="+S 2" mise exec -- mix compile --force
+--warnings-as-errors`) exited 1 on both exact published source and
+corrected source. Each emitted the same 17 inherited warning sites
+tracked by VGAS-19. The DEV and PROD BEAM probes passed for disabled
+Chatwoot adapters and absent TEST capability entry points. A seed 103
+full probe ran 859 passing tests with two exclusions before the final
+test addition. That probe's extra `--warnings-as-errors` test flag
+returned 1 due to inherited warnings in `chatwoot_feasibility_test.exs`.
+Strict TEST application compile and scoped tests above passed.
+
+The full run at seed 8125 exited 0 with 860 passes and two expected
+exclusions. It used the same explicit test file list for ExUnit and for
+the shard report verifier. The verifier exited 0.
+
+```sh
+mapfile -t tests < <(rg --files test -g '*_test.exs' | sort)
+VGAS_F04_DISPOSABLE=1 CI_TEST_RESULTS_OUTPUT="$report" mise exec -- mix test --no-compile --seed 8125 --formatter ExUnit.CLIFormatter --formatter VoelgoedAi.CITimingFormatter "${tests[@]}"
+python3 .github/scripts/verify_test_results.py "$report" shard "${tests[@]}"
+```
+
+Seven single-mutation runs used `mise exec -- mix test <target> --seed 0`
+and returned ExUnit exit 2 at the intended assertions after the
+unmodified control passed.
+
+- `shadow_workflow_test.exs:199`. Returning the original T04 manifest
+  committed a stale grounded decision after revocation.
+- `shadow_workflow_test.exs:289`. Bypassing pre-generation evidence
+  qualification reached T04, which rejected the revoked evidence after
+  generation.
+- `shadow_workflow_test.exs:451`. Using fixture query lineage let the
+  successor generate after an UNKNOWN predecessor query.
+- `shadow_workflow_test.exs:446`. Resetting the successor deadline
+  failed the inherited deadline assertion for both predecessor states.
+- `decision_evidence_test.exs:637`. Checking digest presence let
+  mismatched payloads through both T06 checks.
+- `decision_evidence_test.exs:20`. Skipping revalidation at T06 claim
+  consumed an attempt after revocation, index epoch change and profile
+  mismatch.
+- `decision_evidence_test.exs:20`. Skipping revalidation at the final
+  T06 check bypassed cancellation for revocation, expiry, index epoch and
+  profile drift.
+
+The mutation build had broken dependency links on the first attempt.
+That attempt stopped at publication or fixture evidence setup and does
+not count as mutation evidence. The recorded run used the corrected
+dependency links and restored original source after each change.
+
+After restoration, this command exited 0 with all 25 selected tests
+passing and 184 location-filter exclusions.
+
+```sh
+mise exec -- mix test --no-compile --warnings-as-errors test/voelgoed_ai/support/shadow_workflow_test.exs:199:289:446:451 test/voelgoed_ai/support/decision_evidence_test.exs:20:637 --seed 0
+```
+
+The local secret scan uses Gitleaks 8.30.1 against the staged change and
+the committed range from main. The live provider smoke and external
+activation were outside this local correction.
