@@ -60,7 +60,7 @@ The new WorkStore reads recheck operational IDs and states. The clarification fi
 
 ### Mutation checks
 
-Each mutation ran alone against a detached checkout of the code candidate with a fresh disposable mutation database. Each test selector below used `ELIXIR_ERL_OPTIONS="+S 2" mise exec -- mix test <selector> --seed 0`. Sources were restored in a finally block before rerunning each selector. The detached worktree diff was clean at the end.
+The mutation lane used a fresh disposable database. Each mutation ran alone against a detached checkout of the code candidate. Each test selector below used `ELIXIR_ERL_OPTIONS="+S 2" mise exec -- mix test <selector> --seed 0`. Sources were restored in a finally block before rerunning each selector. The detached worktree diff was clean at the end.
 
 | Mutation | File and line selector under `test/voelgoed_ai/support/` | Failing assertion | Mutated exit and result | Restored exit and result |
 | --- | --- | --- | --- | --- |
@@ -94,7 +94,7 @@ Each mutation ran alone against a detached checkout of the code candidate with a
 +++ b/lib/voelgoed_ai/support/decision_context.ex
 @@ -47,7 +47,7 @@
    def project(_, _, _), do: {:error, :history_changed}
- 
+
    defp qualified?(
 -         %TextMessage{visibility: :public, edited?: false, attachments?: false} = row,
 +         %TextMessage{edited?: false, attachments?: false} = row,
@@ -110,7 +110,7 @@ Each mutation ran alone against a detached checkout of the code candidate with a
 +++ b/lib/voelgoed_ai/support/delivery.ex
 @@ -509,7 +509,8 @@
    end
- 
+
    defp valid?(config, session, delivery, now) do
 -    Ownership.write_enabled?(config) and Ownership.current?(config, session, delivery) and
 +    (Ownership.write_enabled?(config) or Ownership.shadow_evaluation_enabled?(config)) and
@@ -126,7 +126,7 @@ Each mutation ran alone against a detached checkout of the code candidate with a
 --- a/lib/voelgoed_ai/support/ownership.ex
 +++ b/lib/voelgoed_ai/support/ownership.ex
 @@ -91,10 +91,11 @@
- 
+
    @doc false
    def write_enabled?(config) do
 -    permitted?(config) and config.binding.operating_mode == :automatic and
@@ -139,7 +139,7 @@ Each mutation ran alone against a detached checkout of the code candidate with a
 +         match?(%{adapter: {_, _}}, ChatwootAdapter.fixture()) and
 +         not match?(%{response_policy: :shadow_decision}, ChatwootAdapter.fixture()))
    end
- 
+
    if Mix.env() == :test do
 ```
 
