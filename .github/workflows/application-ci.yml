@@ -108,6 +108,7 @@ jobs:
           TEST_FILES: ${{ toJSON(matrix.files) }}
           CI_TIMING_OUTPUT: timing.json
           VGAS_F04_DISPOSABLE: '1'
+          VGAS_VERIFY_VGAS20_UPGRADE: 'true'
         run: |
           [[ "${VGAS_F04_DISPOSABLE:-}" == 1 && "${VGAS_VERIFY_PGVECTOR:-}" == true ]]
           mapfile -d '' -t paths < <(python3 -c 'import json, os, sys; sys.stdout.buffer.write(b"".join(os.fsencode(path) + b"\0" for path in json.loads(os.environ["TEST_FILES"])))')
