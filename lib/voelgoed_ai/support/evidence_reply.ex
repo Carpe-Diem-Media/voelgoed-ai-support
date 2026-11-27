@@ -40,34 +40,47 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @weekday ~S"(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:rs(?:day)?|r)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|maandag|dinsdag|woensdag|donderdag|vrydag|saterdag|sondag)"
   @weekday_prefix "#{@weekday}\\.?(?:,\\h*|\\h+)"
   @numeric_date ~S"(?:\p{N}{4}-\p{N}{2}-\p{N}{2}|\p{N}{1,2}[.\/-]\p{N}{1,2}[.\/-]\p{N}{2,4})"
+  @named_date """
+  (?:
+    #{@date_day}[\\h\\p{Pd}]+(?:(?:of|van)\\h+)?#{@month}#{@date_year}?
+    | #{@month}\\.?[\\h\\p{Pd}]+(?:(?:the|die)\\h+)?(?:#{@date_day}#{@date_year}?|\\p{N}{4})
+  )
+  """
+  @calendar_date "(?:#{@named_date}|#{@numeric_date})"
+  @calendar_fact """
+  (?:
+    #{@weekday}\\.?\\h*\\(\\h*#{@calendar_date}\\h*\\)
+    | #{@calendar_date}\\h*\\(\\h*#{@weekday}\\.?\\h*\\)
+    | #{@weekday_prefix}#{@calendar_date}
+    | #{@named_date}
+    | #{@weekday}
+  )
+  (?![\\p{L}\\p{M}\\p{N}_])
+  """
 
+  @number_digits ~S"\p{N}+(?:(?:[.,:\/-]|\h+)\p{N}+)*"
+  @mixed_part """
+  [\\h\\p{Pd}]+(?:and|en)[\\h\\p{Pd}]+
+  (?:\\p{N}+\\h*/\\h*\\p{N}+|(?:#{@written_number}[\\h\\p{Pd}]+)?#{@implicit_one}#{@fraction_word})
+  (?![\\p{L}\\p{M}\\p{N}_])
+  """
   @quantity """
   (?:#{@sign}#{@currency_prefix}\\s*|#{@currency_prefix}\\s*#{@sign}?|#{@sign}?)
-  (?:\\p{N}+(?:(?:[.,:\\/-]|\\h+)\\p{N}+)*|#{@written_number})
+  (?:#{@number_digits}(?:#{@mixed_part})?|#{@written_number})
   (?:(?:\\s+|[-‑])?(?:#{@amount_scale}|\\p{Sc}|#{@currency_label}|#{@minor_currency_suffix})(?![\\p{L}\\p{N}_]))*
   (?:\\s*%|#{@percentage_join}#{@percentage_unit}(?![\\p{L}\\p{M}\\p{N}_]))?
   """
-  @range_join ~S"(?:\h*[\p{Pd}−]\h*|\h+(?:to|tot|through)\h+)"
+  @between ~r/(?<![\p{L}\p{M}\p{N}_])(?:between|tussen)\h+\z/iu
+  @between_join ~r/\A\h+(?:and|en)\h+\z/iu
+  @range_join ~r/\A(?:\h*[\p{Pd}−]\h*|\h+(?:to|tot|through)\h+)\z/iu
 
   # Compare complete calendar dates and quantity expressions. Date qualifiers,
   # range endpoints and units cannot borrow support from separate source facts.
-  @facts ~r/
-    #{@link_fact}
-    |
-    (?<![\p{L}\p{M}\p{N}_])
-    (?:
-      (?:#{@weekday_prefix})?
-      (?:
-        #{@date_day}[\h\p{Pd}]+(?:(?:of|van)\h+)?#{@month}#{@date_year}?
-        | #{@month}\.?[\h\p{Pd}]+(?:(?:the|die)\h+)?(?:#{@date_day}#{@date_year}?|\p{N}{4})
-      )
-      | #{@weekday_prefix}#{@numeric_date}
-      | #{@weekday}
-    )
-    (?![\p{L}\p{M}\p{N}_])
-    |
-    #{@quantity}(?:#{@range_join}#{@quantity})?
-  /iux
+  @fact_patterns [
+    link: ~r/#{@link_fact}/iu,
+    calendar: ~r/(?<![\p{L}\p{M}\p{N}_])#{@calendar_fact}/iux,
+    quantity: ~r/#{@quantity}/iux
+  ]
   @bare_host ~r|\b[a-z][a-z0-9+.-]*://|iu
   @bare_domain ~r/\b(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}\b/u
   @unsafe ~r/[\x00-\x08\x0b-\x1f\x7f<>]|!\[|(?:\]\(|\]:)|(?:javascript|data|file|mailto|tel):|\bwww\.|\b(?:password|passwd|api[_ -]?key|secret|bearer|access[_ -]?token)\b|\b(?:sk|ghp|gho)[_\-][a-zA-Z0-9_\-]{8,}/iu
@@ -116,9 +129,59 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   defp safe_grounded?(_, _), do: false
 
   defp facts(text) do
-    @facts
-    |> Regex.scan(text)
-    |> Enum.map(fn [fact] -> String.trim_trailing(fact) end)
+    # Range and date patterns can contain smaller quantity matches. Compare the
+    # outer span once so a pair cannot be authorized as unrelated endpoints.
+    spans =
+      Enum.flat_map(@fact_patterns, fn {kind, pattern} ->
+        for [{start, length}] <- Regex.scan(pattern, text, return: :index, capture: :first) do
+          {start, length, kind}
+        end
+      end)
+      |> Enum.sort_by(fn {start, length, _} -> {start, -length} end)
+
+    {_, matched} =
+      Enum.reduce(spans, {0, []}, fn
+        {start, length, kind}, {next, matches} when start >= next ->
+          {start + length, [{start, length, kind} | matches]}
+
+        _, acc ->
+          acc
+      end)
+
+    matched
+    |> Enum.reverse()
+    |> join_ranges(text)
+    |> Enum.map(fn {start, length, _} -> binary_part(text, start, length) end)
+  end
+
+  defp join_ranges([{start, length, kind} = first, {right, width, kind} = second | rest], text)
+       when kind in [:calendar, :quantity] do
+    stop = start + length
+    separator = binary_part(text, stop, right - stop)
+
+    case range_start(text, start, separator) do
+      nil -> [first | join_ranges([second | rest], text)]
+      left -> join_ranges([{left, right + width - left, kind} | rest], text)
+    end
+  end
+
+  defp join_ranges([first | rest], text), do: [first | join_ranges(rest, text)]
+  defp join_ranges([], _), do: []
+
+  defp range_start(text, start, separator) do
+    cond do
+      Regex.match?(@range_join, separator) ->
+        start
+
+      Regex.match?(@between_join, separator) ->
+        case Regex.run(@between, binary_part(text, 0, start), return: :index) do
+          [{left, _}] -> left
+          nil -> nil
+        end
+
+      true ->
+        nil
+    end
   end
 
   @doc "Commit to the exact rendered bytes and the qualified immutable decision."

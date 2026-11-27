@@ -201,6 +201,27 @@ The focused command passed 191 tests at seed 0 on disposable PostgreSQL
 passed. The container and volume were removed. Exact-head CI and
 independent re-review are pending on the corrected candidate.
 
+Review at `7d29325` confirmed the earlier fixes and found that the matcher
+still split between-ranges, mixed fractions, parenthesized weekday dates
+and weekday intervals. The bilingual reproductions all committed on the
+earlier head. The correction extracts typed fact spans, retains the longer
+match when patterns start at the same position, and joins adjacent facts
+of the same kind across a range connector. Mixed fractions and
+parenthesized dates are matched together. The combined regular expression
+exceeded Elixir's compiler limit. Separate link, calendar and quantity
+patterns compile and preserve link checks and full-range matching.
+
+All eight denial cases and four cited controls passed. The author first
+used the same Afrikaans fractional phrase as both cited data and a negative
+case. The mixed-fraction fixture now uses a separate quarter-percent
+source. The nine direct renderer checks also passed, including keeping
+URL digits separate from standalone quantity support. Formatting, forced
+warnings-as-errors TEST compile and snapshot checks passed. The disposable
+seed-0 run of the focused command above plus
+`test/voelgoed_ai/support/delivery_recovery_test.exs` passed 268 tests.
+The container and volume were removed. Exact-head CI and independent
+re-review remain pending on the corrected candidate.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.

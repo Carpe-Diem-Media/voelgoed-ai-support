@@ -134,6 +134,26 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
          %{
            "af-ZA" => "Die afslag is een derde van ’n persent.",
            "en-ZA" => "The discount is one third of a percent."
+         }},
+        {"between range",
+         %{
+           "af-ZA" => "Die afslag is tussen 25 en 30%.",
+           "en-ZA" => "The discount is between 25 and 30%."
+         }},
+        {"mixed fraction",
+         %{
+           "af-ZA" => "Die afslag is 1 en ’n kwart persent.",
+           "en-ZA" => "The discount is 1 and a half percent."
+         }},
+        {"parenthesized weekday and date",
+         %{
+           "af-ZA" => "Besprekings sluit Dinsdag (30 November 2026).",
+           "en-ZA" => "Bookings close Tuesday (30 November 2026)."
+         }},
+        {"weekday interval",
+         %{
+           "af-ZA" => "Die kantoor is oop van Maandag tot Woensdag.",
+           "en-ZA" => "The office is open Monday to Wednesday."
          }}
       ] do
     @opts opts
@@ -175,7 +195,11 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"fractional percentage", "The later discount is one quarter of a percent."},
         {"weekday and date", "Bookings close Monday, 30 November 2026."},
         {"percentage range", "Group discounts range from 10–20%."},
-        {"written denominator", "The adjustment is two thirds of a percent."}
+        {"written denominator", "The adjustment is two thirds of a percent."},
+        {"between range", "The group discount is between 5 and 10%."},
+        {"mixed fraction", "The handling fee is 2 and a half percent."},
+        {"parenthesized weekday and date", "The meeting is Thursday (3 December 2026)."},
+        {"weekday interval", "The exhibition runs Friday to Sunday."}
       ] do
     @reply reply
 
@@ -613,7 +637,9 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                     "Kaartjieprys R25 per persoon. Daar is 25 plekke. Laat besprekings kos 40 rand. " <>
                       "Die aanpassing is − 55 rand. Die verwerkingsfooi is 75c. " <>
                       "Daar is een plek op die balkon. Die studentekorting is 30%. " <>
-                      "Besprekings sluit Maandag, 30 November 2026."
+                      "Besprekings sluit Maandag, 30 November 2026. Die saal sluit 30 November 2026. " <>
+                      "Die kantoor open Maandag. Die winkel open Dinsdag. Die toonbank sluit Woensdag. " <>
+                      "Daar is 1 sitplek by die deur. Laat veranderinge kos ’n kwart persent."
 
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
@@ -623,7 +649,11 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "Bookings close Monday, 30 November 2026. The meeting is 15 December 2026. " <>
                       "The later discount is one quarter of a percent. There is one place on the balcony. " <>
                       "The student discount is 30%. Group discounts range from 10–20%. " <>
-                      "The adjustment is two thirds of a percent."
+                      "The adjustment is two thirds of a percent. Doors close 30 November 2026. " <>
+                      "The office opens Monday. The shop opens Tuesday. The desk closes Wednesday. " <>
+                      "There is 1 seat by the door. Late changes cost a half percent. " <>
+                      "The group discount is between 5 and 10%. The handling fee is 2 and a half percent. " <>
+                      "The meeting is Thursday (3 December 2026). The exhibition runs Friday to Sunday."
                 end
 
               Map.put(variant, "approved_answer", answer)
