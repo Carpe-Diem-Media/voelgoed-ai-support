@@ -154,6 +154,23 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
          %{
            "af-ZA" => "Die kantoor is oop van Maandag tot Woensdag.",
            "en-ZA" => "The office is open Monday to Wednesday."
+         }},
+        {"email overlapping a cited date",
+         %{
+           "af-ZA" => "Kontak ons op Nov 25@example.test.",
+           "en-ZA" => "Contact us at Nov 25@example.test."
+         }},
+        {"range with a hyphen attached to the second endpoint",
+         %{"af-ZA" => "Die afslag is 25 -30%.", "en-ZA" => "The discount is 25 -30%."}},
+        {"range of mixed date formats",
+         %{
+           "af-ZA" => "Die uitstalling duur 30 November 2026 tot 2026-12-05.",
+           "en-ZA" => "The exhibition runs 30 November 2026 to 2026-12-05."
+         }},
+        {"range prefix before joined number words",
+         %{
+           "af-ZA" => "Die afslag is tussen vyf en tien persent.",
+           "en-ZA" => "The discount is between five and ten percent."
          }}
       ] do
     @opts opts
@@ -199,7 +216,10 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"between range", "The group discount is between 5 and 10%."},
         {"mixed fraction", "The handling fee is 2 and a half percent."},
         {"parenthesized weekday and date", "The meeting is Thursday (3 December 2026)."},
-        {"weekday interval", "The exhibition runs Friday to Sunday."}
+        {"weekday interval", "The exhibition runs Friday to Sunday."},
+        {"range with an attached hyphen", "Group discounts vary from 10 -20%."},
+        {"range of mixed date formats", "The sale runs 15 December 2026 to 2026-12-20."},
+        {"range with written endpoints", "The saving is between six and seven percent."}
       ] do
     @reply reply
 
@@ -639,7 +659,9 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "Daar is een plek op die balkon. Die studentekorting is 30%. " <>
                       "Besprekings sluit Maandag, 30 November 2026. Die saal sluit 30 November 2026. " <>
                       "Die kantoor open Maandag. Die winkel open Dinsdag. Die toonbank sluit Woensdag. " <>
-                      "Daar is 1 sitplek by die deur. Laat veranderinge kos ’n kwart persent."
+                      "Daar is 1 sitplek by die deur. Laat veranderinge kos ’n kwart persent. " <>
+                      "Die voorbeeld sê Nov 25. Die ou aanpassing was -30%. " <>
+                      "Die hersieningsdatum is 2026-12-05. Die toetswaardes is vyf en tien persent."
 
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
@@ -653,7 +675,11 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "The office opens Monday. The shop opens Tuesday. The desk closes Wednesday. " <>
                       "There is 1 seat by the door. Late changes cost a half percent. " <>
                       "The group discount is between 5 and 10%. The handling fee is 2 and a half percent. " <>
-                      "The meeting is Thursday (3 December 2026). The exhibition runs Friday to Sunday."
+                      "The meeting is Thursday (3 December 2026). The exhibition runs Friday to Sunday. " <>
+                      "The example says Nov 25. The old adjustment was -30%. " <>
+                      "The review date is 2026-12-05. The test values are five and ten percent. " <>
+                      "Group discounts vary from 10 -20%. The sale runs 15 December 2026 to 2026-12-20. " <>
+                      "The saving is between six and seven percent."
                 end
 
               Map.put(variant, "approved_answer", answer)

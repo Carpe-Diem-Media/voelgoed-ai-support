@@ -222,6 +222,21 @@ seed-0 run of the focused command above plus
 The container and volume were removed. Exact-head CI and independent
 re-review remain pending on the corrected candidate.
 
+Review at `14c8931` found one address overlap and three range boundary
+gaps. Eight bilingual denial tests reproduced them. Link and email spans
+now take precedence over overlapping calendar or quantity matches.
+Range composition joins mixed date formats, retains a hyphen attached to
+the right endpoint, and keeps a `between` or `tussen` prefix when a
+written-number span already covers both endpoints. Three verbatim range
+controls and nine direct overlap and range probes passed. The latter also
+confirmed that digits inside an email cannot authorize a separate date.
+
+The four-file focused run at seed 0 passed 279 tests. Formatting, forced
+warnings-as-errors TEST compile and snapshots passed on disposable
+PostgreSQL 18.7 with pgvector 0.8.7. Its container and volume were removed.
+Independent re-review and exact-head CI are pending on the corrected
+candidate.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.

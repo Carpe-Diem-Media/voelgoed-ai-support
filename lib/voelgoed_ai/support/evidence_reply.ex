@@ -7,7 +7,7 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   alias VoelgoedAi.Knowledge.Content
   alias VoelgoedAi.Support.SupportDecision
 
-  @link_fact "https?:\\/\\/[^\\s<>\"()\\[\\]]+|[\\p{L}\\p{N}._%+-]+@[\\p{L}\\p{N}.-]+\\.[\\p{L}]{2,}"
+  @link_fact ~r/https?:\/\/[^\s<>"()\[\]]+|[\p{L}\p{N}._%+-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,}/iu
   @amount_scale ~S"(?:hundreds?|honderde?|thousands?|duisende?|millions?|miljoene?|billions?|miljarde?|biljoene?|trillions?|triljoene?|k|m|mn|mln|mm|b|bn|bln|tn|trn)"
   @currency_code ~S"(?:ZAR|USD|EUR|GBP|AUD|CAD|CHF|CNY|INR|JPY|NZD|R)"
   @currency_name ~S"(?:(?:South\s+African|Suid[-‑ ]Afrikaanse|Australian|Canadian|New\s+Zealand|US|U\.S\.|British)\s+)?(?:rande?|dollars?|euros?|pounds?|ponde?|cents?|sente?|penny|pennies|pence|yen|yuan|rupees?|roepees?|francs?|franke?)"
@@ -72,12 +72,13 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   """
   @between ~r/(?<![\p{L}\p{M}\p{N}_])(?:between|tussen)\h+\z/iu
   @between_join ~r/\A\h+(?:and|en)\h+\z/iu
-  @range_join ~r/\A(?:\h*[\p{Pd}−]\h*|\h+(?:to|tot|through)\h+)\z/iu
+  @range_join ~r/\A(?:\h*[\p{Pd}−]\h*|\h+(?:to|through|until|till|tot(?:\h+en\h+met)?)\h+)\z/iu
+  @horizontal_gap ~r/\A\h*\z/u
 
   # Compare complete calendar dates and quantity expressions. Date qualifiers,
   # range endpoints and units cannot borrow support from separate source facts.
   @fact_patterns [
-    link: ~r/#{@link_fact}/iu,
+    link: @link_fact,
     calendar: ~r/(?<![\p{L}\p{M}\p{N}_])#{@calendar_fact}/iux,
     quantity: ~r/#{@quantity}/iux
   ]
@@ -115,7 +116,7 @@ defmodule VoelgoedAi.Support.EvidenceReply do
     approved_facts = sources |> Enum.flat_map(&facts/1) |> MapSet.new()
     links = Enum.flat_map(evidence, & &1.links)
 
-    plain = Regex.replace(~r/#{@link_fact}/iu, reply, " ")
+    plain = Regex.replace(@link_fact, reply, " ")
 
     not Regex.match?(@unsafe, reply) and not Regex.match?(@bare_host, plain) and
       not Regex.match?(@bare_domain, plain) and
@@ -129,15 +130,24 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   defp safe_grounded?(_, _), do: false
 
   defp facts(text) do
-    # Range and date patterns can contain smaller quantity matches. Compare the
-    # outer span once so a pair cannot be authorized as unrelated endpoints.
-    spans =
+    # A date or quantity may overlap an address. Preserve every address span
+    # for the link checks and keep its digits out of other evidence facts.
+    {links, other} =
       Enum.flat_map(@fact_patterns, fn {kind, pattern} ->
         for [{start, length}] <- Regex.scan(pattern, text, return: :index, capture: :first) do
           {start, length, kind}
         end
       end)
-      |> Enum.sort_by(fn {start, length, _} -> {start, -length} end)
+      |> Enum.split_with(fn {_, _, kind} -> kind == :link end)
+
+    other =
+      Enum.reject(other, fn {start, length, _} ->
+        Enum.any?(links, fn {offset, width, :link} ->
+          start < offset + width and offset < start + length
+        end)
+      end)
+
+    spans = Enum.sort_by(links ++ other, fn {start, length, _} -> {start, -length} end)
 
     {_, matched} =
       Enum.reduce(spans, {0, []}, fn
@@ -151,15 +161,21 @@ defmodule VoelgoedAi.Support.EvidenceReply do
     matched
     |> Enum.reverse()
     |> join_ranges(text)
-    |> Enum.map(fn {start, length, _} -> binary_part(text, start, length) end)
+    |> Enum.map(&fact_text(&1, text))
   end
 
-  defp join_ranges([{start, length, kind} = first, {right, width, kind} = second | rest], text)
-       when kind in [:calendar, :quantity] do
+  defp join_ranges(
+         [{start, length, kind} = first, {right, width, right_kind} = second | rest],
+         text
+       )
+       when kind != :link and right_kind != :link do
     stop = start + length
     separator = binary_part(text, stop, right - stop)
 
-    case range_start(text, start, separator) do
+    signed_right? =
+      right_kind == :quantity and String.starts_with?(binary_part(text, right, width), ["-", "−"])
+
+    case range_start(text, start, separator, signed_right?) do
       nil -> [first | join_ranges([second | rest], text)]
       left -> join_ranges([{left, right + width - left, kind} | rest], text)
     end
@@ -168,19 +184,34 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   defp join_ranges([first | rest], text), do: [first | join_ranges(rest, text)]
   defp join_ranges([], _), do: []
 
-  defp range_start(text, start, separator) do
+  defp range_start(text, start, separator, signed_right?) do
     cond do
       Regex.match?(@range_join, separator) ->
         start
 
+      signed_right? and Regex.match?(@horizontal_gap, separator) ->
+        start
+
       Regex.match?(@between_join, separator) ->
-        case Regex.run(@between, binary_part(text, 0, start), return: :index) do
-          [{left, _}] -> left
-          nil -> nil
-        end
+        between_start(text, start)
 
       true ->
         nil
+    end
+  end
+
+  defp fact_text({start, length, :link}, text), do: binary_part(text, start, length)
+
+  defp fact_text({start, length, _}, text) do
+    # A written-number span can already contain its two endpoints and "and".
+    left = between_start(text, start) || start
+    binary_part(text, left, start + length - left)
+  end
+
+  defp between_start(text, start) do
+    case Regex.run(@between, binary_part(text, 0, start), return: :index) do
+      [{left, _}] -> left
+      nil -> nil
     end
   end
 
