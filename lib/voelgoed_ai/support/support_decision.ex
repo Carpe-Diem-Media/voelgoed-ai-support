@@ -13,7 +13,7 @@ defmodule VoelgoedAi.Support.SupportDecision do
   @uuid_v7 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/
 
   @enforce_keys @fields
-  defstruct @fields
+  defstruct @fields ++ [purged?: false]
 
   @type t :: %__MODULE__{
           schema_version: 1,
@@ -21,7 +21,8 @@ defmodule VoelgoedAi.Support.SupportDecision do
           locale: String.t(),
           reason_code: String.t(),
           evidence_revision_ids: [String.t()],
-          reply_text: String.t() | nil
+          reply_text: String.t() | nil,
+          purged?: boolean()
         }
 
   @doc "Validate an exact string-keyed map without coercing its values."
@@ -76,22 +77,36 @@ defmodule VoelgoedAi.Support.SupportDecision do
 
   @impl true
   def cast_input(nil, _), do: {:ok, nil}
-  def cast_input(%__MODULE__{} = value, _), do: value |> encode() |> cast()
+  def cast_input(%__MODULE__{} = value, _), do: value |> encode() |> cast_persisted()
   def cast_input(value, _), do: cast(value)
 
   @impl true
   def cast_stored(nil, _), do: {:ok, nil}
-  def cast_stored(value, _), do: cast(value)
+  def cast_stored(value, _), do: cast_persisted(value)
+
+  # Omission distinguishes a purged reply from an original decision with a
+  # null reply. The public proposal decoder still requires all six fields.
+  defp cast_persisted(%{"decision" => kind} = value)
+       when kind in ["answer_grounded", "clarify"] and not is_map_key(value, "reply_text") do
+    with {:ok, validated} <- cast(Map.put(value, "reply_text", "x")) do
+      {:ok, %{validated | reply_text: nil, purged?: true}}
+    end
+  end
+
+  defp cast_persisted(value), do: cast(value)
 
   @impl true
   def dump_to_native(nil, _), do: {:ok, nil}
 
   def dump_to_native(%__MODULE__{} = value, _) do
     encoded = encode(value)
-    with {:ok, _} <- cast(encoded), do: {:ok, encoded}
+    with {:ok, _} <- cast_persisted(encoded), do: {:ok, encoded}
   end
 
   def dump_to_native(_, _), do: :error
 
-  defp encode(value), do: Map.new(@fields, &{Atom.to_string(&1), Map.fetch!(value, &1)})
+  defp encode(%{purged?: true} = value), do: value |> fields() |> Map.delete("reply_text")
+  defp encode(value), do: fields(value)
+
+  defp fields(value), do: Map.new(@fields, &{Atom.to_string(&1), Map.fetch!(value, &1)})
 end

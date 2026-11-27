@@ -94,7 +94,10 @@ defmodule VoelgoedAi.Support.DecisionTemplates do
 
   @doc "Render the approved template for a deterministic decision and pinned version."
   @spec render(SupportDecision.t(), String.t()) :: {:ok, String.t()} | :error
-  def render(%SupportDecision{locale: locale, decision: decision, reply_text: nil}, @version) do
+  def render(
+        %SupportDecision{locale: locale, decision: decision, reply_text: nil, purged?: false},
+        @version
+      ) do
     case get_in(@templates, [locale, decision]) do
       text when is_binary(text) -> {:ok, text}
       nil -> :error

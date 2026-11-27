@@ -1,0 +1,626 @@
+{
+  "attributes": [
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"uuidv7()\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": true,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "turn_ref",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "ownership_epoch",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "assistant_epoch",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "binding_epoch",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "control_epoch",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "0",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "claim_generation",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "0",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "attempt_count",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "0",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "watermark",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "0",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "regroup_count",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "deadline_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "batch_cutoff_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "lease_expires_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "retry_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "started_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "finished_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "decision",
+      "type": "text"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "retention_state",
+      "type": "text"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "retention_occurrence",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "typed_decision",
+      "type": "map"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "evidence_refs",
+      "type": [
+        "array",
+        "map"
+      ]
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "context_digest",
+      "type": "text"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "shadow_disposition",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "\"queued\"",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "state",
+      "type": "text"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "reason_code",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "correlation_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "inserted_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "updated_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "support_runs_session_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "support_sessions"
+      },
+      "scale": null,
+      "size": null,
+      "source": "session_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "support_runs_assistant_revision_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "assistant_revisions"
+      },
+      "scale": null,
+      "size": null,
+      "source": "assistant_revision_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": {
+          "session_id": "session_id"
+        },
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "support_runs_parent_run_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "support_runs"
+      },
+      "scale": null,
+      "size": null,
+      "source": "parent_run_id",
+      "type": "uuid"
+    }
+  ],
+  "base_filter": null,
+  "check_constraints": [
+    {
+      "attribute": [
+        "turn_ref"
+      ],
+      "base_filter": null,
+      "check": "ownership_epoch >= 0 AND assistant_epoch >= 0 AND binding_epoch >= 0 AND control_epoch >= 0 AND\nclaim_generation >= 0 AND attempt_count >= 0 AND watermark >= 0 AND regroup_count BETWEEN 0 AND 1 AND\nstate IN ('queued', 'running', 'retry_wait', 'completed', 'cancelled', 'superseded', 'failed') AND\n(state = 'running') = (lease_expires_at IS NOT NULL) AND\n(state = 'retry_wait') = (retry_at IS NOT NULL) AND\n(state = 'completed') = (decision IS NOT NULL) AND\n(state IN ('completed', 'cancelled', 'superseded', 'failed')) = (finished_at IS NOT NULL)\n",
+      "name": "support_runs_lifecycle"
+    },
+    {
+      "attribute": [
+        "retention_state"
+      ],
+      "base_filter": null,
+      "check": "(CASE\n  WHEN jsonb_typeof(typed_decision->'reply_text') = 'string' THEN\n    state = 'completed' AND retention_state IN ('present', 'held')\n    AND typed_decision->>'decision' IN ('answer_grounded', 'clarify')\n    AND (retention_state <> 'held' OR retention_occurrence IS NOT NULL)\n  WHEN retention_state = 'purged' THEN\n    state = 'completed' AND retention_occurrence IS NOT NULL\n    AND typed_decision->>'decision' IN ('answer_grounded', 'clarify')\n    AND NOT (typed_decision ? 'reply_text')\n  ELSE retention_state IS NULL AND retention_occurrence IS NULL\n    AND typed_decision->>'decision' IS DISTINCT FROM 'answer_grounded'\n    AND (typed_decision IS NULL OR typed_decision ? 'reply_text')\nEND) IS TRUE\n",
+      "name": "support_runs_reply_retention"
+    },
+    {
+      "attribute": [
+        "shadow_disposition"
+      ],
+      "base_filter": null,
+      "check": "CASE\n  WHEN typed_decision IS NULL THEN\n    decision IS DISTINCT FROM 'typed_reply' AND\n    shadow_disposition IS NULL AND evidence_refs IS NULL AND context_digest IS NULL\n  WHEN state <> 'completed' OR claim_generation <= 0 OR\n    jsonb_typeof(typed_decision) IS DISTINCT FROM 'object' THEN false\n  WHEN evidence_refs IS NULL THEN\n    context_digest IS NULL AND decision = 'no_send' AND coalesce(\n      (shadow_disposition = 'local_handoff' AND typed_decision->>'decision' = 'handoff')\n      OR (shadow_disposition = 'no_send' AND typed_decision->>'decision' IN ('greeting', 'clarify', 'decline')),\n      false)\n  ELSE coalesce(\n    context_digest ~ '^[a-f0-9]{64}$' AND\n    cardinality(evidence_refs) BETWEEN 1 AND 4 AND array_position(evidence_refs, NULL) IS NULL AND\n    ((decision = 'no_send' AND shadow_disposition = 'no_send') OR\n      (decision = 'typed_reply' AND shadow_disposition IS NULL)) AND\n    ((typed_decision->>'decision' = 'answer_exact' AND cardinality(evidence_refs) = 1) OR\n      typed_decision->>'decision' = 'answer_grounded'),\n    false)\nEND\n",
+      "name": "support_runs_typed_completion"
+    }
+  ],
+  "create_table_options": null,
+  "custom_indexes": [
+    {
+      "all_tenants?": false,
+      "concurrently": false,
+      "error_fields": [
+        "id",
+        "turn_ref"
+      ],
+      "fields": [
+        {
+          "type": "atom",
+          "value": "id"
+        },
+        {
+          "type": "atom",
+          "value": "turn_ref"
+        }
+      ],
+      "include": null,
+      "include_base_filter?": true,
+      "message": null,
+      "name": "support_runs_qualified_turn",
+      "nulls_distinct": true,
+      "prefix": null,
+      "table": null,
+      "unique": true,
+      "using": null,
+      "where": null
+    },
+    {
+      "all_tenants?": false,
+      "concurrently": false,
+      "error_fields": [
+        "session_id"
+      ],
+      "fields": [
+        {
+          "type": "atom",
+          "value": "session_id"
+        }
+      ],
+      "include": null,
+      "include_base_filter?": true,
+      "message": null,
+      "name": "support_runs_one_active",
+      "nulls_distinct": true,
+      "prefix": null,
+      "table": null,
+      "unique": true,
+      "using": null,
+      "where": "state IN ('queued', 'running', 'retry_wait')"
+    }
+  ],
+  "custom_statements": [
+    {
+      "after_tables": [
+        "support_runs"
+      ],
+      "code?": false,
+      "down": "DROP FUNCTION guard_support_run_shadow_completion()",
+      "global?": false,
+      "name": "guard_shadow_completion_function",
+      "up": "CREATE FUNCTION guard_support_run_shadow_completion() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n  RAISE EXCEPTION 'shadow completion may only be written from a running claim'\n    USING ERRCODE = 'check_violation';\nEND\n$$;\n"
+    },
+    {
+      "after_tables": [
+        "support_runs"
+      ],
+      "code?": false,
+      "down": "DROP TRIGGER support_runs_immutable_shadow_completion ON support_runs",
+      "global?": false,
+      "name": "guard_shadow_completion_trigger",
+      "up": "CREATE TRIGGER support_runs_immutable_shadow_completion\n  BEFORE UPDATE OF typed_decision, shadow_disposition ON support_runs\n  FOR EACH ROW\n  WHEN (OLD.state <> 'running' AND\n    (OLD.typed_decision IS DISTINCT FROM NEW.typed_decision OR\n     OLD.shadow_disposition IS DISTINCT FROM NEW.shadow_disposition)\n   AND NEW.retention_state IS DISTINCT FROM 'purged')\n  EXECUTE FUNCTION guard_support_run_shadow_completion();\n"
+    },
+    {
+      "after_tables": [
+        "support_runs"
+      ],
+      "code?": false,
+      "down": "DROP FUNCTION guard_support_run_reply_retention()",
+      "global?": false,
+      "name": "guard_reply_retention_function",
+      "up": "CREATE FUNCTION guard_support_run_reply_retention() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n  IF OLD.retention_state IS NULL AND OLD.state = 'running'\n      AND NEW.state = 'completed' AND NEW.retention_state = 'present'\n      AND NEW.retention_occurrence IS NULL THEN\n    RETURN NEW;\n  END IF;\n\n  IF OLD.state = 'completed'\n      AND ((OLD.retention_state = 'present' AND NEW.retention_state IN ('held', 'purged'))\n        OR (OLD.retention_state = 'held' AND NEW.retention_state IN ('present', 'purged')))\n      AND NEW.retention_occurrence IS NOT NULL\n      AND OLD.retention_occurrence IS DISTINCT FROM NEW.retention_occurrence\n      AND (to_jsonb(OLD) - ARRAY['retention_state','retention_occurrence','typed_decision','updated_at'])\n        = (to_jsonb(NEW) - ARRAY['retention_state','retention_occurrence','typed_decision','updated_at'])\n      AND NEW.typed_decision = (CASE WHEN NEW.retention_state = 'purged'\n        THEN OLD.typed_decision - 'reply_text'\n        ELSE OLD.typed_decision END) THEN\n    RETURN NEW;\n  END IF;\n\n  RAISE EXCEPTION 'invalid reply retention transition' USING ERRCODE = 'check_violation';\nEND\n$$;\n"
+    },
+    {
+      "after_tables": [
+        "support_runs"
+      ],
+      "code?": false,
+      "down": "DROP TRIGGER support_runs_reply_retention_transition ON support_runs",
+      "global?": false,
+      "name": "guard_reply_retention_trigger",
+      "up": "CREATE TRIGGER support_runs_reply_retention_transition\n  BEFORE UPDATE ON support_runs FOR EACH ROW\n  WHEN (OLD.retention_state IS DISTINCT FROM NEW.retention_state\n    OR OLD.retention_occurrence IS DISTINCT FROM NEW.retention_occurrence\n    OR (OLD.retention_state IS NOT NULL AND OLD.typed_decision IS DISTINCT FROM NEW.typed_decision)\n    OR (OLD.retention_state IS NOT NULL AND OLD.finished_at IS DISTINCT FROM NEW.finished_at))\n  EXECUTE FUNCTION guard_support_run_reply_retention();\n"
+    },
+    {
+      "after_tables": [
+        "support_runs"
+      ],
+      "code?": false,
+      "down": "DROP TRIGGER support_runs_immutable_typed_completion ON support_runs",
+      "global?": false,
+      "name": "guard_typed_completion",
+      "up": "CREATE TRIGGER support_runs_immutable_typed_completion\n  BEFORE UPDATE OF decision, evidence_refs, context_digest, claim_generation,\n    session_id, assistant_revision_id, ownership_epoch, assistant_epoch,\n    binding_epoch, control_epoch, watermark, deadline_at ON support_runs\n  FOR EACH ROW\n  WHEN (OLD.state = 'completed' AND OLD.typed_decision IS NOT NULL AND (\n    ROW(OLD.decision, OLD.evidence_refs, OLD.context_digest, OLD.claim_generation,\n        OLD.session_id, OLD.assistant_revision_id, OLD.ownership_epoch, OLD.assistant_epoch,\n        OLD.binding_epoch, OLD.control_epoch, OLD.watermark, OLD.deadline_at)\n    IS DISTINCT FROM\n    ROW(NEW.decision, NEW.evidence_refs, NEW.context_digest, NEW.claim_generation,\n        NEW.session_id, NEW.assistant_revision_id, NEW.ownership_epoch, NEW.assistant_epoch,\n        NEW.binding_epoch, NEW.control_epoch, NEW.watermark, NEW.deadline_at)))\n  EXECUTE FUNCTION guard_support_run_shadow_completion();\n"
+    }
+  ],
+  "has_create_action": true,
+  "hash": "0DD41CD3C7FBF2F9F4137401D67650498D299E096D1C1954B8D1A4D2804C70CF",
+  "identities": [
+    {
+      "all_tenants?": false,
+      "base_filter": null,
+      "index_name": "support_runs_same_assistant_revision_index",
+      "keys": [
+        {
+          "type": "atom",
+          "value": "id"
+        },
+        {
+          "type": "atom",
+          "value": "assistant_revision_id"
+        }
+      ],
+      "name": "same_assistant_revision",
+      "nils_distinct?": true,
+      "where": null
+    },
+    {
+      "all_tenants?": false,
+      "base_filter": null,
+      "index_name": "support_runs_same_session_run_index",
+      "keys": [
+        {
+          "type": "atom",
+          "value": "id"
+        },
+        {
+          "type": "atom",
+          "value": "session_id"
+        }
+      ],
+      "name": "same_session_run",
+      "nils_distinct?": true,
+      "where": null
+    }
+  ],
+  "multitenancy": {
+    "attribute": null,
+    "global": null,
+    "strategy": null
+  },
+  "repo": "Elixir.VoelgoedAi.Repo",
+  "schema": null,
+  "table": "support_runs",
+  "temporal": null
+}
