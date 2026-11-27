@@ -18,16 +18,17 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @article ~S"(?:a|an|['’]n)"
   @percentage_join "(?:[\\h\\p{Pd}]+(?:(?:of|van)\\h+)?(?:#{@article}\\h+)?)?"
 
-  @english_number ~S"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|trillion|half|halves|quarters?)"
-  @afrikaans_number ~S"(?:nul|een|twee|drie|vier|vyf|ses|sewe|agt|nege|tien|elf|twaalf|dertien|veertien|vyftien|sestien|sewentien|agtien|ne[ëe]ntien|twintig|dertig|veertig|vyftig|sestig|sewentig|tagtig|negentig|honderd|duisend|miljoen|miljard|biljoen|triljoen|halwe|kwarte?)"
-  @number_word "(?:#{@english_number}|#{@afrikaans_number})"
-  @word_join ~S"[\h‑-]*(?:(?:and|en|point|punt|komma)[\h‑-]*)?"
-  @implicit_one "(?:#{@article}\\h+(?=(?:#{@amount_scale}|half|halwe|quarter|kwart)\\b))?"
+  @english_number ~S"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|trillion)"
+  @afrikaans_number ~S"(?:nul|een|twee|drie|vier|vyf|ses|sewe|agt|nege|tien|elf|twaalf|dertien|veertien|vyftien|sestien|sewentien|agtien|ne[ëe]ntien|twintig|dertig|veertig|vyftig|sestig|sewentig|tagtig|negentig|honderd|duisend|miljoen|miljard|biljoen|triljoen)"
+  @fraction_word ~S"(?:half|halves|halwe|kwarte?|(?:third|quarter|fourth|fifth|sixth|seventh|eighth|ninth|tenth|hundredth|thousandth|derde|vierde|vyfde|sesde|sewende|agtste|negende|tiende|honderdste|duisendste)s?)"
+  @number_word "(?:#{@english_number}|#{@afrikaans_number}|#{@fraction_word})"
+  @word_join ~S"[\h\p{Pd}]*(?:(?:and|en|point|punt|komma)[\h\p{Pd}]*)?"
+  @implicit_one "(?:#{@article}[\\h\\p{Pd}]+(?=(?:#{@amount_scale}|#{@fraction_word})\\b))?"
 
   # Written quantities are compared as written, including hyphenated and
   # joined Afrikaans number words. Numeric equivalents are not substitutes.
   @written_number ~S"(?<![\p{L}\p{M}\p{N}_])" <>
-                    "#{@implicit_one}#{@number_word}(?:#{@word_join}#{@number_word})*" <>
+                    "#{@implicit_one}#{@number_word}(?:#{@word_join}#{@implicit_one}#{@number_word})*" <>
                     ~S"(?![\p{L}\p{M}\p{N}_])"
   @sign ~S"(?:[-+−]\s*|(?:minus|negative|negatief)\h+)"
 
@@ -36,23 +37,36 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @date_day "(?:\\p{N}{1,2}(?:st|nd|rd|th|ste|de)?|" <>
               "(?:(?:twenty|thirty)[\\h\\p{Pd}]+)?#{@ordinal_day}|#{@written_number})"
   @date_year ~S"(?:\.?(?:,\h*|\h+)\p{N}{2,4})"
+  @weekday ~S"(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:rs(?:day)?|r)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|maandag|dinsdag|woensdag|donderdag|vrydag|saterdag|sondag)"
+  @weekday_prefix "#{@weekday}\\.?(?:,\\h*|\\h+)"
+  @numeric_date ~S"(?:\p{N}{4}-\p{N}{2}-\p{N}{2}|\p{N}{1,2}[.\/-]\p{N}{1,2}[.\/-]\p{N}{2,4})"
 
-  # Keep signs, currencies, scales and percent units in the same fact as the
-  # quantity. A cited count of 25 cannot validate 25 rand or 25 percent.
+  @quantity """
+  (?:#{@sign}#{@currency_prefix}\\s*|#{@currency_prefix}\\s*#{@sign}?|#{@sign}?)
+  (?:\\p{N}+(?:(?:[.,:\\/-]|\\h+)\\p{N}+)*|#{@written_number})
+  (?:(?:\\s+|[-‑])?(?:#{@amount_scale}|\\p{Sc}|#{@currency_label}|#{@minor_currency_suffix})(?![\\p{L}\\p{N}_]))*
+  (?:\\s*%|#{@percentage_join}#{@percentage_unit}(?![\\p{L}\\p{M}\\p{N}_]))?
+  """
+  @range_join ~S"(?:\h*[\p{Pd}−]\h*|\h+(?:to|tot|through)\h+)"
+
+  # Compare complete calendar dates and quantity expressions. Date qualifiers,
+  # range endpoints and units cannot borrow support from separate source facts.
   @facts ~r/
     #{@link_fact}
     |
     (?<![\p{L}\p{M}\p{N}_])
     (?:
-      #{@date_day}[\h\p{Pd}]+(?:(?:of|van)\h+)?#{@month}#{@date_year}?
-      | #{@month}\.?[\h\p{Pd}]+(?:(?:the|die)\h+)?(?:#{@date_day}#{@date_year}?|\p{N}{4})
+      (?:#{@weekday_prefix})?
+      (?:
+        #{@date_day}[\h\p{Pd}]+(?:(?:of|van)\h+)?#{@month}#{@date_year}?
+        | #{@month}\.?[\h\p{Pd}]+(?:(?:the|die)\h+)?(?:#{@date_day}#{@date_year}?|\p{N}{4})
+      )
+      | #{@weekday_prefix}#{@numeric_date}
+      | #{@weekday}
     )
     (?![\p{L}\p{M}\p{N}_])
     |
-    (?:#{@sign}#{@currency_prefix}\s*|#{@currency_prefix}\s*#{@sign}?|#{@sign}?)
-    (?:\p{N}+(?:(?:[.,:\/-]|\h+)\p{N}+)*|#{@written_number})
-    (?:(?:\s+|[-‑])?(?:#{@amount_scale}|\p{Sc}|#{@currency_label}|#{@minor_currency_suffix})(?![\p{L}\p{N}_]))*
-    (?:\s*%|#{@percentage_join}#{@percentage_unit}(?![\p{L}\p{M}\p{N}_]))?
+    #{@quantity}(?:#{@range_join}#{@quantity})?
   /iux
   @bare_host ~r|\b[a-z][a-z0-9+.-]*://|iu
   @bare_domain ~r/\b(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}\b/u

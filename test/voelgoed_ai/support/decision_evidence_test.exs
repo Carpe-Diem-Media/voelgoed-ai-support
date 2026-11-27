@@ -120,6 +120,20 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
          %{
            "af-ZA" => "Die afslag is ’n halwe persent.",
            "en-ZA" => "The discount is half a percent."
+         }},
+        {"substituted weekday",
+         %{
+           "af-ZA" => "Besprekings sluit Dinsdag, 30 November 2026.",
+           "en-ZA" => "Bookings close Tuesday, 30 November 2026."
+         }},
+        {"dashed percentage range",
+         %{"af-ZA" => "Die afslag is 25–30%.", "en-ZA" => "The discount is 25–30%."}},
+        {"written percentage range",
+         %{"af-ZA" => "Die afslag is 25 tot 30%.", "en-ZA" => "The discount is 25 to 30%."}},
+        {"denominator and percentage unit",
+         %{
+           "af-ZA" => "Die afslag is een derde van ’n persent.",
+           "en-ZA" => "The discount is one third of a percent."
          }}
       ] do
     @opts opts
@@ -157,8 +171,11 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"written percentage unit", "The early booking discount is 15 percent."},
         {"written price", "The printed programme costs sixty rand."},
         {"hyphenated percentage", "Late bookings have a 5-percent fee."},
-        {"month-name date", "Bookings close 30 November 2026."},
-        {"fractional percentage", "The later discount is one quarter of a percent."}
+        {"month-name date", "The meeting is 15 December 2026."},
+        {"fractional percentage", "The later discount is one quarter of a percent."},
+        {"weekday and date", "Bookings close Monday, 30 November 2026."},
+        {"percentage range", "Group discounts range from 10–20%."},
+        {"written denominator", "The adjustment is two thirds of a percent."}
       ] do
     @reply reply
 
@@ -594,14 +611,19 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                 case variant["locale"] do
                   "af-ZA" ->
                     "Kaartjieprys R25 per persoon. Daar is 25 plekke. Laat besprekings kos 40 rand. " <>
-                      "Die aanpassing is − 55 rand. Die verwerkingsfooi is 75c."
+                      "Die aanpassing is − 55 rand. Die verwerkingsfooi is 75c. " <>
+                      "Daar is een plek op die balkon. Die studentekorting is 30%. " <>
+                      "Besprekings sluit Maandag, 30 November 2026."
 
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
                       "The adjustment is − 55 rand. The processing fee is 75c. " <>
                       "The early booking discount is 15 percent. The printed programme costs sixty rand. " <>
                       "The hall is half full. Late bookings have a 5-percent fee. " <>
-                      "Bookings close 30 November 2026. The later discount is one quarter of a percent."
+                      "Bookings close Monday, 30 November 2026. The meeting is 15 December 2026. " <>
+                      "The later discount is one quarter of a percent. There is one place on the balcony. " <>
+                      "The student discount is 30%. Group discounts range from 10–20%. " <>
+                      "The adjustment is two thirds of a percent."
                 end
 
               Map.put(variant, "approved_answer", answer)

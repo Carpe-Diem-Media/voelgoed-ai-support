@@ -184,6 +184,23 @@ checked merge compatibility against `2ed8e24`, which adds the independent
 editorial correction in PR #25. Exact-head CI and independent review are
 pending on the updated candidate.
 
+Independent review of `44764c7` passed the full suite on the merge tree
+with 707 passes and one predecessor-only exclusion. It confirmed the
+prior literal-fact fixes and reproduced weekday substitution, a discount
+range built from separate values, and a fraction with an uncited
+denominator. Eight new bilingual completion tests failed on that head.
+The matcher now binds the weekday to its date, both endpoints and any
+units to the range, and the written denominator to its quantity. The
+cited controls for a weekday date, an en-dash range and written thirds
+preserve their bytes. An eight-case renderer probe checked additional
+numeric dates, range separators and compound fractions against uncited
+and verbatim controls.
+
+The focused command passed 191 tests at seed 0 on disposable PostgreSQL
+18.7 and pgvector 0.8.7. Format, forced strict TEST compile and snapshots
+passed. The container and volume were removed. Exact-head CI and
+independent re-review are pending on the corrected candidate.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.
