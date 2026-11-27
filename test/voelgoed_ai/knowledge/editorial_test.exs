@@ -1029,6 +1029,46 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
              end)
   end
 
+  test "standalone dates and minute times in FAQ prose preserve their original bytes" do
+    for {label, answer} <- [
+          {:date_only, "Published on 2026-01-01."},
+          {:english, "Published on 2026-01-01 10:00."},
+          {:afrikaans, "Gepubliseer op (2026-01-01 10:00)."}
+        ] do
+      input = put_in(payload(), ["localized_content", Access.at(0), "approved_answer"], answer)
+      result = Content.parse(input)
+
+      assert match?({:ok, _}, result), "rejected benign #{label}"
+      {:ok, canonical} = result
+
+      assert Enum.any?(canonical["localized_content"], &(&1["approved_answer"] == answer)),
+             "changed original #{label} bytes"
+    end
+  end
+
+  test "date exemption leaves malformed times and contact-shaped text subject to PII checks" do
+    for {label, answer} <- [
+          {:invalid_day, "2026-02-29 10:00"},
+          {:invalid_month, "2026-13-01 10:00"},
+          {:invalid_hour, "2026-01-01 24:00"},
+          {:invalid_minute, "2026-01-01 10:60"},
+          {:seconds, "2026-01-01 10:00:00"},
+          {:partial, "2026-01-01 10:0"},
+          {:date_in_word, "ref2026-01-01 10:00"},
+          {:time_in_word, "2026-01-01 10:00suffix"},
+          {:sign_prefix, "+2026-01-01 10:00"},
+          {:digit_prefix, "123.2026-01-01 10:00"},
+          {:digit_suffix, "2026-01-01 10:00 12345678"},
+          {:punctuated_suffix, "2026-01-01 10:00-12345678"},
+          {:email, "2026-01-01 10:00. Contact nobody@example.test."},
+          {:phone, "2026-01-01 10:00. Contact +27 00 000 0000."}
+        ] do
+      input = put_in(payload(), ["localized_content", Access.at(0), "approved_answer"], answer)
+
+      assert match?({:error, _}, Content.parse(input)), "accepted prohibited #{label}"
+    end
+  end
+
   test "canonical hash sorts locale keys and scope and preserves answer text" do
     assert {:ok, content} = Content.parse(payload())
     hash = Content.hash(content)

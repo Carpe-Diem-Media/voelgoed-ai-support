@@ -95,6 +95,9 @@ grants its own permission, including when someone holds ADMIN.
   Obtain the information owner's approval for retention, recovery and purge
   before production use.
 
+Apply the [staff telemetry subscriber and export rules](staff-knowledge.md#telemetry-subscribers-and-export)
+to sign-in and session diagnostics.
+
 ## VGAS-9 and production gates
 
 [A-011](../spec/VGAS_SPEC_v1.0.0.md#amendment-a-011--vgas-001-authentication-release-candidate-exception)

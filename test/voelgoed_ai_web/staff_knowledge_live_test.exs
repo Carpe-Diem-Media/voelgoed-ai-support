@@ -21,10 +21,110 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
       start_listener: 1,
       upgrade: 4,
       channel_socket: 1,
-      https_status: 2
+      https_status: 2,
+      tls_message: 5,
+      with_tls_socket: 3
     ]
 
   setup :setup_knowledge
+
+  test "a joined TLS tab and copied cookie outlive sign-out until admin revocation", ctx do
+    row = collection(ctx)
+    path = "/staff/knowledge"
+    page = read_page(ctx.editor, path)
+    {cookie, csrf} = browser_credentials(page)
+    selector = page.resp_body |> LazyHTML.from_document() |> LazyHTML.query("[data-phx-session]")
+    [id] = LazyHTML.attribute(selector, "id")
+    [session] = LazyHTML.attribute(selector, "data-phx-session")
+    [static] = LazyHTML.attribute(selector, "data-phx-static")
+    topic = "lv:" <> id
+    route = "/staff/knowledge/collections/#{row.id}"
+    private_input = "synthetic-private-event-probe"
+    start_listener(:https)
+
+    {_, logs} =
+      with_log([level: :debug, metadata: :all], fn ->
+        with_tls_socket(cookie, csrf, fn socket ->
+          join =
+            tls_message(socket, "1", topic, "phx_join", %{
+              "url" => origin() <> path,
+              "params" => %{"_mounts" => 0, "_csrf_token" => csrf, "probe" => private_input},
+              "session" => session,
+              "static" => static
+            })
+
+          assert reply_has_key?(join, "rendered"), "TLS join did not render"
+
+          patch = tls_message(socket, "2", topic, "live_patch", %{"url" => origin() <> route})
+          assert reply_has_key?(patch, "diff"), "TLS patch did not render"
+
+          signed_out =
+            VoelgoedAi.StaffEntraFixture.request(:post, "/staff/sign-out", page, [
+              {"x-csrf-token", csrf}
+            ])
+
+          assert signed_out.status == 204
+          assert signed_out.resp_cookies["_vgas_staff"].max_age == 0
+          assert upgrade(:https, nil, csrf, origin()) == 403
+          assert https_status(route, [{"Cookie", "_vgas_staff=" <> cookie}]) == 200
+
+          event = %{
+            "type" => "click",
+            "event" => "refresh",
+            "value" => %{"probe" => private_input}
+          }
+
+          assert reply_has_key?(tls_message(socket, "3", topic, "event", event), "diff"),
+                 "copied session unexpectedly revoked at sign-out"
+
+          assert {:ok, _} = Accounts.disable(ctx.admin, ctx.editor.id)
+
+          denied = tls_message(socket, "4", topic, "event", event)
+          assert reply_has_key?(denied, "redirect"), "revoked connected tab did not redirect"
+
+          assert String.contains?(Jason.encode!(denied), "/staff/knowledge/denied"),
+                 "wrong denial redirect"
+
+          refute String.contains?(Jason.encode!(denied), [
+                   private_input,
+                   cookie,
+                   csrf,
+                   session,
+                   static
+                 ]),
+                 "denial reply disclosed private data"
+
+          assert upgrade(:https, cookie, csrf, origin()) == 403
+          assert https_status(route, [{"Cookie", "_vgas_staff=" <> cookie}]) == 302
+
+          result = invoke(Article, :create_draft, draft_args(ctx, row), ctx.editor)
+          assert match?({:error, _}, result), "stale actor action was accepted"
+          fresh = read_page(ctx.reviewer, route)
+          assert fresh.status == 200
+
+          assert {:ok, %{items: []}} =
+                   invoke(Article, :list_articles, %{collection_id: row.id}, ctx.reviewer)
+
+          assert {:ok, _} =
+                   Accounts.reactivate(ctx.admin, ctx.editor.id, ctx.invited, [:knowledge_editor])
+
+          assert upgrade(:https, cookie, csrf, origin()) == 403
+          assert {:ok, fresh_editor} = StaffFixtures.authenticate(ctx.editor.id)
+          fresh_page = read_page(fresh_editor, route)
+          assert fresh_page.status == 200
+          {fresh_cookie, fresh_csrf} = browser_credentials(fresh_page)
+          assert upgrade(:https, fresh_cookie, fresh_csrf, origin()) == 101
+        end)
+      end)
+
+    refute String.contains?(logs, [private_input, cookie, csrf, session, static]),
+           "staff TLS capture disclosed private data"
+  end
+
+  defp reply_has_key?([_, _, _, "phx_reply", %{"status" => "ok", "response" => response}], key),
+    do: Map.has_key?(response, key)
+
+  defp reply_has_key?(_, _), do: false
 
   test "collections and articles are projected only for the permitted roles", ctx do
     hidden = collection(ctx, "-other")
@@ -100,7 +200,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeLiveTest do
     assert {:error, {:redirect, %{to: "/staff/knowledge/denied"}}} =
              live(put_private(page, :live_view_connect_info, %{session: %{}}))
 
-    assert {:ok, _} = Accounts.set_roles(ctx.admin, ctx.editor.id, [:support_operator])
+    assert {:ok, _} =
+             Accounts.set_roles(ctx.admin, ctx.editor.id, [:knowledge_editor, :support_operator])
 
     assert {:error, {:redirect, %{to: "/staff/knowledge/denied"}}} = live(page)
 
