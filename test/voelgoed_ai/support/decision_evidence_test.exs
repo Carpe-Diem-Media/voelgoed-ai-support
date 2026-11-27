@@ -135,6 +135,46 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
     end)
   end
 
+  test "a human assignment observed after the dispatch marker denies the reply" do
+    ctx = prepare(:revocation)
+
+    with_ranked(ctx, fn target ->
+      assert {:ok, delivery} = complete(ctx, target)
+
+      assert :ok =
+               dispatch_at(ctx, :before_dispatch, delivery.id, fn ->
+                 Agent.update(ctx.support.fake, fn state ->
+                   %{state | observation: %{state.observation | assignee: :human}}
+                 end)
+               end)
+
+      assert %{rows: [["cancelled", "dispatch_denied"]]} =
+               SupportDBCase.delivery_rows(ctx.support, "state, reason_code")
+
+      assert SupportDBCase.writes(ctx.support) == []
+    end)
+  end
+
+  test "a newer signed customer receipt after the dispatch marker denies the reply" do
+    ctx = prepare(:revocation)
+
+    with_ranked(ctx, fn target ->
+      assert {:ok, delivery} = complete(ctx, target)
+
+      assert :ok =
+               dispatch_at(ctx, :before_dispatch, delivery.id, fn ->
+                 assert SupportDBCase.signed_request(ctx.support, fn payload ->
+                          Map.put(payload, "id", ctx.support.event.message_id + 1)
+                        end).status == 204
+               end)
+
+      assert %{rows: [["cancelled", "dispatch_denied"]]} =
+               SupportDBCase.delivery_rows(ctx.support, "state, reason_code")
+
+      assert SupportDBCase.writes(ctx.support) == []
+    end)
+  end
+
   test "a replaced delivery claim cannot dispatch or cancel the current worker" do
     ctx = prepare(:revocation)
 

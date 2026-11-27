@@ -108,6 +108,12 @@ After restoration, `ash.codegen --check` exited 0 and the 142-test focused comma
 
 The claim-gate expiry case has a second guard. Advancing its fake clock to expiry also reaches the read-freshness cutoff before the marker. Revocation and index/profile changes independently killed claim omission without touching that cutoff. The supported grant withdrawal and signed takeover can also be denied by the current revision and ownership guards. The completed-state test changes the state required by the typed reader to RUNNING. A simple state-check removal at one layer is redundant with the completion constraint and the other state check.
 
+## Final dispatch regression tests
+
+Independent review of `7fb9a49` found two untested paths after the dispatch marker. The worker now has committed tests for observing a human assignee without a webhook and receiving a newer signed customer message without processing its receipt. Both tests use the real Deliver worker and assert `cancelled/dispatch_denied` with zero Chatwoot writes. The correction changes tests and this record only.
+
+The disposable runner on port 55435 reported PostgreSQL 18.7 and pgvector 0.8.7. Locked dependency resolution, format, forced TEST compile with warnings as errors and `ash.codegen --check` exited 0. `VGAS_F04_DISPOSABLE=1 mise exec -- mix test test/voelgoed_ai/support/decision_evidence_test.exs --seed 0` exited 0 with 55 passed. The runner removed its container and volume.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.
