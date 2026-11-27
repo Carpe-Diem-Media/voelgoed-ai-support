@@ -76,6 +76,7 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
                :append_operational,
                :append_publication_failure,
                :append_publication_transition,
+               :append_retention,
                :append_rollback_request,
                :append_support_operator,
                :append_system,

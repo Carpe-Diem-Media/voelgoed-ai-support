@@ -98,7 +98,7 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @unsafe ~r/[\x00-\x08\x0b-\x1f\x7f<>]|!\[|(?:\]\(|\]:)|(?:javascript|data|file|mailto|tel):|\bwww\.|\b(?:password|passwd|api[_ -]?key|secret|bearer|access[_ -]?token)\b|\b(?:sk|ghp|gho)[_\-][a-zA-Z0-9_\-]{8,}/iu
 
   @doc "Render only when the ordered, locale-qualified references match the decision."
-  def render(%SupportDecision{} = decision, evidence) when evidence != [] do
+  def render(%SupportDecision{purged?: false} = decision, evidence) when evidence != [] do
     if Enum.map(evidence, & &1.revision_id) == decision.evidence_revision_ids and
          Enum.all?(evidence, &(&1.locale == decision.locale)) do
       render_answer(decision, evidence)
@@ -248,9 +248,12 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   because an existing prepared intent carries only the digest.
   """
   def digest(run, text) do
+    # The in-memory retention flag was added after version one. Keep the
+    # original tagged decision term so existing delivery digests still match.
+    decision = Map.delete(run.typed_decision, :purged?)
+
     body =
-      {1, run.id, run.claim_generation, run.typed_decision, run.evidence_refs, run.context_digest,
-       text}
+      {1, run.id, run.claim_generation, decision, run.evidence_refs, run.context_digest, text}
 
     :crypto.hash(:sha256, :erlang.term_to_binary(body, [:deterministic]))
     |> Base.encode16(case: :lower)

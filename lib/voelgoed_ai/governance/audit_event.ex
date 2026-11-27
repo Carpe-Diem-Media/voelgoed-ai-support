@@ -82,6 +82,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   @gap_events [:gap_reviewed, :gap_deferred, :gap_dismissed, :gap_addressed]
   @gap_reasons [:duplicate_issue, :out_of_scope, :no_change_needed]
   @support_events [:request_handoff, :return_to_bot, :close_session, :abandon_delivery]
+  @retention_events [:hold_reply, :release_reply, :purge_reply]
+  @retention_reasons [:fixture_hold, :fixture_release, :synthetic_cutoff]
   @system_events [:delivery_unknown, :missed_deadline, :handoff_failed, :local_handoff]
   @system_target_kinds [:inbound_event, :support_run, :outbound_delivery]
   @system_reason_sql Enum.map_join(ReasonCode.values(), ",", &"'#{&1}'")
@@ -93,6 +95,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   @inhibit_events [:trip_generation_inhibit, :trip_embedding_inhibit]
   @operational_fields [
     inhibited: [type: :boolean],
+    retention_occurrence: [type: :uuid],
     ownership_epoch: [type: :integer, constraints: [min: 0]],
     status: [
       type: :atom,
@@ -124,7 +127,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           :expired,
           :open,
           :addressed,
-          :dismissed
+          :dismissed,
+          :present,
+          :held,
+          :purged
         ]
       ]
     ],
@@ -269,7 +275,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             OR (target_kind = 'outbound_delivery' AND delivery_target_id IS NOT NULL
               AND event IN ('abandon_delivery','delivery_unknown','handoff_failed','local_handoff'))
             OR (target_kind = 'inbound_event' AND event_target_id IS NOT NULL AND event = 'missed_deadline')
-            OR (target_kind = 'support_run' AND run_target_id IS NOT NULL AND event = 'missed_deadline')
+            OR (target_kind = 'support_run' AND run_target_id IS NOT NULL AND event IN ('missed_deadline','hold_reply','release_reply','purge_reply'))
           )
         """
       )
@@ -279,11 +285,23 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           (target_kind = 'staff_user' AND actor_kind IN ('staff','bootstrap') AND after_state IS NOT NULL
             AND operational_before IS NULL AND operational_after IS NULL)
           OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL
-            AND event NOT IN ('gap_reviewed','gap_deferred','gap_dismissed','gap_addressed','delivery_unknown','missed_deadline','handoff_failed','fail_publication','fail_reindex','expire','switch_index','rollback_index','trip_generation_inhibit','trip_embedding_inhibit')
+            AND event NOT IN ('hold_reply','release_reply','purge_reply','gap_reviewed','gap_deferred','gap_dismissed','gap_addressed','delivery_unknown','missed_deadline','handoff_failed','fail_publication','fail_reindex','expire','switch_index','rollback_index','trip_generation_inhibit','trip_embedding_inhibit')
             AND (target_kind <> 'knowledge_revision' OR event NOT IN ('activate','supersede'))
             AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')
               OR (target_kind IN ('knowledge_collection','knowledge_article','knowledge_revision'))
               OR (target_kind NOT IN ('staff_user','support_session','outbound_delivery','knowledge_collection','knowledge_article','knowledge_revision') AND reason_code = 'local_admin')))
+          OR (target_kind = 'support_run' AND before_state IS NULL AND after_state IS NULL
+            AND operational_after->>'retention_occurrence' IS NOT NULL
+            AND (CASE event
+              WHEN 'hold_reply' THEN actor_kind = 'staff' AND reason_code = 'fixture_hold'
+                AND operational_before->>'status' = 'present' AND operational_after->>'status' = 'held'
+              WHEN 'release_reply' THEN actor_kind = 'staff' AND reason_code = 'fixture_release'
+                AND operational_before->>'status' = 'held'
+                AND operational_before->>'retention_occurrence' IS NOT NULL
+                AND operational_after->>'status' IN ('present','purged')
+              WHEN 'purge_reply' THEN actor_kind = 'support_worker' AND reason_code = 'synthetic_cutoff'
+                AND operational_before->>'status' = 'present' AND operational_after->>'status' = 'purged'
+              ELSE false END) IS TRUE)
           OR (actor_kind = 'staff' AND target_kind = 'knowledge_gap'
             AND before_state IS NULL AND after_state IS NULL
             AND (CASE event
@@ -358,7 +376,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
               @operational_events ++
               @support_events ++
               @system_events ++
-              @knowledge_events ++ @financial_events ++ @inhibit_events ++ @gap_events
+              @knowledge_events ++
+              @financial_events ++ @inhibit_events ++ @gap_events ++ @retention_events
         ]
       ]
     )
@@ -377,6 +396,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             ReasonCode.values() ++
             @knowledge_reasons ++
             @gap_reasons ++
+            @retention_reasons ++
             @publication_reasons ++
             [
               :stale_request,
@@ -689,6 +709,29 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       validate(attribute_equals(:reason_code, :local_operator))
     end
 
+    create :append_retention do
+      description("Append a typed reply retention fact in the same transaction as the change.")
+      transaction?(false)
+
+      accept([
+        :actor_kind,
+        :actor_staff_id,
+        :target_kind,
+        :run_target_id,
+        :event,
+        :reason_code,
+        :operational_before,
+        :operational_after,
+        :correlation_id,
+        :occurred_at
+      ])
+
+      require_attributes([:run_target_id, :operational_before, :operational_after])
+      validate(attribute_equals(:target_kind, :support_run))
+      validate(attribute_in(:event, @retention_events))
+      validate(attribute_in(:reason_code, @retention_reasons))
+    end
+
     create :append_system do
       description("Append a typed support workflow fact inside its transition transaction.")
       transaction?(false)
@@ -795,7 +838,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       authorize_if(Editorial)
     end
 
-    policy action([:append_support_operator, :append_system, :system_rows]) do
+    policy action([:append_support_operator, :append_system, :append_retention, :system_rows]) do
       authorize_if(WorkStore)
     end
 

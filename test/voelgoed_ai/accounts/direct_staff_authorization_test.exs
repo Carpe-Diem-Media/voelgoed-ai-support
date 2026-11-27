@@ -30,6 +30,7 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
     append_knowledge: :create,
     append_publication_failure: :create,
     append_publication_transition: :create,
+    append_retention: :create,
     append_rollback_request: :create,
     rollback_request: :read,
     knowledge_rows: :read,
@@ -286,6 +287,19 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
 
   defp arguments(:knowledge_rows, _),
     do: %{id: Ash.UUIDv7.generate(), target_kind: :knowledge_revision}
+
+  defp arguments(:append_retention, _) do
+    %{
+      actor_kind: :support_worker,
+      target_kind: :support_run,
+      run_target_id: Ash.UUIDv7.generate(),
+      event: :purge_reply,
+      reason_code: :synthetic_cutoff,
+      operational_before: %{status: :present},
+      operational_after: %{status: :purged, retention_occurrence: Ash.UUIDv7.generate()},
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
 
   defp arguments(:append_system, _) do
     %{

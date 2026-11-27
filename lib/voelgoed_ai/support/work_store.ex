@@ -26,6 +26,10 @@ defmodule VoelgoedAi.Support.WorkStore do
   alias VoelgoedAi.Governance.MisuseProtection
 
   @owners %{
+    VoelgoedAi.Support.Retention => %{
+      AuditEvent => [:append_retention],
+      SupportRun => [:transition_retention]
+    },
     Support => %{
       AuditEvent => [:append_support_operator],
       OutboundDelivery => [:for_session, :abandon],

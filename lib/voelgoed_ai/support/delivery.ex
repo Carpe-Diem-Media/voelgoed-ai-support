@@ -441,7 +441,8 @@ defmodule VoelgoedAi.Support.Delivery do
   defp render_evidenced(config, delivery, {:ok, context}) do
     run = config.run
 
-    with true <- run.decision == :typed_reply and is_nil(run.shadow_disposition),
+    with true <- run.retention_state != :purged,
+         true <- run.decision == :typed_reply and is_nil(run.shadow_disposition),
          true <- DateTime.compare(run.deadline_at, delivery.deadline_at) == :eq,
          true <- Base.encode16(context.commitment, case: :lower) == run.context_digest,
          {:ok, evidence} <- Retrieval.at_dispatch(&evidence_owner/0, config, run),

@@ -55,6 +55,87 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
     end)
   end
 
+  for {disposition, write_mode, retained_state} <- [
+        {:sent, :accepted, :purged},
+        {:unknown, :timeout, :present}
+      ] do
+    test "retention keeps the #{disposition} delivery identity and writes nothing on replay" do
+      ctx = prepare(:grounded)
+
+      with_ranked(ctx, fn target ->
+        decision = proposal(target, "answer_grounded", "Die kaartjies kos R25.")
+
+        assert {:ok, delivery} =
+                 RunProcessing.complete_evidence_fixture(ctx.claim, decision, [target.citation_id])
+
+        SupportDBCase.write_mode(ctx.support, unquote(write_mode))
+        assert :ok = Deliver.perform(job(delivery.id))
+        assert [_] = writes = SupportDBCase.writes(ctx.support)
+
+        # A signed human response fences local ownership. Cleanup and replay
+        # must preserve the resulting ownership epoch and inhibit.
+        assert {:ok, _} =
+                 VoelgoedAi.Support.Ingress.accept(%{
+                   ctx.support.event
+                   | kind: :human_outbound,
+                     message_id: ctx.support.event.message_id + 1
+                 })
+
+        before = run(ctx)
+        newer = reopen_with_older_unknown(ctx, before, unquote(disposition))
+        accounts = accounting(ctx)
+
+        snapshots = fn ->
+          SQL.query!(
+            Repo,
+            """
+            SELECT to_jsonb(session), (SELECT jsonb_agg(to_jsonb(delivery) ORDER BY delivery.id)
+              FROM outbound_deliveries delivery WHERE delivery.session_id = session.id)
+            FROM support_sessions session
+            WHERE binding_id = $1 AND conversation_id = $2 ORDER BY generation
+            """,
+            [uuid(ctx.support.binding_id), ctx.support.event.conversation_id]
+          ).rows
+        end
+
+        sessions_and_intents = snapshots.()
+        grant = Ash.UUIDv7.generate()
+
+        inbox =
+          Map.take(ctx.support.event, [
+            :installation_ref,
+            :external_account_id,
+            :external_inbox_id
+          ])
+
+        Application.put_env(:voelgoed_ai, :retention_fixture, %{
+          inbox: inbox,
+          capability: grant,
+          batch_size: 25
+        })
+
+        on_exit(fn -> Application.delete_env(:voelgoed_ai, :retention_fixture) end)
+        Agent.update(ctx.support.fake, &%{&1 | now: DateTime.add(before.finished_at, 7 * 86_400)})
+
+        assert :ok =
+                 VoelgoedAi.Support.Workers.Retention.perform(%Oban.Job{
+                   args: %{"capability" => grant}
+                 })
+
+        assert run(ctx).retention_state == unquote(retained_state)
+
+        assert_newer_retained(newer)
+        assert :ok = Deliver.perform(job(delivery.id))
+        assert :ok = RunProcessing.process_run(ctx.id)
+
+        assert accounting(ctx) == accounts
+
+        assert snapshots.() == sessions_and_intents
+        assert SupportDBCase.writes(ctx.support) == writes
+      end)
+    end
+  end
+
   for {label, reply} <- [
         {"room number and zoned clock", "Kamer 731 09:00 (UTC)."},
         {"clock with fractional seconds", "Die sein begin om 09:00:00,123."}
@@ -754,6 +835,71 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
   end
 
   defp dispatch_at(_, :after_rank, id, _), do: Delivery.deliver(id)
+
+  defp assert_newer_retained(nil), do: :ok
+
+  defp assert_newer_retained(id) do
+    assert {:ok, :present} =
+             RunProcessing.with_run(id, fn _, session, row, _ ->
+               assert session.generation == 2 and session.human_inhibit
+               {:ok, row.retention_state}
+             end)
+  end
+
+  defp reopen_with_older_unknown(_ctx, _run, :sent), do: nil
+
+  defp reopen_with_older_unknown(%{support: support}, run, :unknown) do
+    Agent.update(support.fake, &put_in(&1.observation.status, :resolved))
+
+    assert SupportDBCase.signed_request(
+             support,
+             &Map.put(&1, "event", "conversation_status_changed")
+           ).status == 204
+
+    assert %{rows: [[observation]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT id::text FROM inbound_events
+               WHERE conversation_id = $1 AND message_id IS NULL AND disposition = 'pending'
+               """,
+               [support.event.conversation_id]
+             )
+
+    assert :ok = RunProcessing.process_event(observation)
+
+    Agent.update(support.fake, &put_in(&1.observation.status, :pending))
+    message = support.event.message_id + 2
+    SupportDBCase.append_public_input(support, message)
+
+    assert {:ok, receipt} =
+             SupportDBCase.signed_receipt(%{
+               support
+               | event: %{support.event | message_id: message}
+             })
+
+    assert :ok = RunProcessing.process_event(receipt.id)
+
+    # Current admission blocks new work, so seed a completed result from the
+    # earlier schema to make the older-generation dependency observable.
+    newer = Ash.UUIDv7.generate()
+
+    assert %{num_rows: 1} =
+             SQL.query!(
+               Repo,
+               """
+               INSERT INTO support_runs
+               SELECT (jsonb_populate_record(NULL::support_runs, to_jsonb(run) ||
+                 jsonb_build_object('id', $2::uuid, 'turn_ref', $2::uuid, 'session_id', session.id,
+                   'ownership_epoch', session.ownership_epoch))).*
+               FROM support_runs run JOIN support_sessions session ON session.conversation_id = $3
+               WHERE run.id = $1 AND session.generation = 2 AND session.human_inhibit
+               """,
+               [uuid(run.id), uuid(newer), support.event.conversation_id]
+             )
+
+    newer
+  end
 
   defp prepare(change, opts \\ []) do
     knowledge = setup_knowledge(%{embedding_index: true})

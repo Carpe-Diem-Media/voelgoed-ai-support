@@ -32,6 +32,60 @@ defmodule VoelgoedAi.Support.KnowledgeGapTest do
     assert_no_writes(ctx)
   end
 
+  test "an open gap defers purge and its terminal review survives later cleanup" do
+    ctx = setup_faq(:en, "grounded")
+    enable_gap(ctx)
+    grounded = queue(ctx, question(:en))
+    configure(ctx, generation: &response(&1, ctx))
+    assert :ok = perform(grounded)
+    run = run(grounded)
+    assert run.retention_state == :present
+
+    Agent.update(ctx.support.fake, &%{&1 | history: []})
+    missing = queue(ctx, @question, 1)
+    assert :ok = perform(missing)
+    assert [["missing", "open", "en-ZA"]] = occurrences(missing)
+    assert_no_writes(ctx)
+
+    now = DateTime.add(run.finished_at, 7 * 86_400)
+    Agent.update(ctx.support.fake, &%{&1 | now: now})
+    capability = Ash.UUIDv7.generate()
+
+    inbox =
+      Map.take(ctx.support.event, [:installation_ref, :external_account_id, :external_inbox_id])
+
+    Application.put_env(:voelgoed_ai, :retention_fixture, %{
+      inbox: inbox,
+      capability: capability,
+      batch_size: 25
+    })
+
+    on_exit(fn -> Application.delete_env(:voelgoed_ai, :retention_fixture) end)
+
+    cleanup = fn ->
+      VoelgoedAi.Support.Workers.Retention.perform(job("capability", capability))
+    end
+
+    assert :ok = cleanup.()
+    assert run(grounded) == run
+
+    assert %{rows: [[id, version]]} =
+             SQL.query!(
+               Repo,
+               "SELECT id::text, review_version FROM knowledge_gaps WHERE support_run_id = $1",
+               [uuid(missing)]
+             )
+
+    assert {:ok, reviewing} =
+             change(:review, %{id: id, review_version: version}, ctx.staff.reviewer)
+
+    assert {:ok, _} = change(:dismiss, reviewing, ctx.staff.reviewer, %{reason: :duplicate_issue})
+    assert :ok = cleanup.()
+    assert run(grounded).retention_state == :purged
+    assert [["missing", "dismissed", "en-ZA"]] = occurrences(missing)
+    assert [["gap_reviewed"], ["gap_dismissed"]] = audits(id)
+  end
+
   test "another unknown request routes locally without recording a gap" do
     ctx = setup_faq(:en, "exact")
     enable_gap(ctx)

@@ -114,3 +114,41 @@ receive do
 after
   0 -> :ok
 end
+
+# A packaged release denies retention even with a syntactically valid fixture
+# capability. The expected return also proves the gate precedes database work.
+retention_grant = Ash.UUIDv7.generate()
+
+Application.put_env(:voelgoed_ai, :retention_fixture, %{
+  capability: retention_grant,
+  batch_size: 1
+})
+
+{:discard, :retention_disabled} =
+  VoelgoedAi.Support.Workers.Retention.perform(%Oban.Job{
+    args: %{"capability" => retention_grant}
+  })
+
+{:error, :denied} =
+  VoelgoedAi.Support.Retention.staff_transition(
+    %{},
+    :hold,
+    Ash.UUIDv7.generate(),
+    retention_grant
+  )
+
+retention = VoelgoedAi.Support.Retention
+
+{:ok, {^retention, [imports: retention_imports]}} =
+  :beam_lib.chunks(:code.which(retention), [:imports])
+
+false =
+  Enum.any?(retention_imports, fn {module, _, _} ->
+    module in [
+      Ecto.Adapters.SQL,
+      VoelgoedAi.Repo,
+      VoelgoedAi.Accounts.StaffAccess,
+      VoelgoedAi.Support.Configuration,
+      VoelgoedAi.Support.WorkStore
+    ]
+  end)

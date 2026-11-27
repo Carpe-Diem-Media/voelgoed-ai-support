@@ -55,6 +55,24 @@ defmodule VoelgoedAi.Support.SupportRun do
         """
       )
 
+      check_constraint(:retention_state, "support_runs_reply_retention",
+        check: """
+        (CASE
+          WHEN jsonb_typeof(typed_decision->'reply_text') = 'string' THEN
+            state = 'completed' AND retention_state IN ('present', 'held')
+            AND typed_decision->>'decision' IN ('answer_grounded', 'clarify')
+            AND (retention_state <> 'held' OR retention_occurrence IS NOT NULL)
+          WHEN retention_state = 'purged' THEN
+            state = 'completed' AND retention_occurrence IS NOT NULL
+            AND typed_decision->>'decision' IN ('answer_grounded', 'clarify')
+            AND NOT (typed_decision ? 'reply_text')
+          ELSE retention_state IS NULL AND retention_occurrence IS NULL
+            AND typed_decision->>'decision' IS DISTINCT FROM 'answer_grounded'
+            AND (typed_decision IS NULL OR typed_decision ? 'reply_text')
+        END) IS TRUE
+        """
+      )
+
       check_constraint(:shadow_disposition, "support_runs_typed_completion",
         check: """
         CASE
@@ -106,11 +124,61 @@ defmodule VoelgoedAi.Support.SupportRun do
           FOR EACH ROW
           WHEN (OLD.state <> 'running' AND
             (OLD.typed_decision IS DISTINCT FROM NEW.typed_decision OR
-             OLD.shadow_disposition IS DISTINCT FROM NEW.shadow_disposition))
+             OLD.shadow_disposition IS DISTINCT FROM NEW.shadow_disposition)
+           AND NEW.retention_state IS DISTINCT FROM 'purged')
           EXECUTE FUNCTION guard_support_run_shadow_completion();
         """)
 
         down("DROP TRIGGER support_runs_immutable_shadow_completion ON support_runs")
+      end
+
+      statement :guard_reply_retention_function do
+        after_tables(["support_runs"])
+
+        up("""
+        CREATE FUNCTION guard_support_run_reply_retention() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF OLD.retention_state IS NULL AND OLD.state = 'running'
+              AND NEW.state = 'completed' AND NEW.retention_state = 'present'
+              AND NEW.retention_occurrence IS NULL THEN
+            RETURN NEW;
+          END IF;
+
+          IF OLD.state = 'completed'
+              AND ((OLD.retention_state = 'present' AND NEW.retention_state IN ('held', 'purged'))
+                OR (OLD.retention_state = 'held' AND NEW.retention_state IN ('present', 'purged')))
+              AND NEW.retention_occurrence IS NOT NULL
+              AND OLD.retention_occurrence IS DISTINCT FROM NEW.retention_occurrence
+              AND (to_jsonb(OLD) - ARRAY['retention_state','retention_occurrence','typed_decision','updated_at'])
+                = (to_jsonb(NEW) - ARRAY['retention_state','retention_occurrence','typed_decision','updated_at'])
+              AND NEW.typed_decision = (CASE WHEN NEW.retention_state = 'purged'
+                THEN OLD.typed_decision - 'reply_text'
+                ELSE OLD.typed_decision END) THEN
+            RETURN NEW;
+          END IF;
+
+          RAISE EXCEPTION 'invalid reply retention transition' USING ERRCODE = 'check_violation';
+        END
+        $$;
+        """)
+
+        down("DROP FUNCTION guard_support_run_reply_retention()")
+      end
+
+      statement :guard_reply_retention_trigger do
+        after_tables(["support_runs"])
+
+        up("""
+        CREATE TRIGGER support_runs_reply_retention_transition
+          BEFORE UPDATE ON support_runs FOR EACH ROW
+          WHEN (OLD.retention_state IS DISTINCT FROM NEW.retention_state
+            OR OLD.retention_occurrence IS DISTINCT FROM NEW.retention_occurrence
+            OR (OLD.retention_state IS NOT NULL AND OLD.typed_decision IS DISTINCT FROM NEW.typed_decision)
+            OR (OLD.retention_state IS NOT NULL AND OLD.finished_at IS DISTINCT FROM NEW.finished_at))
+          EXECUTE FUNCTION guard_support_run_reply_retention();
+        """)
+
+        down("DROP TRIGGER support_runs_reply_retention_transition ON support_runs")
       end
 
       statement :guard_typed_completion do
@@ -186,6 +254,9 @@ defmodule VoelgoedAi.Support.SupportRun do
       allow_nil?: true,
       constraints: [one_of: [:fixed_reply, :handoff, :no_send, :typed_reply]]
     )
+
+    attribute(:retention_state, :atom, constraints: [one_of: [:present, :held, :purged]])
+    attribute(:retention_occurrence, :uuid)
 
     attribute(:typed_decision, VoelgoedAi.Support.SupportDecision, sensitive?: true)
 
@@ -323,6 +394,7 @@ defmodule VoelgoedAi.Support.SupportRun do
       require_attributes([:typed_decision, :shadow_disposition, :finished_at])
 
       validate({VoelgoedAi.Support.FromState, states: [:running]})
+      change({VoelgoedAi.Support.ReplyRetentionChange, []})
       change(set_attribute(:state, :completed))
       change(set_attribute(:decision, :no_send))
       change(set_attribute(:lease_expires_at, nil))
@@ -354,8 +426,18 @@ defmodule VoelgoedAi.Support.SupportRun do
       ])
 
       validate({VoelgoedAi.Support.FromState, states: [:running]})
+      change({VoelgoedAi.Support.ReplyRetentionChange, []})
       change(set_attribute(:state, :completed))
       change(set_attribute(:lease_expires_at, nil))
+    end
+
+    update :transition_retention do
+      description("Apply one qualified reply retention transition under the support transaction.")
+      transaction?(false)
+      require_atomic?(false)
+      accept([:retention_state, :retention_occurrence, :typed_decision])
+      require_attributes([:retention_state, :retention_occurrence, :typed_decision])
+      validate({VoelgoedAi.Support.FromState, states: [:completed]})
     end
 
     update :cancel do
@@ -437,6 +519,7 @@ defmodule VoelgoedAi.Support.SupportRun do
              :complete,
              :complete_shadow,
              :complete_evidenced,
+             :transition_retention,
              :shadow_clarifications,
              :cancel,
              :supersede,
