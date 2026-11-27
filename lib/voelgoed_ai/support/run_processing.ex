@@ -12,7 +12,6 @@ defmodule VoelgoedAi.Support.RunProcessing do
   alias VoelgoedAi.Support.{
     ChatwootAdapter,
     Configuration,
-    DecisionTemplates,
     Delivery,
     InboundEvent
   }
@@ -554,7 +553,11 @@ defmodule VoelgoedAi.Support.RunProcessing do
            now = ChatwootAdapter.now(),
            true <- DateTime.before?(now, run.lease_expires_at),
            {:ok, decision} <-
-             DecisionTemplates.decide(context, revision.locale, length(prior) < 2),
+             VoelgoedAi.Support.DecisionTemplates.decide(
+               context,
+               revision.locale,
+               length(prior) < 2
+             ),
            handoff? = decision.decision == "handoff",
            {:ok, completed} <-
              store_update(run, :complete_shadow, %{
