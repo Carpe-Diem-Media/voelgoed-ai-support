@@ -4,9 +4,13 @@ defmodule VoelgoedAiWeb.StaffLiveSocket do
 
   alias VoelgoedAiWeb.StaffSession
 
-  def connect(_params, socket, %{uri: uri, session: cookie}) do
+  def connect(_params, socket, info),
+    do: connect_for(socket, info, &StaffSession.knowledge_access/1)
+
+  @doc false
+  def connect_for(socket, %{uri: uri, session: cookie}, access) do
     with true <- StaffSession.knowledge_origin?(uri),
-         {:ok, :authorized} <- cookie |> StaffSession.decode() |> StaffSession.knowledge_access() do
+         {:ok, :authorized} <- access.(StaffSession.decode(cookie)) do
       # Channel.Server merges these over the channel defaults. Upload joins
       # carry a signed token and can carry arbitrary client parameters.
       {:ok,
@@ -16,5 +20,5 @@ defmodule VoelgoedAiWeb.StaffLiveSocket do
     end
   end
 
-  def connect(_params, _socket, _info), do: :error
+  def connect_for(_socket, _info, _access), do: :error
 end

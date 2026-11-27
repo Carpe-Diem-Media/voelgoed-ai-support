@@ -42,6 +42,17 @@ defmodule VoelgoedAiWeb.Router do
     post("/knowledge/collections/:id/export", KnowledgeExportController, :download)
   end
 
+  if Mix.env() == :test do
+    scope "/staff", VoelgoedAiWeb, log: false do
+      pipe_through([:staff_knowledge, :staff_session])
+
+      live_session :staff_gaps,
+        root_layout: {VoelgoedAiWeb.KnowledgeLive.Components, :gap_root} do
+        live("/gaps", GapLive, :index)
+      end
+    end
+  end
+
   scope "/staff/knowledge", VoelgoedAiWeb, log: false do
     pipe_through([:staff_knowledge, :staff_session])
 

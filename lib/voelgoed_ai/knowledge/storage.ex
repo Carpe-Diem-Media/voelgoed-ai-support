@@ -2,7 +2,7 @@ defmodule VoelgoedAi.Knowledge.Storage do
   @moduledoc false
   use Ash.Policy.SimpleCheck
 
-  alias VoelgoedAi.Knowledge.{Editorial, Publication}
+  alias VoelgoedAi.Knowledge.{Editorial, GapReview, Publication}
   alias VoelgoedAi.Intelligence.{Embedding, Generation}
   alias VoelgoedAi.Governance.{EmbeddingAccounting, FinancialControl}
   alias VoelgoedAi.Repo
@@ -18,6 +18,7 @@ defmodule VoelgoedAi.Knowledge.Storage do
       when is_reference(ref) and
              owner in [
                Editorial,
+               GapReview,
                Publication,
                Embedding,
                Generation,

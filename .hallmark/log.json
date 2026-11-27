@@ -1,0 +1,19 @@
+[
+ {
+  "scope": "app",
+  "shape": "app screen",
+  "genre": "editorial",
+  "theme": "Almanac",
+  "axes": "mid/system-sans/chromatic-magenta",
+  "nav": "existing staff top bar",
+  "imagery": "authenticated TEST queue capture",
+  "photos": [],
+  "signature": "scoped knowledge gap queue",
+  "entry": "/staff/gaps",
+  "sections": "queue with inline review controls",
+  "waived": [],
+  "prompt": "Add one scoped synthetic FAQ gap review queue in the existing staff design.",
+  "date": "2026-11-27",
+  "mode": "build"
+ }
+]

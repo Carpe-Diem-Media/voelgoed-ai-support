@@ -1,0 +1,20 @@
+/* Hallmark · shape: app screen · genre: editorial · theme: existing Almanac staff system
+ * nav: staff top bar · signature: scoped knowledge gap queue · states: full, empty, error, denied, reconnecting
+ * axes: mid/system-sans/chromatic-magenta · posture: restrained · v2.0.0 */
+/* Hallmark · pre-emit critique: P4 H4 E4 S4 R5 V3 · weakest: V, use the staff sheet and mark each occurrence with its cause and review state. */
+/* Hallmark · answered F23 · The gap queue is private and has no public link preview. */
+.gap-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+#gap-queue .editorial-form {
+  margin-block-start: var(--space-3);
+  padding-inline: 0;
+}
+#gap-queue .editorial-form button { white-space: nowrap; }
+.gap-offline { display: none; }
+.phx-disconnected .gap-offline { display: block; }

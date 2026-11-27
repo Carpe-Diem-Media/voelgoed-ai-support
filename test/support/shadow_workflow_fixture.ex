@@ -95,7 +95,8 @@ defmodule VoelgoedAi.ShadowWorkflowFixture do
     assert {:ok, target} =
              invoke(ArticleRevision, :approve, attest(snapshot(reviewed)), staff.reviewer)
 
-    for id <- request_index(staff, target), do: assert(:ok = Embedding.index(id))
+    for id <- request_index(staff, target, :request_publish, length(raw["localized_content"])),
+        do: assert(:ok = Embedding.index(id))
 
     assert :ok =
              FinalizePublication.perform(%Oban.Job{
