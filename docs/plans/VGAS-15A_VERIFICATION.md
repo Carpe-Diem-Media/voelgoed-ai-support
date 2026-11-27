@@ -207,3 +207,27 @@ The six PR A scope items have local evidence. The combined verification status i
 - `test/support/support_db_case.ex`
 - `test/voelgoed_ai/support/delivery_recovery_test.exs`
 - `test/voelgoed_ai/support/shadow_decision_test.exs`
+
+## Review corrections
+
+An independent review of `63f2c89` was cut short before it gave a verdict. Before it stopped it:
+- confirmed that format, the forced TEST compile, the PROD compile and the stubs outside TEST all hold;
+- found the same 17 inherited DEV warnings as on base;
+- ran `ash.codegen --check`, migrate, rollback and re-migrate, all with exit 0;
+- ran the full suite, which matched the record apart from the two inherited split-clock failures that VGAS-23 fixed.
+
+It also ran eight mutants. Six were killed, and two survived:
+- the covered-receipt recheck under the completion lock (`run_processing.ex:524`);
+- the pending-input recheck under the completion lock (`run_processing.ex:525`).
+
+The reviewer showed that the pending-input window is reachable. A signed receipt that has landed but not been processed leaves the watermark unchanged.
+
+`shadow_decision_test.exs` adds two parked-claim tests:
+- **"a newer receipt awaiting processing fences the parked decision".** A signed receipt arrives while the history read is parked and is not yet in the fake history.
+- **"a covered receipt that changes after the claim fences the parked decision".** No supported action reaches this, so the test simulates the drift with SQL.
+
+Each test leaves the run `failed` with no typed decision and no wire writes.
+
+On disposable 18.7/0.8.7 at 55435, `shadow_decision_test.exs --seed 0` gave 31 passed. Each mutant then failed exactly its matching new test (30/31 passed), and the source was restored after each one. Together with `delivery_recovery_test.exs`, the restored source gave 96 passed.
+
+The review also noted that admission-limited input is routed to staff with the existing `:late_input` handoff reason (`ownership.ex:307`). That is a labelling NIT with no safety effect, and it is recorded in VGAS-24.

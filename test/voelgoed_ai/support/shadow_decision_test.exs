@@ -274,6 +274,40 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
     assert [] = SupportDBCase.writes(ctx)
   end
 
+  # A receipt that has landed but not yet been processed leaves the watermark
+  # unchanged. The history read may not show it yet either, so only the
+  # pending-input recheck under the completion lock stops the decision from
+  # ignoring the newer customer message.
+  test "a newer receipt awaiting processing fences the parked decision" do
+    ctx = SupportDBCase.setup(shadow: :en)
+    id = queue(ctx, "Hello")
+    {task, worker} = park(ctx, id)
+    message_id = ctx.event.message_id + 1
+
+    assert {:ok, _} =
+             SupportDBCase.signed_receipt(%{ctx | event: %{ctx.event | message_id: message_id}})
+
+    assert :ok = resume(task, worker)
+    assert %{rows: [["failed", nil, nil]]} = run_row(id)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  # No supported action changes a covered receipt after its claim; this
+  # simulates that drift to prove completion rechecks the covered set.
+  test "a covered receipt that changes after the claim fences the parked decision" do
+    ctx = SupportDBCase.setup(shadow: :en)
+    id = queue(ctx, "Hello")
+    {task, worker} = park(ctx, id)
+
+    SQL.query!(Repo, "UPDATE inbound_events SET disposition = 'triage' WHERE message_id = $1", [
+      ctx.event.message_id
+    ])
+
+    assert :ok = resume(task, worker)
+    assert %{rows: [["failed", nil, nil]]} = run_row(id)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
   test "an ownership or control epoch change fences the parked claim" do
     ctx = SupportDBCase.setup(shadow: :en)
     id = queue(ctx, "Human please")
