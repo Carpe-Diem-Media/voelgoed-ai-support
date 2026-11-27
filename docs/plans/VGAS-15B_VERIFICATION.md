@@ -168,6 +168,22 @@ compound and signed phrases, then accepted each exact phrase when cited.
 The disposable container and volume were removed. Independent review and
 hosted CI are required for the corrected head.
 
+The independent review at `043904c` confirmed the written-quantity fix and
+reproduced gaps in hyphenated percentages, month-name dates and fractional
+percentages. Eight new bilingual completion cases failed on that head.
+The corrected matcher retains date order, month name, optional ordinal and
+year, and the connecting words or punctuation in percentage expressions.
+The paired controls for `5-percent`, `30 November 2026` and `one quarter of
+a percent` preserve the cited bytes. A direct render probe also checked nine
+date and percentage forms with uncited and verbatim cited evidence.
+
+The focused command exited 0 with 180 tests at seed 0. Format, forced strict
+TEST compile and snapshot checks exited 0 on disposable PostgreSQL 18.7 and
+pgvector 0.8.7. The container and volume were removed. The orchestrator
+checked merge compatibility against `2ed8e24`, which adds the independent
+editorial correction in PR #25. Exact-head CI and independent review are
+pending on the updated candidate.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.

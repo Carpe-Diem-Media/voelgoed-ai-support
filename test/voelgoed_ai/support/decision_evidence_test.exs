@@ -93,15 +93,37 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"currency suffix", "25 rand"},
         {"spaced minus sign", "− 40 rand"},
         {"cents suffix", "25c"},
-        {"written percentage unit", %{"af-ZA" => "25 persent", "en-ZA" => "25 percent"}},
-        {"written price", %{"af-ZA" => "vyftig rand", "en-ZA" => "fifty rand"}},
+        {"written percentage unit",
+         %{"af-ZA" => "Die afslag is 25 persent.", "en-ZA" => "The discount is 25 percent."}},
+        {"written price",
+         %{"af-ZA" => "Kaartjies kos vyftig rand.", "en-ZA" => "Tickets cost fifty rand."}},
         {"written compound price",
-         %{"af-ZA" => "vyf-en-twintig rand", "en-ZA" => "twenty-five rand"}},
-        {"written percentage", %{"af-ZA" => "vyftig persent", "en-ZA" => "fifty per cent"}}
+         %{
+           "af-ZA" => "Kaartjies kos vyf-en-twintig rand.",
+           "en-ZA" => "Tickets cost twenty-five rand."
+         }},
+        {"written percentage",
+         %{
+           "af-ZA" => "Die afslag is vyftig persent.",
+           "en-ZA" => "The discount is fifty per cent."
+         }},
+        {"hyphenated percentage",
+         %{"af-ZA" => "Kry 25-persent afslag.", "en-ZA" => "Get a 25-percent discount."}},
+        {"day-first month-name date",
+         %{"af-ZA" => "Besprekings sluit 25 Desember.", "en-ZA" => "Bookings close 25 December."}},
+        {"month-first date",
+         %{
+           "af-ZA" => "Die sluitingsdatum is Desember 25.",
+           "en-ZA" => "The deadline is December 25."
+         }},
+        {"fractional percentage",
+         %{
+           "af-ZA" => "Die afslag is ’n halwe persent.",
+           "en-ZA" => "The discount is half a percent."
+         }}
       ] do
     @opts opts
-    @amount if is_map(amount), do: Map.fetch!(amount, locale), else: amount
-    @reply "#{price_prefix} #{@amount}."
+    @reply if is_map(amount), do: Map.fetch!(amount, locale), else: "#{price_prefix} #{amount}."
 
     test "grounded #{locale} completion rejects an unsupported #{label}" do
       ctx = prepare(:grounded, @opts)
@@ -133,7 +155,10 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"spaced minus sign", "The adjustment is − 55 rand."},
         {"cents suffix", "The processing fee is 75c."},
         {"written percentage unit", "The early booking discount is 15 percent."},
-        {"written price", "The printed programme costs sixty rand."}
+        {"written price", "The printed programme costs sixty rand."},
+        {"hyphenated percentage", "Late bookings have a 5-percent fee."},
+        {"month-name date", "Bookings close 30 November 2026."},
+        {"fractional percentage", "The later discount is one quarter of a percent."}
       ] do
     @reply reply
 
@@ -574,7 +599,9 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
                       "The adjustment is − 55 rand. The processing fee is 75c. " <>
-                      "The early booking discount is 15 percent. The printed programme costs sixty rand."
+                      "The early booking discount is 15 percent. The printed programme costs sixty rand. " <>
+                      "The hall is half full. Late bookings have a 5-percent fee. " <>
+                      "Bookings close 30 November 2026. The later discount is one quarter of a percent."
                 end
 
               Map.put(variant, "approved_answer", answer)

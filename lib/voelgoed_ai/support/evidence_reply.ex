@@ -14,29 +14,45 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @currency_label "(?:#{@currency_code}|#{@currency_name})"
   @currency_prefix "(?:\\p{Sc}|(?<![\\p{L}\\p{N}_])#{@currency_label})"
   @minor_currency_suffix ~S"(?:c|ct|cts|p)"
-  @percentage_unit ~S"(?:percent(?:age\s+points?)?|persent(?:punt(?:e)?)?|per[-\s]+(?:cent|sent))"
+  @percentage_unit ~S"(?:percent(?:age[\h\p{Pd}]+points?)?|persent(?:punt(?:e)?)?|per[\h\p{Pd}]+(?:cent|sent))"
+  @article ~S"(?:a|an|['’]n)"
+  @percentage_join "(?:[\\h\\p{Pd}]+(?:(?:of|van)\\h+)?(?:#{@article}\\h+)?)?"
 
-  @english_number ~S"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|trillion|half|quarter)"
-  @afrikaans_number ~S"(?:nul|een|twee|drie|vier|vyf|ses|sewe|agt|nege|tien|elf|twaalf|dertien|veertien|vyftien|sestien|sewentien|agtien|ne[ëe]ntien|twintig|dertig|veertig|vyftig|sestig|sewentig|tagtig|negentig|honderd|duisend|miljoen|miljard|biljoen|triljoen|half|kwart)"
+  @english_number ~S"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|trillion|half|halves|quarters?)"
+  @afrikaans_number ~S"(?:nul|een|twee|drie|vier|vyf|ses|sewe|agt|nege|tien|elf|twaalf|dertien|veertien|vyftien|sestien|sewentien|agtien|ne[ëe]ntien|twintig|dertig|veertig|vyftig|sestig|sewentig|tagtig|negentig|honderd|duisend|miljoen|miljard|biljoen|triljoen|halwe|kwarte?)"
   @number_word "(?:#{@english_number}|#{@afrikaans_number})"
   @word_join ~S"[\h‑-]*(?:(?:and|en|point|punt|komma)[\h‑-]*)?"
+  @implicit_one "(?:#{@article}\\h+(?=(?:#{@amount_scale}|half|halwe|quarter|kwart)\\b))?"
 
   # Written quantities are compared as written, including hyphenated and
   # joined Afrikaans number words. Numeric equivalents are not substitutes.
   @written_number ~S"(?<![\p{L}\p{M}\p{N}_])" <>
-                    "#{@number_word}(?:#{@word_join}#{@number_word})*" <>
+                    "#{@implicit_one}#{@number_word}(?:#{@word_join}#{@number_word})*" <>
                     ~S"(?![\p{L}\p{M}\p{N}_])"
   @sign ~S"(?:[-+−]\s*|(?:minus|negative|negatief)\h+)"
+
+  @month ~S"(?:jan(?:uary|uarie)?|feb(?:ruary|ruarie)?|mar(?:ch)?|mrt|maart|apr(?:il)?|may|mei|jun(?:e|ie)?|jul(?:y|ie)?|aug(?:ust(?:us)?)?|sept?(?:ember)?|oct(?:ober)?|okt(?:ober)?|nov(?:ember)?|dec(?:ember)?|des(?:ember)?)"
+  @ordinal_day ~S"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|(?:thir|four|fif|six|seven|eigh|nine)teenth|twentieth|thirtieth|eerste|tweede|derde|vierde|vyfde|sesde|sewende|agtste|negende|tiende|elfde|twaalfde|dertien(?:de)?|veertiende|vyftiende|sestiende|sewentiende|agtiende|ne[ëe]ntiende|twintigste|dertigste)"
+  @date_day "(?:\\p{N}{1,2}(?:st|nd|rd|th|ste|de)?|" <>
+              "(?:(?:twenty|thirty)[\\h\\p{Pd}]+)?#{@ordinal_day}|#{@written_number})"
+  @date_year ~S"(?:\.?(?:,\h*|\h+)\p{N}{2,4})"
 
   # Keep signs, currencies, scales and percent units in the same fact as the
   # quantity. A cited count of 25 cannot validate 25 rand or 25 percent.
   @facts ~r/
     #{@link_fact}
     |
+    (?<![\p{L}\p{M}\p{N}_])
+    (?:
+      #{@date_day}[\h\p{Pd}]+(?:(?:of|van)\h+)?#{@month}#{@date_year}?
+      | #{@month}\.?[\h\p{Pd}]+(?:(?:the|die)\h+)?(?:#{@date_day}#{@date_year}?|\p{N}{4})
+    )
+    (?![\p{L}\p{M}\p{N}_])
+    |
     (?:#{@sign}#{@currency_prefix}\s*|#{@currency_prefix}\s*#{@sign}?|#{@sign}?)
     (?:\p{N}+(?:(?:[.,:\/-]|\h+)\p{N}+)*|#{@written_number})
     (?:(?:\s+|[-‑])?(?:#{@amount_scale}|\p{Sc}|#{@currency_label}|#{@minor_currency_suffix})(?![\p{L}\p{N}_]))*
-    (?:\s*(?:%|#{@percentage_unit}(?![\p{L}\p{N}_])))?
+    (?:\s*%|#{@percentage_join}#{@percentage_unit}(?![\p{L}\p{M}\p{N}_]))?
   /iux
   @bare_host ~r|\b[a-z][a-z0-9+.-]*://|iu
   @bare_domain ~r/\b(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}\b/u
