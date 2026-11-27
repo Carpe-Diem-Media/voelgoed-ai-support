@@ -114,6 +114,9 @@ defmodule VoelgoedAi.Intelligence.SupportProposal do
   def output_limit, do: @output_limit
 
   @doc false
+  def system_prompt, do: @system_prompt
+
+  @doc false
   def schema do
     %{
       "type" => "object",

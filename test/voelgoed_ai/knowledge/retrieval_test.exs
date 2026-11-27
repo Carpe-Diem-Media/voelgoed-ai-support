@@ -889,6 +889,39 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     refute_received :wire
   end
 
+  @tag :frozen_embedding_dispatch
+  test "query wire entry retains its admitted cap after the current cap increases" do
+    origin = ~U[2034-05-01 00:00:00Z]
+    ctx = setup_search(%{}, query_clock: origin)
+    {sibling_claim, _} = create_run(SupportDBCase.next_conversation(ctx.support, 1))
+    clock = fn -> origin end
+    owner = self()
+
+    wire = fn request ->
+      send(owner, :wire)
+      EmbeddingTransport.fixture_wire(request)
+    end
+
+    fixture(%{
+      clock: clock,
+      wire: wire,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      after_dispatch: fn _ ->
+        fixture(%{clock: clock, wire: wire})
+
+        sibling = Task.async(fn -> search(sibling_claim) end)
+        assert {:ok, %{status: :evidence}} = Task.await(sibling)
+        assert query_rows(%{claim: sibling_claim}) == [["succeeded", true, "settled", 8]]
+      end
+    })
+
+    assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
+    assert_received :wire
+    refute_received :wire
+    assert query_rows(ctx) == [["unknown", true, "unknown", nil]]
+  end
+
   defp set_run_cutoff(claim, field, cutoff) do
     assert %{num_rows: 1} =
              SQL.query!(Repo, "UPDATE support_runs SET #{field} = $2 WHERE id = $1", [
@@ -1183,11 +1216,91 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
         assert query_rows(ctx) == [["rejected", false, "released", nil]]
         refute_received :wire
       else
-        assert {:ok, %{status: :no_evidence, evidence: []}} = search(ctx.claim)
-        assert query_rows(ctx) == [["succeeded", true, "settled", 8]]
-        assert_received :wire
+        assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
+        assert query_rows(ctx) == [["unknown", true, "unknown", nil]]
+        refute_received :wire
       end
     end
+  end
+
+  @tag :reset_authority
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "a later fixture budget cannot reset a query embedding overage" do
+    alias VoelgoedAi.Governance.AutomationControl
+
+    origin = ~U[2028-01-31 23:59:50Z]
+    ctx = setup_search(%{}, query_clock: origin)
+
+    fixture(%{
+      clock: fn -> origin end,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      wire: &wire_result(&1, :over_reserve)
+    })
+
+    assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
+    assert [["succeeded", true, "settled", 100_000]] = query_rows(ctx)
+
+    assert [[true, occurrence]] =
+             SQL.query!(
+               Repo,
+               "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+             ).rows
+
+    reset = %{lane: :embedding, occurrence: occurrence}
+
+    decide = fn ->
+      VoelgoedAi.SupportFixtures.financial_decision(
+        AutomationControl,
+        :reset_financial_inhibit,
+        reset,
+        ctx.knowledge.admin
+      )
+    end
+
+    assert {:error, _} = decide.()
+    fixture(%{clock: fn -> origin end, day_cap: 10_000_000, month_cap: 100_000_000})
+    assert {:error, _} = decide.()
+
+    assert [[true, ^occurrence]] =
+             SQL.query!(
+               Repo,
+               "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+             ).rows
+
+    assert [[0]] =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM audit_events WHERE event = 'reset_embedding_inhibit' AND correlation_id = $1",
+               [Ecto.UUID.dump!(occurrence)]
+             ).rows
+
+    fixture(%{clock: fn -> DateTime.add(origin, 15) end, day_cap: 1, month_cap: 1})
+
+    [[approved]] =
+      SQL.query!(Repo, "SELECT embedding_inhibit_budget FROM automation_controls").rows
+
+    [[replacement_id, replacement_quote] | _] =
+      SQL.query!(
+        Repo,
+        "SELECT id::text, embedding_budget FROM inference_runs WHERE purpose = 'article_embedding' AND state = 'succeeded' AND embedding_budget IS NOT NULL ORDER BY id"
+      ).rows
+
+    for invalid <- [nil, %{"attempt_id" => replacement_id, "quote" => replacement_quote}] do
+      SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibit_budget = $1", [invalid])
+      assert {:error, _} = decide.()
+    end
+
+    assert [[0]] =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM audit_events WHERE event = 'reset_embedding_inhibit' AND correlation_id = $1",
+               [uuid(occurrence)]
+             ).rows
+
+    SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibit_budget = $1", [approved])
+    assert {:ok, ^reset} = decide.()
   end
 
   for {name, result, expected} <- [
@@ -1277,17 +1390,91 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     args = %{id: id, reason: :conservative_closure}
 
     assert {:error, _} = invoke(InferenceRun, :close_unknown_embedding, args, ctx.knowledge.admin)
-    fixture(%{closure_approved_by: ctx.knowledge.admin.id})
 
     assert {:error, _} =
              invoke(InferenceRun, :close_unknown_embedding, args, ctx.knowledge.reviewer)
 
     for _ <- 1..2 do
       assert {:ok, %{state: :abandoned}} =
-               invoke(InferenceRun, :close_unknown_embedding, args, ctx.knowledge.admin)
+               VoelgoedAi.SupportFixtures.financial_decision(
+                 InferenceRun,
+                 :close_unknown_embedding,
+                 args,
+                 ctx.knowledge.admin
+               )
     end
 
     assert query_rows(ctx) == [["abandoned", true, "conservatively_settled", 81_920]]
+  end
+
+  for order <- [:closure_first, :settlement_first] do
+    @tag closure_order: order
+    test "query accounting serializes #{order} without rank or duplicate charge", tags do
+      ctx = setup_search()
+      owner = self()
+      barrier = make_ref()
+      {:ok, clock} = Agent.start_link(fn -> ctx.now end)
+
+      fixture(%{
+        clock: fn -> Agent.get(clock, & &1) end,
+        wire: parking_wire(owner, barrier, &wire_result(&1, :correlated_usage))
+      })
+
+      worker =
+        on_connection(fn ->
+          Retrieval.with_rank_measurement(fn _, _, _ -> send(owner, :query_ranked) end, fn ->
+            search(ctx.claim)
+          end)
+        end)
+
+      assert_receive {:embedding_parked, ^barrier, adapter}, 5_000
+      Agent.update(clock, fn _ -> DateTime.add(ctx.now, 35, :day) end)
+      assert :ok = Embedding.sweep()
+
+      %{rows: [[id]]} =
+        SQL.query!(Repo, "SELECT id::text FROM inference_runs WHERE support_run_id = $1", [
+          uuid(ctx.claim.run_id)
+        ])
+
+      close = fn ->
+        VoelgoedAi.SupportFixtures.financial_decision(
+          InferenceRun,
+          :close_unknown_embedding,
+          %{id: id, reason: :conservative_closure},
+          ctx.knowledge.admin
+        )
+      end
+
+      if tags.closure_order == :closure_first do
+        assert {:ok, %{state: :abandoned}} = close.()
+      end
+
+      send(adapter, {:complete_embedding, barrier})
+      assert {:ok, %{status: :unavailable}} = Task.await(worker, 5_000)
+      refute_received :query_ranked
+
+      if tags.closure_order == :settlement_first do
+        assert {:error, _} = close.()
+        assert [["succeeded", true, "settled", 18]] = query_rows(ctx)
+      else
+        assert [
+                 ["abandoned", true, "conservatively_settled", 81_920],
+                 ["abandoned", true, "conservatively_settled", -81_902]
+               ] = query_rows(ctx)
+      end
+
+      assert %{rows: [[18, count]]} =
+               SQL.query!(
+                 Repo,
+                 """
+                 SELECT sum(amount_nano_usd)::bigint, count(*) FROM usage_ledger_entries
+                 WHERE inference_run_id = $1
+                 """,
+                 [uuid(id)]
+               )
+
+      assert count == if(tags.closure_order == :closure_first, do: 2, else: 1)
+    end
   end
 
   for state <- [:running, :unknown] do
@@ -1678,6 +1865,14 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
           end
         end
       )
+
+    support =
+      if now = Keyword.get(opts, :query_clock) do
+        Agent.update(support.fake, &%{&1 | now: now})
+        put_in(support.event.received_at, now)
+      else
+        support
+      end
 
     {claim, now} = create_run(support)
 

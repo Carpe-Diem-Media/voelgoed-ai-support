@@ -6,6 +6,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
     data_layer: AshPostgres.DataLayer,
     authorizers: [Ash.Policy.Authorizer]
 
+  alias VoelgoedAi.Governance.FinancialControl
   alias VoelgoedAi.Knowledge.Storage
   alias VoelgoedAi.Support.{ActionScope, Configuration}
 
@@ -60,6 +61,10 @@ defmodule VoelgoedAi.Governance.AutomationControl do
 
     attribute(:generation_inhibited, :boolean, allow_nil?: false, default: false)
     attribute(:embedding_inhibited, :boolean, allow_nil?: false, default: false)
+    attribute(:generation_inhibit_occurrence, :uuid)
+    attribute(:generation_inhibit_budget, :map)
+    attribute(:embedding_inhibit_occurrence, :uuid)
+    attribute(:embedding_inhibit_budget, :map)
     create_timestamp(:inserted_at)
     update_timestamp(:updated_at)
   end
@@ -69,6 +74,16 @@ defmodule VoelgoedAi.Governance.AutomationControl do
   end
 
   actions do
+    action :reset_financial_inhibit, :map do
+      description(
+        "Reset one classified TEST inhibit occurrence after rechecking exposure and caps."
+      )
+
+      argument(:lane, :atom, allow_nil?: false, constraints: [one_of: [:embedding, :generation]])
+      argument(:occurrence, :uuid, allow_nil?: false)
+      run(FinancialControl)
+    end
+
     action :enable_automation, :map do
       argument(:binding_id, :uuid, allow_nil?: false)
       run(Configuration)
@@ -89,13 +104,33 @@ defmodule VoelgoedAi.Governance.AutomationControl do
     update :inhibit_generation do
       transaction?(false)
       require_atomic?(false)
+      accept([:generation_inhibit_budget])
       change(set_attribute(:generation_inhibited, true))
+      change(set_attribute(:generation_inhibit_occurrence, &Ash.UUIDv7.generate/0))
     end
 
     update :inhibit_embedding do
       transaction?(false)
       require_atomic?(false)
+      accept([:embedding_inhibit_budget])
       change(set_attribute(:embedding_inhibited, true))
+      change(set_attribute(:embedding_inhibit_occurrence, &Ash.UUIDv7.generate/0))
+    end
+
+    update :clear_embedding_inhibit do
+      transaction?(false)
+      require_atomic?(false)
+      change(set_attribute(:embedding_inhibited, false))
+      change(set_attribute(:embedding_inhibit_occurrence, nil))
+      change(set_attribute(:embedding_inhibit_budget, nil))
+    end
+
+    update :clear_generation_inhibit do
+      transaction?(false)
+      require_atomic?(false)
+      change(set_attribute(:generation_inhibited, false))
+      change(set_attribute(:generation_inhibit_occurrence, nil))
+      change(set_attribute(:generation_inhibit_budget, nil))
     end
 
     update :update_row do
@@ -106,6 +141,14 @@ defmodule VoelgoedAi.Governance.AutomationControl do
   end
 
   policies do
+    policy action(:reset_financial_inhibit) do
+      authorize_if(FinancialControl)
+    end
+
+    policy action([:clear_embedding_inhibit, :clear_generation_inhibit]) do
+      authorize_if(Storage)
+    end
+
     policy action([:inhibit_embedding, :inhibit_generation]) do
       authorize_if(Storage)
     end

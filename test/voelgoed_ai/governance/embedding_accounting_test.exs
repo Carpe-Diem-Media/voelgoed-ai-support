@@ -10,7 +10,13 @@ defmodule VoelgoedAi.Governance.EmbeddingAccountingTest do
     assert {:ok, 8} = EmbeddingAccounting.cost(3, price)
     assert {:ok, 22_517_998_136_852_483} = EmbeddingAccounting.cost(9_007_199_254_740_993, price)
     assert {:error, :invalid_usage} = EmbeddingAccounting.cost(1.0, price)
-    assert {:error, :amount_overflow} = EmbeddingAccounting.cost(9_223_372_036_854_775_807, price)
+    max = 9_223_372_036_854_775_807
+    assert {:error, :amount_overflow} = EmbeddingAccounting.cost(max, price)
+
+    assert {:ok, ^max} =
+             EmbeddingAccounting.cost(max, %{price | rate_nano_usd: max, token_unit: max})
+
+    assert {:error, :invalid_usage} = EmbeddingAccounting.cost(max + 1, price)
   end
 
   test "article embedding serializes scoped content deterministically" do

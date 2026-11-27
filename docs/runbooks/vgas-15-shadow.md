@@ -60,6 +60,77 @@ after external work and compares its commitment before completing.
 UNKNOWN keeps the original reservation and prevents blind reuse. A trusted
 late response can settle usage even if the worker lost answer authority.
 
+## Local accounting and recovery
+
+VGAS-20 supports financial decisions in TEST. A synthetic decision must match the
+named action, current ADMIN session and exact attempt or inhibit occurrence.
+Closure requires a committed dispatch and UNKNOWN on both the attempt and its
+reservation. It charges the frozen reserve to the original UTC day and month
+and records a staff audit linked to that charge in the same transaction.
+A replay by the original approved actor returns the recorded disposition.
+Historical closures retain their original ledger entries.
+
+The initial charge remains in `actual_nano_usd`. If trusted usage arrives
+after closure, read the initial charge and the linked `late-usage` correction
+together. A correction may be negative, zero or positive. It uses the frozen
+price and the original two windows. Recovery of recorded usage can retry the
+database settlement without calling the provider or returning a vector or
+proposal. If a charge or either window cannot represent the amount, the
+attempt retains the capture and the lane stays inhibited. Shared admission
+and reset deny unresolved overflow across UTC rollover. A transport result
+without qualified usage retains the UNKNOWN hold.
+
+Reset is scoped to one classified inhibit occurrence. Under the accounting
+lock it checks ambiguous exposure and headroom in both UTC windows,
+including outstanding holds. Both lanes use the TEST profile, price and
+caps recorded at admission. A separate append-only audit binds the
+occurrence to the actual tripping attempt and its quote in the same
+transaction as the financial changes. Reset verifies that audit, the
+attempt and its reservation. It denies missing evidence, mismatched
+quotes and conflicting retrips. The reset audit commits with the flag change.
+
+Repeated faults replace classified occurrence IDs. A predecessor flag
+with no occurrence remains unclassified even after a later trip. It
+blocks new inference and resets in both lanes across UTC rollover.
+Qualified delayed usage can still settle against its original windows.
+Resolving the legacy flag requires separate authority and evidence.
+
+The historical feasibility calculation for Luna was **525,375,000 nano-USD**
+(`1,050,000 × 500 + 500 × 750`), above the **250,000,000 nano-USD**
+development daily allowance used for that estimate. The historical embedding
+estimate was **163,840 nano-USD** (`8,192 × 20`). The TEST embedding profile
+reserves **81,920 nano-USD** (`32,768 × 5/2`). The synthetic rates and
+limits are fixed to their passing request profiles. The embedding adapter
+accepts one input with fixed model, dimensions and float encoding. The
+generation adapter checks the full request against the expected messages,
+schema, output limit, reasoning and storage options. Both permit one
+request and disable retries and redirects. The byte limits bound the local
+envelopes. Live tokenization, cache and context tier pricing, complete billed
+output including reasoning, and retry accounting still require separate
+provider evidence and owner approval under VGAS-7.
+
+The owner must approve real prices, caps, eligible financial operators,
+qualified evidence, the conservative closure procedure and inhibit reset
+before any live use. The TEST decision issuer and fixture budget entry
+points are excluded from DEV and PROD. Keep VGAS-7 smoke excluded from
+routine checks.
+
+The VGAS-20 migration adds evidence fields and an audit reference without
+rewriting previous financial rows. A downgrade can remove the schema
+additions before they have recorded a financial audit, inhibit occurrence,
+admitted budget or overflow.
+After recording evidence, disable automation and financial commands. Retain
+the schema and use a build that can read the recorded audit events and
+overflow evidence.
+
+The populated VGAS-20 upgrade test changes the schema. Run it only through
+the approved disposable PostgreSQL 18.7 and pgvector 0.8.7 runner on its
+isolated TEST port. Use the following command in the runner's steps file.
+
+```sh
+VGAS_F04_DISPOSABLE=1 VGAS_VERIFY_VGAS20_UPGRADE=true mise exec -- mix test test/voelgoed_ai/intelligence/generation_test.exs --only vgas20_upgrade --seed 0
+```
+
 ## Opt-in provider smoke
 
 Status is `OWNER_AUTHORIZATION_REQUIRED`. Run this only after the owner

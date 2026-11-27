@@ -11,7 +11,6 @@ defmodule VoelgoedAi.Intelligence.Generation do
   use Ash.Resource.Actions.Implementation
   use Ash.Policy.SimpleCheck
 
-  alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Governance.EmbeddingAccounting, as: Accounting
   alias VoelgoedAi.Intelligence.{GenerationTransport, InferenceRun, SupportProposal}
   alias VoelgoedAi.Knowledge.Storage
@@ -91,6 +90,17 @@ defmodule VoelgoedAi.Intelligence.Generation do
       with_scope(id, claim, Map.delete(options, :evidence_guard), operation)
     end
 
+    @doc false
+    def reset_budget(%{"day_cap" => day, "month_cap" => month} = quote) do
+      config = %{price: @price, day_cap: day, month_cap: month}
+
+      if verified_profile?(%{}) and budget_authority(config) === quote,
+        do: {:ok, config},
+        else: {:error, :invalid_budget}
+    end
+
+    def reset_budget(_), do: {:error, :invalid_budget}
+
     defp with_scope(id, claim, options, operation) do
       if is_nil(Process.get(@scope_key)) and not Repo.in_transaction?() do
         ref = make_ref()
@@ -126,30 +136,56 @@ defmodule VoelgoedAi.Intelligence.Generation do
     end
   end
 
-  def run(
-        %{
-          action: %{name: :close_unknown_generation},
-          arguments: %{id: id, reason: :conservative_closure}
-        },
-        _,
-        %{actor: session}
-      ) do
-    StaffAccess.with_current(session, :admin, fn staff ->
-      with {_, _, _, %{closure_approved_by: approver}} when approver == staff.id <-
-             Process.get(@scope_key),
-           {:ok, control} <- Configuration.lock_control(),
-           {:ok, candidate} <- read_attempt(id, false),
-           {:ok, attempt, reservation} <- lock_money(candidate),
-           {:ok, result} <- close(control, attempt, reservation, staff.id) do
-        {:ok, result}
-      else
-        _ -> {:error, :denied}
+  if Mix.env() == :test do
+    alias VoelgoedAi.Governance.FinancialControl
+
+    def run(
+          %{
+            action: %{name: :close_unknown_generation},
+            arguments: %{id: id, reason: :conservative_closure}
+          } = input,
+          _,
+          %{actor: session}
+        ) do
+      FinancialControl.with_authority(input, session, fn control, staff_id ->
+        with {:ok, candidate} <- read_attempt(id, false),
+             {:ok, attempt, reservation} <- lock_money(candidate) do
+          close(control, attempt, reservation, staff_id)
+        end
+      end)
+      |> case do
+        {:ok, result} -> {:ok, result}
+        _ -> {:error, "generation closure denied"}
       end
-    end)
-    |> case do
-      {:ok, result} -> {:ok, result}
-      _ -> {:error, "generation closure denied"}
     end
+
+    defp close(control, attempt, hold, staff_id) do
+      now = ChatwootAdapter.now()
+
+      case finish(control, attempt, hold, now, {:conservative_closure, staff_id}) do
+        {:ok, :conservative_closure} when attempt.state == :abandoned ->
+          {:ok, %{id: attempt.id, state: :abandoned}}
+
+        {:ok, :conservative_closure} ->
+          with {:ok, row} <-
+                 change(attempt, %{
+                   state: :abandoned,
+                   finished_at: now,
+                   reason_code: :conservative_closure
+                 }) do
+            {:ok, %{id: row.id, state: row.state}}
+          end
+
+        {:ok, :amount_overflow} ->
+          {:ok, %{id: attempt.id, state: :unknown}}
+
+        error ->
+          error
+      end
+    end
+  else
+    def run(%{action: %{name: :close_unknown_generation}}, _, _),
+      do: {:error, "generation closure denied"}
   end
 
   defp qualified(%{run_id: id, claim_generation: claim}, settings, work) do
@@ -229,8 +265,29 @@ defmodule VoelgoedAi.Intelligence.Generation do
       end)
   end
 
+  defp budget(options) do
+    %{
+      price: @price,
+      day_cap: Map.get(options, :day_cap, 2_000_000_000),
+      month_cap: Map.get(options, :month_cap, 20_000_000_000)
+    }
+  end
+
+  # The quote comes from the same fixture scope as admission. Persist it with
+  # the attempt so delayed settlement cannot substitute another fixture's caps.
+  defp budget_authority(config) do
+    Accounting.budget_quote("openai", SupportProposal.model(), SupportProposal.profile(), config)
+  end
+
+  defp verified_profile?(options) do
+    Map.get(options, :price, @price) == @price and
+      SupportProposal.output_limit() == @price.max_output_tokens
+  end
+
   defp reserve(control, run, now, cutoff, fixture) do
-    with {:ok, slots} <- read(:generation_slots, %{turn_ref: run.turn_ref}, &Ash.read/1),
+    with true <- verified_profile?(fixture),
+         config = budget(fixture),
+         {:ok, slots} <- read(:generation_slots, %{turn_ref: run.turn_ref}, &Ash.read/1),
          {:ok, ordinal} <- next_slot(run, slots),
          {:ok, attempt} <-
            storage(:insert_generation_attempt, fn actor ->
@@ -245,6 +302,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
                  model_id: SupportProposal.model(),
                  profile_id: SupportProposal.profile(),
                  prompt_version: SupportProposal.prompt_version(),
+                 generation_budget: budget_authority(config),
                  deadline_at: cutoff,
                  started_at: now,
                  ordinal: ordinal,
@@ -255,16 +313,14 @@ defmodule VoelgoedAi.Intelligence.Generation do
                actor: actor
              )
            end),
-         config = %{
-           price: @price,
-           day_cap: Map.get(fixture, :day_cap, 2_000_000_000),
-           month_cap: Map.get(fixture, :month_cap, 20_000_000_000)
-         },
          {:ok, _} <-
            account(attempt, :reserve, &Accounting.reserve(&1, control, attempt, now, config)),
          {:ok, _} <-
            Ownership.enqueue(RecoverIndexing, %{generation_id: attempt.id}, scheduled_at: cutoff) do
       {:ok, attempt}
+    else
+      false -> {:error, :invalid_price}
+      error -> error
     end
   end
 
@@ -285,7 +341,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
     barrier(fixture, :after_claim, attempt)
 
     case qualified(args, fixture, fn config, _, revision, _, cutoff ->
-           with {:ok, dispatched} <- dispatch(config, attempt, cutoff),
+           with {:ok, dispatched} <- dispatch(config, attempt, cutoff, fixture),
                 do: {:ok, {dispatched, locale(revision)}}
          end) do
       {:ok, {%InferenceRun{} = dispatched, approved_locale}} ->
@@ -326,21 +382,27 @@ defmodule VoelgoedAi.Intelligence.Generation do
     end
   end
 
-  defp dispatch(config, %{dispatched_at: nil} = candidate, cutoff) do
-    with {:ok, attempt, now} <- dispatch_ready(config, candidate, cutoff) do
+  defp dispatch(config, %{dispatched_at: nil} = candidate, cutoff, settings) do
+    with {:ok, attempt, now} <- dispatch_ready(config, candidate, cutoff, settings) do
       change(attempt, %{dispatched_at: now})
     end
   end
 
   defp dispatch_ready(
-         %{control: %{generation_inhibited: false, status: :enabled}},
+         %{control: %{generation_inhibited: false, status: :enabled} = control},
          candidate,
-         cutoff
+         cutoff,
+         settings
        ) do
     with {:ok, %{state: :running} = attempt} <- read_attempt(candidate.id, true),
          true <- immutable?(attempt, candidate),
          true <- attempt.dispatched_at == candidate.dispatched_at,
-         {:ok, %{state: :reserved}} <- reservation(attempt),
+         true <- verified_profile?(settings),
+         approved = budget(settings),
+         true <- attempt.generation_budget === budget_authority(approved),
+         {:ok, hold} <- reservation(attempt),
+         now = ChatwootAdapter.now(),
+         :ok <- Accounting.validate_dispatch(attempt, control, hold, now, approved),
          # Locks may have waited past either cutoff.
          now = ChatwootAdapter.now(),
          true <- DateTime.before?(now, cutoff) and DateTime.before?(now, attempt.deadline_at) do
@@ -350,7 +412,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
     end
   end
 
-  defp dispatch_ready(_, _, _), do: {:error, :dispatch_denied}
+  defp dispatch_ready(_, _, _, _), do: {:error, :dispatch_denied}
 
   # The closure is bound to the committed attempt and runs in ReqLLM's request
   # task. Use the same lock order as dispatch and return only after commit.
@@ -358,7 +420,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
     scope = %{run_id: attempt.support_run_id, claim_generation: attempt.claim_generation}
 
     qualified(scope, settings, fn config, _run, _revision, _now, cutoff ->
-      with {:ok, _, _} <- dispatch_ready(config, attempt, cutoff), do: {:ok, cutoff}
+      with {:ok, _, _} <- dispatch_ready(config, attempt, cutoff, settings), do: {:ok, cutoff}
     end)
   end
 
@@ -375,6 +437,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
           attempt,
           {self(), ref},
           fixture.wire,
+          payload,
           timeout,
           authorize_entry
         )
@@ -414,10 +477,22 @@ defmodule VoelgoedAi.Intelligence.Generation do
   @doc "Fence a due generation attempt and retain its hold if dispatch was committed."
   def recover(id) do
     case transaction(id, nil, fn control, current, hold ->
-           if current.state == :running and
-                not DateTime.before?(ChatwootAdapter.now(), current.deadline_at),
-              do: expire(control, current, hold, :deadline),
-              else: {:ok, :noop}
+           cond do
+             current.overflow_evidence && is_nil(current.overflow_resolved_at) ->
+               settle(
+                 control,
+                 current,
+                 hold,
+                 {:usage, Accounting.recorded_usage(current), :invalid}
+               )
+
+             current.state == :running and
+                 not DateTime.before?(ChatwootAdapter.now(), current.deadline_at) ->
+               expire(control, current, hold, :deadline)
+
+             true ->
+               {:ok, :noop}
+           end
          end) do
       {:ok, {:attention, reason, attempt}} -> alert(attempt, reason)
       {:ok, _} -> :ok
@@ -461,12 +536,14 @@ defmodule VoelgoedAi.Intelligence.Generation do
 
     # The frozen output limit governs proposal eligibility independently of price.
     valid =
-      is_integer(hold.max_output_tokens) and usage.output_tokens <= hold.max_output_tokens and
+      usage.input_tokens <= hold.max_input_tokens and
+        is_integer(hold.max_output_tokens) and usage.output_tokens <= hold.max_output_tokens and
         match?({:ok, %VoelgoedAi.Support.SupportDecision{}}, result)
 
     status = if valid, do: :valid, else: :invalid_proposal
 
-    with {:ok, accounting} <-
+    with true <- Accounting.overflow_matches?(attempt, usage),
+         {:ok, accounting} <-
            finish(
              control,
              attempt,
@@ -475,6 +552,9 @@ defmodule VoelgoedAi.Intelligence.Generation do
              {:usage, usage.input_tokens, usage.output_tokens, status}
            ) do
       apply_usage(attempt, now, usage, result, status, accounting)
+    else
+      false -> {:error, :conflicting_evidence}
+      error -> error
     end
   end
 
@@ -493,17 +573,28 @@ defmodule VoelgoedAi.Intelligence.Generation do
 
   defp settle(_, _, _, _), do: {:ok, :noop}
 
-  defp apply_usage(%{state: :abandoned}, _, _, _, _, :amount_overflow),
-    do: {:ok, {:attention, :amount_overflow}}
+  defp apply_usage(attempt, now, usage, _, _, :amount_overflow) do
+    evidence = attempt.overflow_evidence || Accounting.overflow_evidence(usage)
 
-  defp apply_usage(attempt, now, _, _, _, :amount_overflow) do
-    with {:ok, _} <-
-           change(attempt, %{state: :unknown, finished_at: now, reason_code: :amount_overflow}),
-         do: {:ok, {:attention, :amount_overflow}}
+    attrs =
+      case attempt.state do
+        :abandoned ->
+          %{overflow_evidence: evidence}
+
+        _ ->
+          %{
+            state: :unknown,
+            finished_at: now,
+            reason_code: :amount_overflow,
+            overflow_evidence: evidence
+          }
+      end
+
+    with {:ok, _} <- change(attempt, attrs), do: {:ok, {:attention, :amount_overflow}}
   end
 
-  defp apply_usage(%{state: :abandoned} = attempt, _, usage, _, _, accounting) do
-    with {:ok, _} <- change(attempt, usage) do
+  defp apply_usage(%{state: :abandoned} = attempt, now, usage, _, _, accounting) do
+    with {:ok, _} <- change(attempt, resolved_usage(attempt, now, usage)) do
       # The first ceiling charge and terminal attempt state stay immutable.
       if accounting == :late_over_reserve,
         do: {:ok, {:attention, :over_reserve}},
@@ -518,7 +609,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
       finished_at: now
     }
 
-    with {:ok, _} <- change(attempt, Map.merge(usage, changes)) do
+    with {:ok, _} <- change(attempt, Map.merge(resolved_usage(attempt, now, usage), changes)) do
       case {accounting, attempt.state, result} do
         {:over_reserve, _, _} -> {:ok, {:attention, :over_reserve}}
         {:trusted_usage, :running, {:ok, decision}} -> {:ok, {:proposal, decision}}
@@ -527,26 +618,8 @@ defmodule VoelgoedAi.Intelligence.Generation do
     end
   end
 
-  defp close(control, %{state: :unknown} = attempt, hold, staff_id) do
-    now = ChatwootAdapter.now()
-
-    with {:ok, :conservative_closure} <-
-           finish(control, attempt, hold, now, {:conservative_closure, staff_id}),
-         {:ok, row} <-
-           change(attempt, %{
-             state: :abandoned,
-             finished_at: now,
-             reason_code: :conservative_closure
-           }) do
-      {:ok, %{id: row.id, state: row.state}}
-    else
-      {:ok, :amount_overflow} -> {:ok, %{id: attempt.id, state: :unknown}}
-      error -> error
-    end
-  end
-
-  defp close(_, %{state: :abandoned, id: id}, _, _), do: {:ok, %{id: id, state: :abandoned}}
-  defp close(_, _, _, _), do: {:error, :not_unknown}
+  defp resolved_usage(%{overflow_evidence: nil}, _now, usage), do: usage
+  defp resolved_usage(_attempt, now, usage), do: Map.put(usage, :overflow_resolved_at, now)
 
   defp transaction(id, fence, work) do
     Repo.transact(fn ->
@@ -591,7 +664,8 @@ defmodule VoelgoedAi.Intelligence.Generation do
       :provider,
       :model_id,
       :profile_id,
-      :prompt_version
+      :prompt_version,
+      :generation_budget
     ]
 
     Map.take(current, keys) == Map.take(candidate, keys)

@@ -182,7 +182,7 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
       consume_dispatch: fn take ->
         results = [Task.async(take), Task.async(take)] |> Task.await_many()
         send(parent, {:fence_results, Enum.map(results, &elem(&1, 0)) |> Enum.sort()})
-        Enum.find(results, &match?({:ok, _, _}, &1))
+        Enum.find(results, &match?({:ok, _, _, _}, &1))
       end
     })
 
@@ -526,7 +526,6 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
       clock: fn -> Agent.get(clock, & &1) end,
       day_cap: 81_920,
       month_cap: 81_920,
-      closure_approved_by: ctx.admin.id,
       before_settlement: fn attempt ->
         if self() != parent do
           send(parent, {:settlement, self(), attempt.id})
@@ -558,9 +557,23 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
         assert {:error, _} = invoke(InferenceRun, :close_unknown_embedding, args, ctx.reviewer)
 
+        stale_session = %{ctx.admin | generation: ctx.admin.generation - 1}
+
+        assert {:error, _} =
+                 financial_decision(InferenceRun, :close_unknown_embedding, args, stale_session)
+
+        reject_financial_audit(:close_unknown_inference, fn ->
+          assert {:error, _} =
+                   financial_decision(InferenceRun, :close_unknown_embedding, args, ctx.admin)
+
+          assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+          assert [] == ledger_rows(id)
+          assert [] == origin_windows()
+        end)
+
         for _ <- 1..2 do
           assert {:ok, %{state: :abandoned}} =
-                   invoke(InferenceRun, :close_unknown_embedding, args, ctx.admin)
+                   financial_decision(InferenceRun, :close_unknown_embedding, args, ctx.admin)
         end
 
         assert [["abandoned", true, "conservatively_settled", 81_920, 81_920]] =
@@ -570,6 +583,16 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
                  ceiling = ledger_rows(id)
 
         assert admin == ctx.admin.id
+
+        assert [[admin]] ==
+                 SQL.query!(
+                   Repo,
+                   """
+                   SELECT actor_staff_id::text FROM audit_events
+                   WHERE event = 'close_unknown_inference' AND actor_staff_id = $1
+                   """,
+                   [Ecto.UUID.dump!(admin)]
+                 ).rows
 
         assert [["day", ~D[2027-01-31], 81_920], ["month", ~D[2027-01-01], 81_920]] ==
                  origin_windows()
@@ -589,13 +612,234 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     assert Enum.sum(Enum.map(ledger_rows(id), &Enum.at(&1, 4))) == 8
 
     assert {:ok, %{state: :abandoned}} =
-             invoke(InferenceRun, :close_unknown_embedding, args, ctx.admin)
+             financial_decision(InferenceRun, :close_unknown_embedding, args, ctx.admin)
 
     assert :ok = Embedding.recover(id)
     assert :ok = Embedding.index(id)
     assert ledger_rows(id) == ceiling ++ [correction]
     assert [["failed", nil]] = vector_rows(id)
     assert [["day", ~D[2027-01-31], 8], ["month", ~D[2027-01-01], 8]] == origin_windows()
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "article settlement wins over a later qualified close", ctx do
+    {_collection, revision} = approved(ctx)
+    owner = self()
+    origin = ~U[2027-01-31 23:59:50Z]
+    {:ok, clock} = Agent.start_link(fn -> origin end)
+
+    fixture(%{
+      clock: fn -> Agent.get(clock, & &1) end,
+      before_settlement: fn attempt ->
+        send(owner, {:settlement, self(), attempt.id})
+
+        receive do
+          :settle -> :ok
+        after
+          5_000 -> exit(:settlement_barrier_timeout)
+        end
+      end
+    })
+
+    [id, _] = request_index(ctx, revision)
+    worker = Task.async(fn -> Embedding.index(id) end)
+    assert_receive {:settlement, pid, attempt_id}, 5_000
+
+    Agent.update(clock, fn _ -> DateTime.add(origin, 65) end)
+    assert :ok = Embedding.recover(id)
+    send(pid, :settle)
+    assert :ok = Task.await(worker)
+    args = %{id: attempt_id, reason: :conservative_closure}
+
+    assert {:error, _} =
+             financial_decision(InferenceRun, :close_unknown_embedding, args, ctx.admin)
+
+    assert [["succeeded", true, "settled", 81_920, 8]] = reservation_rows(id)
+    assert [[_, "settlement", "settlement", nil, 8, 3, nil]] = ledger_rows(id)
+    assert [["failed", nil]] = vector_rows(id)
+  end
+
+  for window <- ["day", "month"] do
+    @tag :requires_pgvector
+    @tag :embedding_index
+    @tag origin_window: window
+    test "late usage overflow in the origin #{window} survives rollover and blocks reset", ctx do
+      alias VoelgoedAi.Governance.{AutomationControl, FinancialControl}
+
+      {_collection, revision} = approved(ctx)
+      owner = self()
+      origin = ~U[2027-01-31 23:59:50Z]
+      {:ok, clock} = Agent.start_link(fn -> origin end)
+
+      fixture(%{
+        clock: fn -> Agent.get(clock, & &1) end,
+        wire: &response(&1, 40_000),
+        before_settlement: fn attempt ->
+          send(owner, {:about_to_settle, self(), attempt.id})
+
+          receive do
+            :settle -> :ok
+          after
+            5_000 -> exit(:settlement_barrier_timeout)
+          end
+        end
+      })
+
+      [id, _] = request_index(ctx, revision)
+      worker = Task.async(fn -> Embedding.index(id) end)
+      assert_receive {:about_to_settle, pid, attempt_id}, 5_000
+      Agent.update(clock, fn _ -> DateTime.add(origin, 65) end)
+      assert :ok = Embedding.recover(id)
+      close = %{id: attempt_id, reason: :conservative_closure}
+
+      assert {:error, _} =
+               FinancialControl.with_decision(
+                 :close_unknown_embedding,
+                 ctx.admin.id,
+                 revision.id,
+                 fn ->
+                   invoke(InferenceRun, :close_unknown_embedding, close, ctx.admin)
+                 end
+               )
+
+      assert {:ok, %{state: :abandoned}} =
+               financial_decision(InferenceRun, :close_unknown_embedding, close, ctx.admin)
+
+      date = if ctx.origin_window == "day", do: ~D[2027-01-31], else: ~D[2027-01-01]
+
+      update_window = fn amount ->
+        SQL.query!(
+          Repo,
+          "UPDATE spend_windows SET settled_nano_usd = $1 WHERE kind = $2 AND window_start = $3",
+          [amount, ctx.origin_window, date]
+        )
+      end
+
+      update_window.(9_223_372_036_854_775_807)
+
+      first_occurrence =
+        try do
+          send(pid, :settle)
+          assert :ok = Task.await(worker)
+
+          assert [["abandoned", true, "conservatively_settled", 81_920, 81_920]] =
+                   reservation_rows(id)
+
+          assert [_] = ledger_rows(id)
+
+          assert %{rows: [[40_000, nil]]} =
+                   SQL.query!(
+                     Repo,
+                     """
+                     SELECT (overflow_evidence->>'input_tokens')::bigint, overflow_resolved_at
+                     FROM inference_runs WHERE id = $1
+                     """,
+                     [Ecto.UUID.dump!(attempt_id)]
+                   )
+
+          assert %{rows: [[true, occurrence]]} =
+                   SQL.query!(
+                     Repo,
+                     "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+                   )
+
+          reset = %{lane: :embedding, occurrence: occurrence}
+
+          assert {:error, _} =
+                   financial_decision(
+                     AutomationControl,
+                     :reset_financial_inhibit,
+                     reset,
+                     ctx.admin
+                   )
+
+          assert :ok = Embedding.recover(id)
+          assert [_] = ledger_rows(id)
+
+          assert %{rows: [[^occurrence]]} =
+                   SQL.query!(
+                     Repo,
+                     "SELECT embedding_inhibit_occurrence::text FROM automation_controls"
+                   )
+
+          occurrence
+        after
+          update_window.(81_920)
+        end
+
+      assert :ok = Embedding.recover(id)
+      assert [_, [_, "correction", "late-usage", _, 18_080, 40_000, nil]] = ledger_rows(id)
+      assert :ok = Embedding.recover(id)
+      assert [_, _] = ledger_rows(id)
+
+      assert [["abandoned", true, "conservatively_settled", 81_920, 81_920]] =
+               reservation_rows(id)
+
+      assert [["day", ~D[2027-01-31], 100_000], ["month", ~D[2027-01-01], 100_000]] ==
+               origin_windows()
+
+      assert [["failed", nil]] = vector_rows(id)
+
+      assert %{rows: [[true, occurrence]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+               )
+
+      reset = %{lane: :embedding, occurrence: occurrence}
+      assert {:error, _} = invoke(AutomationControl, :reset_financial_inhibit, reset, ctx.admin)
+      refute occurrence == first_occurrence
+      stale = %{reset | occurrence: first_occurrence}
+
+      assert {:error, _} =
+               financial_decision(AutomationControl, :reset_financial_inhibit, stale, ctx.admin)
+
+      reject_financial_audit(:reset_embedding_inhibit, fn ->
+        assert {:error, _} =
+                 financial_decision(AutomationControl, :reset_financial_inhibit, reset, ctx.admin)
+
+        assert %{rows: [[true, ^occurrence]]} =
+                 SQL.query!(
+                   Repo,
+                   "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+                 )
+      end)
+
+      set_legacy_generation_inhibit()
+
+      assert {:error, _} =
+               financial_decision(AutomationControl, :reset_financial_inhibit, reset, ctx.admin)
+
+      assert %{rows: [[0]]} =
+               SQL.query!(
+                 Repo,
+                 """
+                 SELECT count(*) FROM audit_events
+                 WHERE event = 'reset_embedding_inhibit' AND correlation_id = $1
+                 """,
+                 [Ecto.UUID.dump!(occurrence)]
+               )
+
+      SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibited = false")
+
+      assert {:ok, ^reset} =
+               financial_decision(AutomationControl, :reset_financial_inhibit, reset, ctx.admin)
+
+      assert {:error, _} =
+               financial_decision(AutomationControl, :reset_financial_inhibit, reset, ctx.admin)
+
+      assert %{rows: [[1]]} =
+               SQL.query!(
+                 Repo,
+                 """
+                 WITH removed AS (
+                   DELETE FROM audit_events WHERE event = 'reset_embedding_inhibit' AND correlation_id = $1 RETURNING id
+                 ) SELECT count(*) FROM removed
+                 """,
+                 [Ecto.UUID.dump!(occurrence)]
+               )
+    end
   end
 
   @tag :requires_pgvector
@@ -664,6 +908,185 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
   @tag :requires_pgvector
   @tag :embedding_index
+  test "a cheaper fixture price cannot reserve the approved embedding request", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, _] = request_index(ctx, revision)
+    owner = self()
+
+    fixture(%{
+      price: %{
+        version: "embedding-fixture-v1",
+        rate_nano_usd: 1,
+        token_unit: 2,
+        max_input_tokens: 32_768
+      },
+      wire: fn request ->
+        send(owner, :wire)
+        EmbeddingTransport.fixture_wire(request)
+      end
+    })
+
+    assert :ok = Embedding.index(id)
+    assert [] == reservation_rows(id)
+    refute_received :wire
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "article wire entry denies cap drift after the marker and preserves the hold", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, _] = request_index(ctx, revision)
+    owner = self()
+
+    wire = fn request ->
+      send(owner, :wire)
+      EmbeddingTransport.fixture_wire(request)
+    end
+
+    fixture(%{
+      wire: wire,
+      after_dispatch: fn _ -> fixture(%{wire: wire, month_cap: 81_919}) end
+    })
+
+    assert :ok = Embedding.index(id)
+    assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+    assert [] == ledger_rows(id)
+    refute_received :wire
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  @tag :frozen_embedding_dispatch
+  test "article wire entry retains its admitted cap after the current cap increases", ctx do
+    {_collection, revision} = approved(ctx)
+    clock = fn -> ~U[2034-05-01 00:00:00Z] end
+    owner = self()
+
+    wire = fn request ->
+      send(owner, :wire)
+      EmbeddingTransport.fixture_wire(request)
+    end
+
+    fixture(%{clock: clock})
+    [id, sibling] = request_index(ctx, revision)
+
+    fixture(%{
+      clock: clock,
+      wire: wire,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      after_dispatch: fn _ ->
+        fixture(%{clock: clock, wire: wire})
+        assert :ok = Embedding.index(sibling)
+        assert [["succeeded", true, "settled", 81_920, 8]] = reservation_rows(sibling)
+      end
+    })
+
+    assert :ok = Embedding.index(id)
+    assert_received :wire
+    refute_received :wire
+    assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+    assert [] == ledger_rows(id)
+  end
+
+  defp set_legacy_generation_inhibit do
+    assert %{rows: [[false, nil, nil]]} =
+             SQL.query!(Repo, """
+             SELECT generation_inhibited, generation_inhibit_occurrence, generation_inhibit_budget
+             FROM automation_controls
+             """)
+
+    SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibited = true")
+
+    on_exit(fn ->
+      SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibited = false")
+    end)
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "article wire entry denies a legacy generation inhibit after the marker", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, _] = request_index(ctx, revision)
+    owner = self()
+
+    fixture(%{
+      wire: fn request ->
+        send(owner, :wire)
+        EmbeddingTransport.fixture_wire(request)
+      end,
+      after_dispatch: fn _ ->
+        set_legacy_generation_inhibit()
+      end
+    })
+
+    assert :ok = Embedding.index(id)
+    assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+    assert [] == ledger_rows(id)
+    assert [["failed", nil]] = vector_rows(id)
+    refute_received :wire
+  end
+
+  @tag :reset_authority
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "a later fixture budget cannot reset an article embedding overage", ctx do
+    alias VoelgoedAi.Governance.AutomationControl
+
+    origin = ~U[2028-01-31 23:59:50Z]
+    {_collection, revision} = approved(ctx)
+
+    fixture(%{
+      clock: fn -> origin end,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      wire: &response(&1, 40_000)
+    })
+
+    [id, _] = request_index(ctx, revision)
+    assert :ok = Embedding.index(id)
+    assert [["succeeded", true, "settled", 81_920, 100_000]] = reservation_rows(id)
+
+    assert [[true, occurrence]] =
+             SQL.query!(
+               Repo,
+               "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+             ).rows
+
+    reset = %{lane: :embedding, occurrence: occurrence}
+
+    decide = fn ->
+      VoelgoedAi.SupportFixtures.financial_decision(
+        AutomationControl,
+        :reset_financial_inhibit,
+        reset,
+        ctx.admin
+      )
+    end
+
+    assert {:error, _} = decide.()
+    fixture(%{clock: fn -> origin end, day_cap: 10_000_000, month_cap: 100_000_000})
+    assert {:error, _} = decide.()
+
+    assert [[true, ^occurrence]] =
+             SQL.query!(
+               Repo,
+               "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+             ).rows
+
+    assert [[0]] =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM audit_events WHERE event = 'reset_embedding_inhibit' AND correlation_id = $1",
+               [Ecto.UUID.dump!(occurrence)]
+             ).rows
+
+    fixture(%{clock: fn -> DateTime.add(origin, 15) end, day_cap: 1, month_cap: 1})
+    assert {:ok, ^reset} = decide.()
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
   test "settlement uses frozen trusted usage and inhibits admission on excess", ctx do
     {_collection, revision} = approved(ctx)
     parent = self()
@@ -710,6 +1133,39 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     assert :ok = Embedding.index(sibling)
     assert [] == reservation_rows(sibling)
     refute_receive {:pricing_wire, _}, 50
+  end
+
+  for failure <- [:raise, :exit] do
+    @tag :requires_pgvector
+    @tag :embedding_index
+    @tag decoder_failure: failure
+    test "trusted embedding usage survives a decoder #{failure}", ctx do
+      {_collection, revision} = approved(ctx)
+
+      fixture(%{
+        wire: fn request ->
+          {request, response} = EmbeddingTransport.fixture_wire(request)
+
+          request =
+            Req.Request.prepend_response_steps(request,
+              synthetic_decoder_failure: fn _ ->
+                case ctx.decoder_failure do
+                  :raise -> raise "synthetic decoder failure"
+                  :exit -> exit(:synthetic_decoder_failure)
+                end
+              end
+            )
+
+          {request, response}
+        end
+      })
+
+      [id, _] = request_index(ctx, revision)
+      assert :ok = Embedding.index(id)
+      assert [["failed", true, "settled", 81_920, 8]] = reservation_rows(id)
+      assert [[_, "settlement", "settlement", nil, 8, 3, nil]] = ledger_rows(id)
+      assert [["failed", nil]] = vector_rows(id)
+    end
   end
 
   @tag :requires_pgvector

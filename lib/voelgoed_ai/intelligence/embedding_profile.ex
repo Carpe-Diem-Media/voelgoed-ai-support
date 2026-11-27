@@ -29,12 +29,18 @@ defmodule VoelgoedAi.Intelligence.EmbeddingProfile do
              answer,
              scope
            ]),
-         true <- byte_size(text) <= @max_input_bytes and String.valid?(text) do
+         true <- bounded_input?(text) do
       {:ok, text}
     else
       _ -> {:error, :invalid_content}
     end
   end
+
+  @doc "Check the byte envelope used by the synthetic single-input embedding profile."
+  def bounded_input?(text) when is_binary(text),
+    do: byte_size(text) in 1..@max_input_bytes and String.valid?(text)
+
+  def bounded_input?(_), do: false
 
   def vector(values) when is_list(values) and length(values) == @dimensions do
     # Reject float32 infinity and detect underflow to zero after rounding.

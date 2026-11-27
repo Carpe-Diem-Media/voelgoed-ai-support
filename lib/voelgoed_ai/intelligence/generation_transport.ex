@@ -12,7 +12,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
 
   # ReqLLM runs timed HTTP in a task. The closure carries the committed
   # attempt's authority and its own single-entry latch across that boundary.
-  def options(attempt, {owner, ref}, wire, timeout, authorize_entry) do
+  def options(attempt, {owner, ref}, wire, payload, timeout, authorize_entry) do
     latch = :atomics.new(1, [])
     key = {ref, attempt.id, attempt.dispatch_fence}
     expires = System.monotonic_time(:millisecond) + timeout
@@ -24,7 +24,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
       adapter: fn request ->
         request = protect_errors(request)
 
-        with true <- valid_request?(request),
+        with true <- valid_request?(request, payload),
              false <- Repo.in_transaction?(),
              :ok <- :atomics.compare_exchange(latch, 1, 0, 1),
              {:ok, %DateTime{} = cutoff} <- authorize_entry.(),
@@ -124,17 +124,20 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
     end
   end
 
-  defp valid_request?(%Req.Request{
-         method: :post,
-         url: %{
-           scheme: "https",
-           host: "api.openai.com",
-           port: 443,
-           path: "/v1/responses",
-           query: nil
+  defp valid_request?(
+         %Req.Request{
+           method: :post,
+           url: %{
+             scheme: "https",
+             host: "api.openai.com",
+             port: 443,
+             path: "/v1/responses",
+             query: nil
+           },
+           body: body
          },
-         body: body
-       })
+         payload
+       )
        when is_binary(body) or is_list(body) do
     with true <- IO.iodata_length(body) <= @max_request_bytes,
          {:ok,
@@ -151,7 +154,8 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
               "format" => %{"type" => "json_schema", "strict" => true, "schema" => schema}
             }
           } = fields} <- body |> IO.iodata_to_binary() |> Jason.decode() do
-      is_binary(system) and is_binary(data) and limit == SupportProposal.output_limit() and
+      system == SupportProposal.system_prompt() and data == payload and
+        limit == SupportProposal.output_limit() and
         schema == SupportProposal.schema() and
         Map.keys(fields) -- ~w(model input store max_output_tokens reasoning text stream include) ==
           [] and
@@ -161,7 +165,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
     end
   end
 
-  defp valid_request?(_), do: false
+  defp valid_request?(_, _), do: false
 
   defp evidence(%Req.Response{status: 200, body: body} = response, elapsed) do
     with [request_id] <- Req.Response.get_header(response, "x-request-id"),

@@ -4,7 +4,7 @@ defmodule VoelgoedAi.Knowledge.Storage do
 
   alias VoelgoedAi.Knowledge.{Editorial, Publication}
   alias VoelgoedAi.Intelligence.{Embedding, Generation}
-  alias VoelgoedAi.Governance.EmbeddingAccounting
+  alias VoelgoedAi.Governance.{EmbeddingAccounting, FinancialControl}
   alias VoelgoedAi.Repo
 
   @enforce_keys [:ref]
@@ -16,7 +16,14 @@ defmodule VoelgoedAi.Knowledge.Storage do
   @impl true
   def match?(%__MODULE__{ref: ref, owner: owner}, %{subject: subject}, _opts)
       when is_reference(ref) and
-             owner in [Editorial, Publication, Embedding, Generation, EmbeddingAccounting] do
+             owner in [
+               Editorial,
+               Publication,
+               Embedding,
+               Generation,
+               EmbeddingAccounting,
+               FinancialControl
+             ] do
     Repo.in_transaction?() and
       Process.get({owner, :storage}) == {ref, subject.resource, subject.action.name}
   end
