@@ -36,6 +36,14 @@ bash .github/scripts/compare_release_payloads.sh vgas-release:first vgas-release
   source. For removal, verify that a compatible upstream lock pin orders the
   keywords and that two clean builds match without the helper.
   [Normalization script](../../rel/build/normalize_xema.sh)
+- The same stage checks the locked ReqLLM 1.31.0 and LLMDB 2026.11.6
+  sources before sorting the inline-model allowlist and the generated model
+  and pricing field lists. The guard checks all three input and output
+  hashes before replacing any source file. Development and test dependency
+  preparation use the original packages. Remove the helper only after
+  qualifying compatible upstream pins and repeating both complete builds
+  and the packaged model checks.
+  [Model normalization](../../rel/build/normalize_model_schemas.sh)
 - Phoenix 1.8.17 and LiveView 1.2.15 provide their minified browser bundles via
   the locked Hex packages. The app ships the staff CSS and JS from
   `priv/static/staff/`. DEV pins the esbuild and Tailwind wrappers to versions
@@ -63,6 +71,18 @@ HTTP liveness. Use the packaged migration and restricted-role probes for
 database verification. Run the runtime proof on a Linux Docker host with
 `curl`, `openssl`, and Git. It connects directly to the container addresses
 and uses a disposable TLS listener for staff asset checks.
+
+The packaged model probe checks the ordered fields and compares a digest
+of the full schemas, struct defaults, representative valid and invalid
+results, complete errors for a multi-field invalid input, and all catalog
+models against the pinned baseline. When intentionally changing the pins,
+rerun the probe against the unmodified upstream package with
+`VGAS_REQUIRE_SORTED_MODEL_SCHEMAS` unset. Review and record any semantic
+differences before updating the baseline digest. ReqLLM can select a
+different subset of its previous three-error diagnostic because its
+field traversal is now ordered. The release also checks that VGAS rejects
+fabricated dispatch authority and invalid request envelopes without a wire
+call or a provider error in the returned result.
 
 The default release denies staff and Chatwoot access and leaves Oban job
 execution disabled. The HTTPS asset test uses synthetic registration settings

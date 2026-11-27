@@ -26,9 +26,10 @@ RUN test "$(cat /usr/local/lib/erlang/releases/29/OTP_VERSION)" = "$(awk '$1 == 
 COPY config/config.exs config/config.exs
 # Remove the normalization when the locked upstream Xema release provides
 # deterministic keyword ordering and two clean builds match without it.
-COPY rel/build/normalize_xema.sh /tmp/normalize_xema.sh
+COPY rel/build/normalize_xema.sh rel/build/normalize_model_schemas.sh /tmp/
 RUN mix deps.get --only prod --check-locked \
     && sh /tmp/normalize_xema.sh deps/xema/lib/xema/json_schema.ex \
+    && sh /tmp/normalize_model_schemas.sh deps \
     && mix deps.compile
 
 COPY lib lib

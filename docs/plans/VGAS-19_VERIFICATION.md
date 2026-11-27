@@ -313,3 +313,168 @@ merge. The separate external integration and activation checks remain
 under G038. The [runbook](../runbooks/release-verification.md#roll-back)
 describes how to revert the application while retaining the data and its
 inhibit and fencing history.
+
+## Dependency ordering follow-up
+
+The follow-up starts at `f230a825434440eaef70d92c73422dee59d5a763`.
+Plane VGAS-19 comment `6a1b65b9-f10a-44c7-a4d7-99776b2f6371` authorizes
+only deterministic ordering in the isolated release build.
+[Plane decision](https://app.plane.so/symphony-development/projects/8e7e9131-668d-4d99-8bd7-b5847d5f8c8c/issues/b4439ed9-049a-464c-944c-212a473519bd)
+[Diagnosis](t3-thread://v2/fdfd1f03-53cf-41e7-8d37-6f5313c72d55/thread:delegated-task:command%3Amcp%3A71923c1b-9bb7-4c4c-a748-ae8e8856ff66%3Adelegate-task%3A7251fca8-4b3b-4677-bad4-375056a3b163)
+
+ReqLLM 1.31.0 derives its inline-model string membership guard from
+`Map.keys/1`. LLMDB 2026.11.6 embeds field pairs in its model schema,
+struct and pricing schema. Zoi 0.19.0's `Zoi.object/2` and `Zoi.struct/3`
+document maps as field inputs. The fix retains those calls and sorts
+the lists produced by `Zoi.Types.Map.new/2` and `Zoi.Types.Struct.new/3`.
+It also sorts the embedded pricing component before refinement and
+the pricing field list after the field map merge. Every field, option,
+default and refinement comes from the same pinned source. The
+authorized observable change is which three errors ReqLLM may choose
+for its truncated internal invalid-model diagnostic.
+
+### Locked inputs and behavior
+
+The existing B/C image comparison reproduced only the two documented
+BEAM differences with exit 1. Their Xema BEAMs still matched. Fresh
+isolated dependency trees passed `mix deps.get --only prod --check-locked`
+before and after the normalizers. The original Hex archives matched the
+outer checksums in `mix.lock`. The helper verified these source hashes
+before it replaced any file.
+
+```text
+                                      Locked source                                                       Ordered source
+req_llm/lib/req_llm.ex                 032a362a5bea00819e0e3094746584d6c387a24f9388b965d690f2ae3e890251  8dd1e73de254d570b41b2752401a3c2c3fbbad63535d64e154a73dfe83a0e7aa
+llm_db/lib/llm_db/model.ex             873b215cf233941d37a89077932fc6af242ad7f2782fd8bf12cd5cd93b9649d9  e2801cba756ee4a48545875fe702cffdabfb557196a030afad1a506d1697feea
+llm_db/lib/llm_db/schema/pricing.ex    0f903cf67932b2d456b91909e5cef12d4adc8523ebc4347ba374dddf5d14ef1b  0391772d0a123ada95e23257d3b0f8f5da6e9d30bd423fbb05bd16f71391b1a8
+```
+
+Each pre-image rejection was reproduced by appending a comment to a
+different input in a scratch copy and calling
+`sh rel/build/normalize_model_schemas.sh "$scratch_deps"`. The fourth
+rejection used a scratch helper whose ReqLLM transform reversed the
+list. All four runs exited 1, and `sha256sum -c` confirmed that all
+three inputs remained byte-identical to their state before each run.
+
+Four fresh pinned VMs compiled the three normalized sources with
+`Code.compile_file/1`, forward and reverse atom preload order, and
+`ELIXIR_ERL_OPTIONS="+S 1"` and `"+S 2"`. The SHA-256 values from the
+existing `Mix.Release.strip_beam/1` operation matched in all four VMs.
+The fix leaves release stripping and payload comparison as they were.
+
+The model probe failed on the original image when it required ordered
+fields. Without that requirement, both original images and both new
+payloads matched this digest from the full schema definitions, struct
+defaults and required fields, valid model results, complete errors for
+the invalid fixture, and 11,425 catalog models indexed by provider and ID.
+
+```text
+920384b882479de2d7c1164fd059679f589ff40f07132804fb9a901e6288f5f8
+```
+
+The probe also checked inline string-key handling and observed zero wire
+entries for an invalid inline model. The packaged runtime checked VGAS's
+exact `{:error, "support proposal unavailable"}` and `:unknown` results
+for missing authority. Its invalid generation envelope returned
+`:closed` without emitting wire or usage evidence.
+[Model probe](../../.github/scripts/release_model_schemas.exs)
+[Runtime probe](../../.github/scripts/release_runtime.exs)
+
+### Two clean payloads and packaged controls
+
+The workstation compiled both dependency trees independently with
+Elixir 1.20.5, OTP 29.1.2, Rebar3 3.28.0 and a common absolute source
+path. Each compile began with an empty build directory and a new
+set of Hex package extractions. The second dependency fetch reused
+the locked Git checkout for Heroicons. Commands used for each release
+are below. The first fetch resolved Heroicons over HTTPS despite
+`HEX_OFFLINE=1`, which only affects Hex. The second disabled Git HTTPS.
+
+```sh
+export MIX_ENV=prod HEX_OFFLINE=1 ELIXIR_ERL_OPTIONS='+S 4'
+export SOURCE_DATE_EPOCH=1795392000
+# MIX_DEPS_PATH and MIX_BUILD_PATH point to run-owned directories.
+mise exec -- mix deps.get --only prod --check-locked
+sh rel/build/normalize_xema.sh "$MIX_DEPS_PATH/xema/lib/xema/json_schema.ex"
+sh rel/build/normalize_model_schemas.sh "$MIX_DEPS_PATH"
+mise exec -- mix deps.get --only prod --check-locked
+mise exec -- mix do deps.compile + compile --force --warnings-as-errors + release voelgoed_ai
+```
+
+The host release ERTS required a newer glibc than Debian's. Each
+compiled tree was assembled a second time with the pinned locally
+cached Hex Bob container from the Dockerfile, using `--network none`
+and `Mix.Task.run("release", ["voelgoed_ai", "--no-compile", "--path", path])`
+after loading the already verified dependency paths with
+`Mix.Task.run("deps.loadpaths", ["--no-deps-check"])`. Each release
+directory entirely replaced `/app` in a disposable runner derived
+from `vgas19-release:approved-c`. The runner used its packaged Debian
+system libraries and ran as UID/GID 65534. The native dependency
+compiler for these checks was Ubuntu GCC 15.2.0. The repository Dockerfile
+still uses Debian's pinned builder and the checksum-verified Rebar
+download.
+
+```sh
+bash .github/scripts/compare_release_payloads.sh vgas19-ordering-0f2785b0:offline-a vgas19-ordering-0f2785b0:offline-b
+bash .github/scripts/verify_release.sh vgas19-ordering-0f2785b0:offline-a
+bash .github/scripts/verify_release.sh vgas19-ordering-0f2785b0:offline-b
+```
+
+All three commands exited 0. The comparison covered every file under
+`/app` and its metadata as defined by the comparator. Both images
+applied 19 migrations in fresh and predecessor-upgrade lanes with
+no-op reruns, denied missing settings, returned HTTP 200 for health,
+denied staff and webhook access by default, passed the HTTPS asset and
+CSP checks, and shut down cleanly on SIGTERM.
+
+```text
+Linux amd64 image A  sha256:9b7080b122d72214dc7cc8ac7e0282aa8096ff2358a676bb10bc6ae0d939953b
+Linux amd64 image B  sha256:0d1c50bdd71bed3e87397c8ebfec2204bc4f7b8075e04ce5b6d8062bd1910f21
+Full manifest A/B   29e42d200612d9c04e7b6d0fc45f507980d0f38fa87a80daa63eb0bb9cbd6c0e
+```
+
+These results verify two cold compilations and complete packaged
+payloads assembled from them. The unchanged cold Dockerfile bootstrap
+requires signed Debian snapshot indexes. The offline bootstrap control
+`docker build --platform linux/amd64 --network none --target compile -f - .`
+using the predecessor Dockerfile on standard input failed at Debian
+package installation. The locally cached images did not contain that
+builder layer. The exact Dockerfile build pair and hosted CI remain
+required for the follow-up commit, along with independent review.
+
+### Affected checks and rollback
+
+The following checks exited 0. Strict DEV and TEST application
+compiles used run-owned build directories. The TEST copy used the
+three normalized dependency BEAMs, which matched the PROD originals
+before and after the focused run. Its database was a run-owned
+PostgreSQL 18.7/pgvector 0.8.7 container on a dynamically assigned
+loopback port. The focused suite passed all 107 generation, retrieval
+and publication cases, including governed fake wire options, usage,
+telemetry redaction and denial. The earlier 865-pass full ExUnit run
+and source migration matrix are carry-forward evidence from the
+predecessor. The follow-up changes neither migrations nor snapshots.
+
+```sh
+mise exec -- mix format --check-formatted
+mise exec -- mix format --check-formatted .github/scripts/{release_model_schemas,release_runtime}.exs
+mise exec -- mix deps.unlock --check-unused
+HEX_OFFLINE=1 unshare -Urn mise exec -- mix hex.audit
+MIX_ENV=dev mise exec -- mix compile --no-deps-check --force --warnings-as-errors
+MIX_ENV=test mise exec -- mix compile --no-deps-check --force --warnings-as-errors
+# TEST_DATABASE_* points to the disposable database.
+bash .github/scripts/verify_postgres.sh 180007
+mise exec -- mix test --no-compile --no-deps-check --warnings-as-errors --seed 0 test/voelgoed_ai/intelligence/generation_test.exs test/voelgoed_ai/knowledge/{retrieval,publication}_test.exs
+MIX_ENV=test mise exec -- mix ash.codegen --check
+mise exec actionlint@1.7.12 -- actionlint .github/workflows/application-ci.yml
+bash .github/scripts/test_application_gate.sh
+python3 .github/scripts/plan_tests.py
+shellcheck rel/build/normalize_model_schemas.sh .github/scripts/{verify_release,compare_release_payloads}.sh
+git diff --check
+```
+
+The audit used the cached advisory data with networking disabled.
+Compose verification does not apply. To roll back this follow-up, revert
+its commit and rebuild with the same lockfile. That restores the original
+ReqLLM and LLMDB build inputs and reopens the reproducibility blocker.
+It requires no data or schema rollback.

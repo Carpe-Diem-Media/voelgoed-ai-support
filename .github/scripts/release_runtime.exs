@@ -1,6 +1,6 @@
 # Executed by the packaged release. The values below are synthetic and
 # deliberately set in memory to test that PROD cannot acquire TEST authority.
-alias VoelgoedAi.Intelligence.{Embedding, EmbeddingTransport, Generation}
+alias VoelgoedAi.Intelligence.{Embedding, EmbeddingTransport, Generation, GenerationTransport}
 alias VoelgoedAi.Knowledge.{Publication, Retrieval}
 alias VoelgoedAi.Support.{ChatwootAdapter, Ingress, Recovery, RunProcessing}
 
@@ -58,3 +58,46 @@ false = ChatwootAdapter.in_scope?(%{})
 {:error, :scope_denied} = Ingress.accept(%{})
 :ok = Recovery.sweep()
 {:error, :disabled} = Embedding.publication_deadline(%{})
+
+# Neither fabricated authority nor an invalid envelope can reach a wire adapter.
+ref = make_ref()
+args = %{text: "vgas-synthetic-rejected-input"}
+
+{:error, "support proposal unavailable"} =
+  Generation.run(%{action: %{name: :generate}, arguments: args}, [], %{
+    actor: struct!(Generation, ref: ref)
+  })
+
+owner = self()
+
+wire = fn request ->
+  send(owner, :invalid_dispatch_wire)
+  {request, Req.Response.new(status: 500)}
+end
+
+:unknown = EmbeddingTransport.invoke(ref, args.text, 1_000, {:fixture, wire})
+
+attempt = %{
+  id: "synthetic-attempt",
+  dispatch_fence: 1,
+  deadline_at: DateTime.add(DateTime.utc_now(), 1)
+}
+
+adapter =
+  GenerationTransport.options(attempt, {owner, ref}, wire, 1_000, fn ->
+    {:ok, attempt.deadline_at}
+  end)[:adapter]
+
+request =
+  Req.Request.prepend_response_steps(Req.new(),
+    llm_decode_response: &Function.identity/1
+  )
+
+{%Req.Request{}, %Req.TransportError{reason: :closed}} = adapter.(request)
+:unknown = GenerationTransport.take(attempt, ref)
+
+receive do
+  :invalid_dispatch_wire -> raise "invalid dispatch entered the wire adapter"
+after
+  0 -> :ok
+end

@@ -110,10 +110,11 @@ SQL
   printf '%s: migrated all %s versions and repeated with no changes.\n' "$lane" "$(wc -l <<< "$expected_versions")"
 done
 
-docker run --rm "${release_args[@]}" \
+docker run --rm "${release_args[@]}" --env VGAS_REQUIRE_SORTED_MODEL_SCHEMAS=1 \
+  --mount "type=bind,source=$PWD/.github/scripts/release_model_schemas.exs,target=/release_model_schemas.exs,readonly" \
   --mount "type=bind,source=$PWD/.github/scripts/release_runtime.exs,target=/release_runtime.exs,readonly" \
   --mount "type=bind,source=$PWD/.github/scripts/release_xema_schema.exs,target=/release_xema_schema.exs,readonly" \
-  "$image" /app/bin/voelgoed_ai eval 'Code.eval_file("/release_runtime.exs"); Code.eval_file("/release_xema_schema.exs")'
+  "$image" /app/bin/voelgoed_ai eval 'Code.eval_file("/release_runtime.exs"); Code.eval_file("/release_xema_schema.exs"); Code.eval_file("/release_model_schemas.exs")'
 echo 'Packaged runtime denied TEST capability issuers and kept the default configuration disabled.'
 
 for required in DATABASE_URL PHX_HOST SECRET_KEY_BASE; do
