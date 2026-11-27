@@ -12,6 +12,7 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     Assistant,
     AssistantRevision,
     Embedding,
+    EmbeddingProfile,
     EmbeddingTransport,
     InferenceRun
   }
@@ -22,16 +23,24 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
 
   setup :setup_knowledge
 
-  test "a draft with a stale content hash cannot be submitted for review", ctx do
+  test "a stale draft snapshot disables editing, submission and withdrawal", ctx do
     draft = draft_revision(ctx, collection(ctx))
     content = Map.put(draft.content, "effective_from", "2026-02-01T00:00:00Z")
     store_content(draft, content)
 
-    assert {:ok, %{action_hints: %{submit_review: false, edit_draft: true}}} =
+    assert {:ok, %{action_hints: %{submit_review: false, edit_draft: false, withdraw: false}}} =
              invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.editor)
 
     assert {:error, _} =
              invoke(ArticleRevision, :submit_review, snapshot(draft), ctx.editor)
+
+    assert {:error, _} =
+             invoke(
+               ArticleRevision,
+               :withdraw,
+               Map.put(snapshot(draft), :reason, :withdrawn_by_staff),
+               ctx.editor
+             )
   end
 
   @tag :embedding_index
@@ -303,6 +312,10 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
   @tag :embedding_index
   test "outstanding spend crosses UTC rollover and a late result settles to the origin window",
        ctx do
+    # Load ReqLLM's local catalog before timing the worker's arrival at the fake adapter.
+    model = "#{EmbeddingProfile.provider()}:#{EmbeddingProfile.model()}"
+    assert {:ok, _} = ReqLLM.Embedding.validate_model(model)
+
     {_collection, revision} = approved(ctx)
     parent = self()
     origin = ~U[2027-01-31 23:59:50.000000Z]

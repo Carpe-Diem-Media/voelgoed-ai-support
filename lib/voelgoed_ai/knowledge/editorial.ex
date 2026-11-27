@@ -398,6 +398,8 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     editor? = scoped?(collection.id, staff, @editor)
     reviewer? = scoped?(collection.id, staff, @reviewer)
     draft_editor? = active? and editor? and row.status == :draft
+    intact? = active? and row.status in [:draft, :in_review] and snapshot_intact?(row)
+    can_edit? = draft_editor? and intact?
     reviewable? = Content.reviewable?(row.content)
 
     public? =
@@ -424,9 +426,9 @@ defmodule VoelgoedAi.Knowledge.Editorial do
 
     %{
       action_hints: %{
-        edit_draft: draft_editor?,
-        submit_review: draft_editor? and reviewable? and snapshot_intact?(row),
-        withdraw: active? and (editor? or reviewer?) and row.status in [:draft, :in_review],
+        edit_draft: can_edit?,
+        submit_review: can_edit? and reviewable?,
+        withdraw: intact? and (editor? or reviewer?),
         request_changes: active? and reviewer? and row.status == :in_review,
         approve:
           active? and reviewer? and row.status == :in_review and row.content["sensitive"] != true,

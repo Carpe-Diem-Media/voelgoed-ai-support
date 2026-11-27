@@ -10,7 +10,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
   import VoelgoedAi.StaffKnowledgeFixture, only: [read_page: 2]
   import VoelgoedAi.SupportFixtures, only: [invoke: 4]
 
-  alias VoelgoedAi.{Accounts, StaffFixtures}
+  alias Ecto.Adapters.SQL
+  alias VoelgoedAi.{Accounts, Repo, StaffFixtures}
   alias VoelgoedAi.Intelligence.Embedding
   alias VoelgoedAi.Knowledge.{Article, ArticleRevision}
   alias VoelgoedAi.Knowledge.Workers.FinalizePublication
@@ -60,6 +61,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
                ctx.editor
              )
 
+    before = decision_state(draft.id)
+
     assert render_submit(submit, %{
              "id" => Ash.UUIDv7.generate(),
              "expected_version" => newer.edit_version,
@@ -68,6 +71,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
 
     assert {:ok, %{status: :draft}} =
              invoke(ArticleRevision, :read_revision, %{id: draft.id}, ctx.editor)
+
+    assert decision_state(draft.id) == before
   end
 
   test "a contributor with both roles cannot approve through the staff workspace", ctx do
@@ -77,6 +82,9 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
     assert {:ok, actor} = StaffFixtures.authenticate(ctx.editor.id)
     ctx = %{ctx | editor: actor, reviewer: actor}
     reviewed = review(ctx, draft_revision(ctx, collection(ctx)))
+
+    assert {:ok, %{action_hints: %{approve: true}, self_approval_required: true}} =
+             invoke(ArticleRevision, :read_revision, %{id: reviewed.id}, actor)
 
     assert {:ok, view, _} = live(connected_page(actor, path(reviewed)))
     refute has_element?(view, "#approve")
@@ -88,6 +96,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
       |> LazyHTML.query("#request-changes [name=form_token]")
       |> LazyHTML.attribute("value")
 
+    before = decision_state(reviewed.id)
+
     render_submit(view, "approve", %{
       "form_token" => token,
       "source_verified" => "true",
@@ -96,6 +106,8 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
 
     assert {:ok, %{status: :in_review, self_approval_required: true}} =
              invoke(ArticleRevision, :read_revision, %{id: reviewed.id}, actor)
+
+    assert decision_state(reviewed.id) == before
   end
 
   test "a decision from before a refresh cannot submit the refreshed draft", ctx do
@@ -205,10 +217,14 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
       put_in(state.socket.assigns.page.article.current_revision_id, stale_pointer)
     end)
 
+    before = decision_state(approved.id)
+
     assert render_submit(form(view, "#request-publish", %{"confirm" => "true"})) =~ "Reload"
 
     assert {:ok, %{status: :approved, publication_generation: 0}} =
              invoke(ArticleRevision, :read_revision, %{id: approved.id}, ctx.reviewer)
+
+    assert decision_state(approved.id) == before
   end
 
   @tag :embedding_index
@@ -313,6 +329,55 @@ defmodule VoelgoedAiWeb.StaffKnowledgeFormsTest do
 
     assert {:ok, %{status: :published, publication_generation: 1}} =
              invoke(ArticleRevision, :read_revision, %{id: approved.id}, ctx.reviewer)
+  end
+
+  test "edit and withdraw controls require an intact draft snapshot", ctx do
+    draft = draft_revision(ctx, collection(ctx))
+    assert {:ok, view, _} = live(connected_page(ctx.editor, path(draft)))
+    edit_link = "a[href='#{path(draft)}/edit']"
+
+    assert has_element?(view, edit_link, "Edit draft")
+    assert has_element?(view, "#withdraw")
+
+    store_effective_date(draft, "2026-02-01T00:00:00Z")
+    render_click(view, "refresh")
+
+    refute has_element?(view, edit_link)
+    refute has_element?(view, "#withdraw")
+  end
+
+  @tag :embedding_index
+  test "an approved revision with a non-string date mounts with publication unavailable", ctx do
+    {_collection, approved} = approved(ctx)
+    store_effective_date(approved, 42)
+
+    assert {:ok, view, _} = live(connected_page(ctx.reviewer, path(approved)))
+    assert has_element?(view, ".metadata > div", ~r/^Effective from\s*—$/)
+    assert has_element?(view, "#publication-notice[role=status]", "Publishing is unavailable.")
+    refute has_element?(view, "#request-publish")
+  end
+
+  defp store_effective_date(revision, value) do
+    content = Map.put(revision.content, "effective_from", value)
+
+    assert %{num_rows: 1} =
+             SQL.query!(Repo, "UPDATE article_revisions SET content = $1 WHERE id = $2", [
+               content,
+               Ecto.UUID.dump!(revision.id)
+             ])
+  end
+
+  defp decision_state(revision_id) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT r.status, r.edit_version, r.content_hash, r.review_hash, r.publication_generation,
+             (SELECT count(*) FROM audit_events WHERE article_revision_target_id = r.id),
+             (SELECT count(*) FROM oban_jobs)
+      FROM article_revisions r WHERE r.id = $1
+      """,
+      [Ecto.UUID.dump!(revision_id)]
+    ).rows
   end
 
   defp approve_content(ctx, content), do: approve_content(ctx, collection(ctx), content)

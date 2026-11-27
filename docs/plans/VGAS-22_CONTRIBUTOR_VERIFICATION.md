@@ -42,10 +42,10 @@ checks and snapshot check.
 
 ```sh
 mise exec -- mix test \
-  test/voelgoed_ai/knowledge/editorial_test.exs:880 \
-  test/voelgoed_ai/knowledge/editorial_test.exs:1105 \
-  test/voelgoed_ai/knowledge/editorial_test.exs:1126 \
-  test/voelgoed_ai/knowledge/editorial_test.exs:1158 --seed 0 --trace
+  test/voelgoed_ai/knowledge/editorial_test.exs:893 \
+  test/voelgoed_ai/knowledge/editorial_test.exs:1118 \
+  test/voelgoed_ai/knowledge/editorial_test.exs:1139 \
+  test/voelgoed_ai/knowledge/editorial_test.exs:1171 --seed 0 --trace
 mise exec -- mix ash.codegen --check
 ```
 
