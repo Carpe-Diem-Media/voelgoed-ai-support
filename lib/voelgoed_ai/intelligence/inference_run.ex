@@ -1,5 +1,5 @@
 defmodule VoelgoedAi.Intelligence.InferenceRun do
-  @moduledoc "Durable purpose-bound embedding attempt and one-shot dispatch fence."
+  @moduledoc "Durable purpose-bound inference attempt and one-shot dispatch fence."
 
   use Ash.Resource,
     domain: VoelgoedAi.Intelligence,
@@ -13,7 +13,12 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
     table("inference_runs")
     repo(VoelgoedAi.Repo)
 
-    migration_types(input_tokens: :bigint, claim_generation: :bigint)
+    migration_types(
+      input_tokens: :bigint,
+      output_tokens: :bigint,
+      duration_us: :bigint,
+      claim_generation: :bigint
+    )
 
     references do
       reference(:article_embedding, on_delete: :restrict, on_update: :restrict)
@@ -27,7 +32,27 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
       reference(:assistant_revision, on_delete: :restrict, on_update: :restrict)
     end
 
+    custom_statements do
+      statement :generation_run_lineage do
+        after_tables(["support_runs", "inference_runs"])
+
+        up("""
+        ALTER TABLE inference_runs ADD CONSTRAINT inference_runs_generation_lineage_fkey
+          FOREIGN KEY (support_run_id, turn_ref) REFERENCES support_runs (id, turn_ref)
+          ON UPDATE RESTRICT ON DELETE RESTRICT
+        """)
+
+        down("ALTER TABLE inference_runs DROP CONSTRAINT inference_runs_generation_lineage_fkey")
+      end
+    end
+
     custom_indexes do
+      index([:turn_ref, :ordinal],
+        name: "inference_runs_generation_turn_slot",
+        unique: true,
+        where: "purpose = 'generate'"
+      )
+
       index([:support_run_id],
         name: "inference_runs_one_query_attempt",
         unique: true,
@@ -40,10 +65,22 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
         check: """
         ((purpose = 'article_embedding' AND article_embedding_id IS NOT NULL
           AND support_run_id IS NULL AND assistant_revision_id IS NULL AND claim_generation IS NULL)
-          OR (purpose = 'query_embedding' AND article_embedding_id IS NULL
+          OR (purpose IN ('query_embedding', 'generate') AND article_embedding_id IS NULL
             AND support_run_id IS NOT NULL AND assistant_revision_id IS NOT NULL
-            AND claim_generation IS NOT NULL AND claim_generation > 0 AND ordinal = 1
+            AND claim_generation IS NOT NULL AND claim_generation > 0
             AND state NOT IN ('queued', 'cancelled') AND started_at IS NOT NULL))
+        AND (purpose <> 'query_embedding' OR ordinal = 1)
+        AND CASE WHEN purpose = 'generate' THEN
+          turn_ref IS NOT NULL AND ordinal IN (1, 2) AND prompt_version IS NOT NULL
+          AND (output_tokens IS NULL) = (input_tokens IS NULL)
+          AND (provider_response_id IS NULL) = (input_tokens IS NULL)
+          AND (duration_us IS NULL) = (input_tokens IS NULL)
+        ELSE
+          turn_ref IS NULL AND prompt_version IS NULL AND output_tokens IS NULL
+          AND provider_response_id IS NULL AND duration_us IS NULL
+        END
+        AND (output_tokens IS NULL OR output_tokens >= 0)
+        AND (duration_us IS NULL OR duration_us >= 0)
         AND ordinal > 0 AND (input_tokens IS NULL OR input_tokens > 0)
         AND state IN ('queued', 'running', 'succeeded', 'failed', 'unknown', 'rejected', 'cancelled', 'abandoned')
         AND (dispatched_at IS NULL OR started_at IS NOT NULL)
@@ -62,9 +99,11 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
     attribute(:purpose, :atom,
       default: :article_embedding,
       allow_nil?: false,
-      constraints: [one_of: [:article_embedding, :query_embedding]]
+      constraints: [one_of: [:article_embedding, :query_embedding, :generate]]
     )
 
+    attribute(:turn_ref, :uuid)
+    attribute(:prompt_version, :string)
     attribute(:provider, :string, allow_nil?: false)
     attribute(:model_id, :string, allow_nil?: false)
     attribute(:profile_id, :string, allow_nil?: false)
@@ -94,6 +133,9 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
     attribute(:started_at, :utc_datetime_usec)
     attribute(:finished_at, :utc_datetime_usec)
     attribute(:provider_request_id, :string, constraints: [max_length: 128], sensitive?: true)
+    attribute(:provider_response_id, :string, constraints: [max_length: 128], sensitive?: true)
+    attribute(:output_tokens, :integer, constraints: [min: 0])
+    attribute(:duration_us, :integer, constraints: [min: 0])
     attribute(:input_tokens, :integer, constraints: [min: 1])
 
     attribute(:reason_code, :atom,
@@ -103,6 +145,7 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
           :stale_request,
           :transport_unknown,
           :invalid_vector,
+          :invalid_proposal,
           :amount_overflow,
           :over_reserve,
           :conservative_closure,
@@ -134,6 +177,18 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
       run(Embedding)
     end
 
+    action :close_unknown_generation, :map do
+      argument(:id, :uuid, allow_nil?: false)
+      argument(:reason, :atom, allow_nil?: false, constraints: [one_of: [:conservative_closure]])
+      run(VoelgoedAi.Intelligence.Generation)
+    end
+
+    read :generation_slots do
+      argument(:turn_ref, :uuid, allow_nil?: false)
+      filter(expr(purpose == :generate and turn_ref == ^arg(:turn_ref)))
+      prepare(build(sort: [:ordinal]))
+    end
+
     read :storage_row do
       argument(:id, :uuid, allow_nil?: false)
       filter(expr(id == ^arg(:id)))
@@ -146,7 +201,16 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
 
     read :recovery_candidates do
       argument(:now, :utc_datetime_usec, allow_nil?: false)
-      filter(expr(state == :running and deadline_at <= ^arg(:now)))
+      argument(:generation_now, :utc_datetime_usec, allow_nil?: false)
+
+      filter(
+        expr(
+          state == :running and
+            ((purpose == :generate and deadline_at <= ^arg(:generation_now)) or
+               (purpose != :generate and deadline_at <= ^arg(:now)))
+        )
+      )
+
       prepare(build(sort: [:deadline_at, :id], limit: 50))
     end
 
@@ -186,6 +250,29 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
       change(set_attribute(:state, :running))
     end
 
+    create :insert_generation_attempt do
+      transaction?(false)
+
+      accept([
+        :support_run_id,
+        :assistant_revision_id,
+        :turn_ref,
+        :claim_generation,
+        :provider,
+        :model_id,
+        :profile_id,
+        :prompt_version,
+        :ordinal,
+        :deadline_at,
+        :started_at,
+        :dispatch_fence,
+        :correlation_id
+      ])
+
+      change(set_attribute(:purpose, :generate))
+      change(set_attribute(:state, :running))
+    end
+
     update :change_row do
       transaction?(false)
       require_atomic?(false)
@@ -196,6 +283,9 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
         :dispatched_at,
         :finished_at,
         :provider_request_id,
+        :provider_response_id,
+        :output_tokens,
+        :duration_us,
         :input_tokens,
         :reason_code
       ])
@@ -207,12 +297,18 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
       authorize_if(Embedding)
     end
 
+    policy action(:close_unknown_generation) do
+      authorize_if(Embedding)
+    end
+
     policy action([
              :storage_row,
              :insert_row,
              :change_row,
              :recovery_candidates,
              :query_attempt,
+             :generation_slots,
+             :insert_generation_attempt,
              :insert_query_attempt
            ]) do
       authorize_if(Storage)

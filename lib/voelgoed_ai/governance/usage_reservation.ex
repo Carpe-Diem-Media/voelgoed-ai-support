@@ -16,6 +16,8 @@ defmodule VoelgoedAi.Governance.UsageReservation do
       rate_nano_usd: :bigint,
       token_unit: :bigint,
       max_input_tokens: :bigint,
+      max_output_tokens: :bigint,
+      output_rate_nano_usd: :bigint,
       reserved_nano_usd: :bigint,
       actual_nano_usd: :bigint
     )
@@ -28,6 +30,8 @@ defmodule VoelgoedAi.Governance.UsageReservation do
       check_constraint(:state, "usage_reservations_shape",
         check: """
         rate_nano_usd > 0 AND token_unit > 0 AND max_input_tokens > 0 AND reserved_nano_usd > 0
+        AND (max_output_tokens IS NULL) = (output_rate_nano_usd IS NULL)
+        AND (max_output_tokens IS NULL OR (max_output_tokens > 0 AND output_rate_nano_usd > 0))
         AND month_window = date_trunc('month', day_window::timestamp)::date
         AND state IN ('reserved', 'unknown', 'released', 'settled', 'conservatively_settled')
         AND (state IN ('settled', 'conservatively_settled')) = (actual_nano_usd IS NOT NULL)
@@ -44,6 +48,8 @@ defmodule VoelgoedAi.Governance.UsageReservation do
     attribute(:price_version, :string, allow_nil?: false)
     attribute(:rate_nano_usd, :integer, allow_nil?: false, constraints: [min: 1])
     attribute(:token_unit, :integer, allow_nil?: false, constraints: [min: 1])
+    attribute(:max_output_tokens, :integer, constraints: [min: 1])
+    attribute(:output_rate_nano_usd, :integer, constraints: [min: 1])
     attribute(:max_input_tokens, :integer, allow_nil?: false, constraints: [min: 1])
 
     attribute(:reserved_nano_usd, :integer, allow_nil?: false, constraints: [min: 1])
@@ -66,6 +72,7 @@ defmodule VoelgoedAi.Governance.UsageReservation do
           :stale_request,
           :transport_unknown,
           :invalid_vector,
+          :invalid_proposal,
           :amount_overflow,
           :over_reserve,
           :conservative_closure,
@@ -107,6 +114,8 @@ defmodule VoelgoedAi.Governance.UsageReservation do
         :rate_nano_usd,
         :token_unit,
         :max_input_tokens,
+        :max_output_tokens,
+        :output_rate_nano_usd,
         :reserved_nano_usd,
         :day_window,
         :month_window

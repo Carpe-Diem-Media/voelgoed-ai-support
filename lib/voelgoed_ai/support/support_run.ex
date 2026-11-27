@@ -33,6 +33,8 @@ defmodule VoelgoedAi.Support.SupportRun do
     end
 
     custom_indexes do
+      index([:id, :turn_ref], name: "support_runs_qualified_turn", unique: true)
+
       index([:session_id],
         name: "support_runs_one_active",
         unique: true,
