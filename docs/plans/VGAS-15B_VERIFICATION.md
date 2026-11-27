@@ -255,6 +255,26 @@ forced strict TEST compile and snapshots exited 0 on disposable PostgreSQL
 18.7 and pgvector 0.8.7. The container and volume were removed. Hosted CI
 and independent re-review are pending on the corrected head.
 
+Review at `29aee09` found four incomplete clock expressions and a
+fail-closed regression for a cited URL enclosed in parentheses. Eight
+bilingual clock denials and the parenthesized URL control reproduced the
+findings. The correction keeps the sign, timezone, offset and ISO date
+with the clock. It strips enclosing URL punctuation only when an opening
+parenthesis precedes the token and the matching close ends it. A direct
+probe found an additional explicit timezone qualifier could split off;
+the matcher now keeps consecutive qualifiers, with two more regressions.
+The direct probes and cited URL and clock controls passed on the final
+candidate.
+
+The four-file focused suite at seed 0 passed 304 tests. Formatting, strict
+TEST compilation and snapshot checks passed on disposable PostgreSQL
+18.7 and pgvector 0.8.7. The container and volume were removed.
+`MIX_ENV=dev HEX_OFFLINE=1 ELIXIR_ERL_OPTIONS='+S 4' mise exec -- mix compile --force --warnings-as-errors`
+exited 1 with the same 17 inherited application warnings. None came from
+the modified validator. VGAS-19 owns non-TEST compilation and release
+verification after PR D. Semantic evaluation remains PR D. Hosted CI and
+independent re-review are pending for the updated candidate.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.

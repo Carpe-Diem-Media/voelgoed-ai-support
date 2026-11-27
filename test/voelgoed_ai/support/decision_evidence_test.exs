@@ -183,6 +183,28 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
          %{
            "af-ZA" => "Die kantoor is oop van 9am tot 5pm.",
            "en-ZA" => "The office is open from 9am to 5pm."
+         }},
+        {"signed time qualifier",
+         %{"af-ZA" => "Die aangepaste tyd is −9nm.", "en-ZA" => "The adjusted time is −9pm."}},
+        {"parenthesized zone",
+         %{
+           "af-ZA" => "Die sessie begin 09:00 (SAST).",
+           "en-ZA" => "The session starts 09:00 (SAST)."
+         }},
+        {"zone with an attached offset",
+         %{
+           "af-ZA" => "Die sessie begin 09:00 UTC+02:00.",
+           "en-ZA" => "The session starts 09:00 UTC+02:00."
+         }},
+        {"additional timezone qualifier",
+         %{
+           "af-ZA" => "Die sessie begin 09:00 UTC (SAST).",
+           "en-ZA" => "The session starts 09:00 UTC (SAST)."
+         }},
+        {"ISO date and clock zone",
+         %{
+           "af-ZA" => "Die afspraak is 2026-12-15T09:00SAST.",
+           "en-ZA" => "The appointment is 2026-12-15T09:00SAST."
          }}
       ] do
     @opts opts
@@ -234,7 +256,12 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"range with written endpoints", "The saving is between six and seven percent."},
         {"approved URL", "See https://faq.example.test/synthetic"},
         {"compact time", "The office opens at 9am."},
-        {"compact time range", "The reception is open from 7am to 4pm."}
+        {"compact time range", "The reception is open from 7am to 4pm."},
+        {"parenthesized URL", "See (https://faq.example.test/synthetic)."},
+        {"signed clock", "The adjusted time is −9am."},
+        {"parenthesized zone", "The session starts 09:00 (UTC)."},
+        {"zone and its offset", "The broadcast starts 07:00 GMT+01:00."},
+        {"ISO date and clock", "The appointment is 2026-12-15T09:00Z."}
       ] do
     @reply reply
 
@@ -712,7 +739,10 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "Daar is 1 sitplek by die deur. Laat veranderinge kos ’n kwart persent. " <>
                       "Die voorbeeld sê Nov 25. Die ou aanpassing was -30%. " <>
                       "Die hersieningsdatum is 2026-12-05. Die toetswaardes is vyf en tien persent. " <>
-                      "Die kantoor open om 9vm, oftewel 9am. Die toonbank sluit om 5pm."
+                      "Die kantoor open om 9vm, oftewel 9am. Die toonbank sluit om 5pm. " <>
+                      "Die aangepaste tyd is −9vm. Die sessie begin 09:00 (UTC). " <>
+                      "Die regstreekse uitsending begin 09:00 UTC. Die tydsverskil is +02:00. " <>
+                      "Die afspraak is 2026-12-15T09:00Z."
 
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
@@ -731,7 +761,10 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "The review date is 2026-12-05. The test values are five and ten percent. " <>
                       "Group discounts vary from 10 -20%. The sale runs 15 December 2026 to 2026-12-20. " <>
                       "The saving is between six and seven percent. The office opens at 9am. " <>
-                      "The desk closes at 5pm. The reception is open from 7am to 4pm."
+                      "The desk closes at 5pm. The reception is open from 7am to 4pm. " <>
+                      "The adjusted time is −9am. The session starts 09:00 (UTC). " <>
+                      "The livestream starts 09:00 UTC. The time offset is +02:00. " <>
+                      "The broadcast starts 07:00 GMT+01:00. The appointment is 2026-12-15T09:00Z."
                 end
 
               Map.put(variant, "approved_answer", answer)

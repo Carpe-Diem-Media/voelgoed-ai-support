@@ -7,7 +7,12 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   alias VoelgoedAi.Knowledge.Content
   alias VoelgoedAi.Support.SupportDecision
 
-  @link_fact ~r/https?:\/\/[^\s<>"]+|[\p{L}\p{N}._%+-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,}/iu
+  @url_token ~S|https?:\/\/[^\s<>"]+|
+  @link_fact ~r/
+    (?<=\()#{@url_token}(?=\)[.,!?;:]*(?:\z|[\s<>"]))
+    | #{@url_token}
+    | [\p{L}\p{N}._%+-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,}
+  /iux
   @amount_scale ~S"(?:hundreds?|honderde?|thousands?|duisende?|millions?|miljoene?|billions?|miljarde?|biljoene?|trillions?|triljoene?|k|m|mn|mln|mm|b|bn|bln|tn|trn)"
   @currency_code ~S"(?:ZAR|USD|EUR|GBP|AUD|CAD|CHF|CNY|INR|JPY|NZD|R)"
   @currency_name ~S"(?:(?:South\s+African|Suid[-‑ ]Afrikaanse|Australian|Canadian|New\s+Zealand|US|U\.S\.|British)\s+)?(?:rande?|dollars?|euros?|pounds?|ponde?|cents?|sente?|penny|pennies|pence|yen|yuan|rupees?|roepees?|francs?|franke?)"
@@ -75,11 +80,13 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @range_join ~r/\A(?:\h*[\p{Pd}−]\h*|\h+(?:to|through|until|till|tot(?:\h+en\h+met)?)\h+)\z/iu
   @horizontal_gap ~r/\A\h*\z/u
   @meridiem ~S"(?:am|pm|vm|nm|[apvn]\.m\.?)"
-  @zone ~S"(?:UTC|GMT|SAST|CAT|Z|[-+−]\p{N}{2}:?\p{N}{2})"
+  @utc_offset ~S"[-+−]\p{N}{2}:?\p{N}{2}"
+  @zone "(?:(?:UTC|GMT|SAST|CAT|Z)(?:\\h*#{@utc_offset})?|#{@utc_offset})"
   @clock ~r/
     (?<![\p{L}\p{M}\p{N}_])
+    (?:#{@numeric_date}T)?#{@sign}?
     (?:\p{N}{1,2}(?:[:.h]\p{N}{2}(?::\p{N}{2})?)?\h*#{@meridiem}|\p{N}{1,2}[:h]\p{N}{2}(?::\p{N}{2})?)
-    (?:\h*#{@zone})?
+    (?:\h*(?:#{@zone}|\(\h*#{@zone}\h*\)))*
     (?![\p{L}\p{M}\p{N}_])
   /iux
 
