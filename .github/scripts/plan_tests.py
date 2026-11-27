@@ -5,6 +5,7 @@ import json
 import math
 import statistics
 from pathlib import Path
+from verify_test_results import FEASIBILITY
 
 
 def fingerprint(path):
@@ -41,6 +42,8 @@ if __name__ == "__main__":
         if isinstance(entries, dict):
             history.update(entries)
     paths = sorted(str(path) for path in Path("test").rglob("*_test.exs") if path.is_file())
+    if FEASIBILITY not in paths:
+        raise SystemExit(f"Required feasibility test file is missing: {FEASIBILITY}")
     matrix = plan(paths, history)
     print(f"matrix={json.dumps(matrix, separators=(',', ':'))}")
     print(f"has_tests={str(bool(paths)).lower()}")

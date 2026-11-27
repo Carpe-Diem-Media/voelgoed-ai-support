@@ -5,3 +5,6 @@
 /deps/
 /cover/
 /erl_crash.dump
+
+# Python bytecode from local CI script runs
+__pycache__/
