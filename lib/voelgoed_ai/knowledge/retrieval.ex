@@ -70,6 +70,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     @rank_measurement_key {__MODULE__, :rank_measurement}
 
     @manifest_limit 4
+    @lexeme_byte_limit 2_048
 
     @rank """
     , words AS (
@@ -318,7 +319,8 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
              qualified(context, fn config, run, _revision, now, _ ->
                bindings = params(context, config, run, now)
 
-               with :ok <- has_eligible(bindings),
+               with :ok <- check_shadow_lexemes(context),
+                    :ok <- has_eligible(bindings),
                     {:ok, coverage} <- coverage(context, bindings),
                     {:ok, query} when is_binary(query) <- rank_query(context, query, coverage),
                     {:ok, %{rows: [[lexemes]]}} <-
@@ -340,6 +342,28 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
         _ -> outcome(:unavailable)
       end
     end
+
+    # PostgreSQL drops lexemes at its byte limit. Check the raw parser
+    # tokens before the tsvector can erase part of either question.
+    defp check_shadow_lexemes(%{shadow_query: query, prior_query: prior})
+         when byte_size(query) >= @lexeme_byte_limit or byte_size(prior) >= @lexeme_byte_limit do
+      statement = """
+      SELECT EXISTS (
+        SELECT 1
+        FROM unnest(ARRAY[$1::text, $2::text]) AS input(text)
+        CROSS JOIN LATERAL ts_parse('default', input.text) AS parsed
+        WHERE octet_length(parsed.token) >= $3
+      )
+      """
+
+      case sql(statement, [query, prior, @lexeme_byte_limit]) do
+        {:ok, %{rows: [[true]]}} -> {:ok, :no_evidence}
+        {:ok, %{rows: [[false]]}} -> :ok
+        error -> error
+      end
+    end
+
+    defp check_shadow_lexemes(_), do: :ok
 
     defp rank_query(%{prior_query: prior}, query, [{_, false, true}]) do
       case minimize(query <> "\n" <> prior) do

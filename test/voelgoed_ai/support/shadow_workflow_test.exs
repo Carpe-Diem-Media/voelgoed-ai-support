@@ -55,6 +55,21 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
     end
   end
 
+  for {locale, term} <- [en: String.duplicate("x", 2_050), af: String.duplicate("é", 1_024)] do
+    test "#{locale} oversized lexeme routes locally without using truncated evidence" do
+      locale = unquote(locale)
+      ctx = setup_faq(locale, "exact")
+      id = queue(ctx, question(locale) <> " " <> unquote(term))
+      configure(ctx)
+
+      assert :ok = perform(id)
+      assert {"handoff", "missing_evidence", []} = outcome(run(id))
+      assert_usage(id, 0, 0, :exact)
+      assert_local_handoff(ctx)
+      assert_no_writes(ctx)
+    end
+  end
+
   test "a qualified public follow-up uses the preceding contact topic" do
     ctx = setup_faq(:en, "grounded", decoy: &decoy/1)
     text = "And the FAQ?"
@@ -152,6 +167,24 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
     else
       assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
     end
+  end
+
+  test "an observation outage cannot override a definite history scope denial" do
+    ctx = setup_faq(:en, "grounded")
+    id = queue(ctx, question(:en))
+    configure(ctx)
+
+    Agent.update(ctx.support.fake, fn state ->
+      Map.merge(state, %{text_contact: 6, conversation_result: {:error, :unavailable}})
+    end)
+
+    assert :ok = perform(id)
+    assert {:failed, :scope_denied, []} = outcome(run(id))
+    assert :ok = perform(id)
+    assert :ok = Sweep.perform(job("run_id", id))
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
+    assert_usage(id, 0, 0, :exact)
+    assert_no_writes(ctx)
   end
 
   test "a storage failure rolls back both the outage result and local triage" do

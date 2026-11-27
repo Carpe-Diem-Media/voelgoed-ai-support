@@ -474,3 +474,48 @@ mise exec -- mix test --no-compile --warnings-as-errors test/voelgoed_ai/support
 The local secret scan uses Gitleaks 8.30.1 against the staged change and
 the committed range from main. The live provider smoke and external
 activation were outside this local correction.
+
+### Follow-up on lexeme loss and history scope
+
+The independent review of `0d9d802` found two failures. A 2,050-byte
+synthetic term appended to an approved FAQ was dropped by PostgreSQL
+before the coverage check. A definite history contact mismatch followed
+by an observation outage could authorize a local staff intent. Both new
+signed-worker assertions failed on `0d9d802`, with ExUnit exit 2 on the
+approved disposable PostgreSQL 18.7 and pgvector 0.8.7 runner.
+
+For a long shadow query or explicit prior topic, the worker checks the
+raw parser tokens before building a tsvector. A token of 2,048 bytes or
+more sends the turn to the existing missing-evidence handoff before any
+query or generation attempt. [PostgreSQL 18 text search limits](https://www.postgresql.org/docs/18/textsearch-limitations.html)
+
+A definitive history scope denial survives context comparison and vetoes
+outage triage. With a fresh, independently qualified observation, the
+worker can still route the local conversation to staff under the
+existing ownership guard. No answer or external write is authorized by
+the mismatched history. The ordinary history-drift and known takeover
+fences still apply.
+
+An intermediate six-file run passed 335 of 336 tests with the smoke
+excluded. The initial guard suppressed the pre-existing local handoff
+even when a separate observation verified the conversation. The final
+guard retains that paired control. The final run also exercises an
+Afrikaans 2,048-byte token made from 1,024 characters.
+
+```sh
+bash .github/scripts/verify_postgres.sh 180007
+mise exec -- mix format --check-formatted
+mise exec -- mix compile --force --warnings-as-errors
+mise exec -- mix ash.codegen --check
+VGAS_F04_DISPOSABLE=1 mise exec -- mix test --no-compile --warnings-as-errors test/voelgoed_ai/support/{shadow_workflow,shadow_decision,decision_evidence,shadow_smoke}_test.exs test/voelgoed_ai/intelligence/generation_test.exs --seed 0
+```
+
+All five commands exited 0 on the final correction. The suite passed
+281 tests with the smoke excluded. Both oversized questions routed
+locally with zero inference attempts or external writes. The combined
+scope-denial and outage case produced zero staff intents and external
+writes across replay and Sweep. The qualified observation control
+retained its local handoff. All disposable containers and volumes were
+removed. Strict DEV and PROD compiles each exited 1 at the same 17
+inherited VGAS-19 warning sites. Hosted exact-head CI and independent
+review remain pending.

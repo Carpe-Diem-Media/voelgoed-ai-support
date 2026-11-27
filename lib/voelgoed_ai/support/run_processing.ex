@@ -458,6 +458,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
            true <- original.commitment == current.commitment do
         {:ok, current}
       else
+        {:error, :scope_denied} = denial -> denial
         _ -> {:error, :history_changed}
       end
     end
@@ -516,8 +517,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
     defp shadow_result(
            {{:ok, %{decision: kind} = decision}, items},
            receipts,
-           observation,
-           context,
+           {:ok, _} = observation,
+           {:ok, _} = context,
            commitment,
            _locale
          )
@@ -815,6 +816,10 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
+    # A failed observation cannot restore scope that the history check denied.
+    defp finalize(_, _, run, now, {:shadow, _, {:error, _}, {:error, :scope_denied}, _}),
+      do: finish(run, :fail, now, :scope_denied)
+
     defp finalize(config, session, run, now, {:shadow, receipts, {:error, reason}, _, _})
          when reason in [:unavailable, :deadline, :rate_limited] do
       # The completion transaction already checked the claim, cutoff and
@@ -875,8 +880,9 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
-    defp decide_shadow(config, session, run, _, now, observation, {:error, :history_changed}, _) do
-      with {:ok, _} <- finish(run, :fail, now, :history_changed) do
+    defp decide_shadow(config, session, run, _, now, observation, {:error, reason}, _)
+         when reason in [:history_changed, :scope_denied] do
+      with {:ok, _} <- finish(run, :fail, now, reason) do
         Ownership.route_shadow_locked(config, session, observation, now)
       end
     end
