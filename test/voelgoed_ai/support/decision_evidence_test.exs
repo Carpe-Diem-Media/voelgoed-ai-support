@@ -9,7 +9,7 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
   alias VoelgoedAi.Intelligence.{AssistantRevision, Embedding, EmbeddingTransport}
   alias VoelgoedAi.Knowledge.{ArticleRevision, Retrieval}
   alias VoelgoedAi.Knowledge.Workers.FinalizePublication
-  alias VoelgoedAi.Support.{Delivery, RunProcessing, SupportRun}
+  alias VoelgoedAi.Support.{Delivery, EvidenceReply, RunProcessing, SupportDecision, SupportRun}
   alias VoelgoedAi.Support.Workers.Deliver
 
   for phase <- [:after_rank, :after_commit, :before_dispatch],
@@ -171,6 +171,18 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
          %{
            "af-ZA" => "Die afslag is tussen vyf en tien persent.",
            "en-ZA" => "The discount is between five and ten percent."
+         }},
+        {"URL path suffix",
+         %{
+           "af-ZA" => "Sien https://faq.example.test/synthetic(terms)",
+           "en-ZA" => "See https://faq.example.test/synthetic(terms)"
+         }},
+        {"compact time qualifier",
+         %{"af-ZA" => "Die kantoor open om 9nm.", "en-ZA" => "The office opens at 9pm."}},
+        {"compact time range",
+         %{
+           "af-ZA" => "Die kantoor is oop van 9am tot 5pm.",
+           "en-ZA" => "The office is open from 9am to 5pm."
          }}
       ] do
     @opts opts
@@ -219,7 +231,10 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"weekday interval", "The exhibition runs Friday to Sunday."},
         {"range with an attached hyphen", "Group discounts vary from 10 -20%."},
         {"range of mixed date formats", "The sale runs 15 December 2026 to 2026-12-20."},
-        {"range with written endpoints", "The saving is between six and seven percent."}
+        {"range with written endpoints", "The saving is between six and seven percent."},
+        {"approved URL", "See https://faq.example.test/synthetic"},
+        {"compact time", "The office opens at 9am."},
+        {"compact time range", "The reception is open from 7am to 4pm."}
       ] do
     @reply reply
 
@@ -238,6 +253,38 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
         assert SupportDBCase.writes(ctx.support) == []
       end)
+    end
+  end
+
+  test "renderer checks a number outside a cited address separately" do
+    approved = "The reference is 731 2026@example.test."
+
+    decision = %SupportDecision{
+      schema_version: 1,
+      decision: "answer_grounded",
+      locale: "en-ZA",
+      reason_code: "supported",
+      evidence_revision_ids: ["synthetic"],
+      reply_text: approved
+    }
+
+    evidence = [
+      %{
+        revision_id: "synthetic",
+        locale: "en-ZA",
+        mode: :grounded,
+        title: "Reference",
+        answer: approved,
+        steps: [],
+        links: []
+      }
+    ]
+
+    assert {:ok, ^approved} = EvidenceReply.render(decision, evidence)
+
+    for reply <- ["The reference is 991 2026@example.test.", "The reference is 2026."] do
+      assert {:error, :stale_evidence} =
+               EvidenceReply.render(%{decision | reply_text: reply}, evidence)
     end
   end
 
@@ -649,6 +696,9 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         :grounded ->
           payload()
           |> Map.put("response_mode", "grounded")
+          |> Map.update!("source_references", fn [ref] ->
+            [Map.put(ref, "public_link", "https://faq.example.test/synthetic")]
+          end)
           |> Map.update!("localized_content", fn locales ->
             Enum.map(locales, fn variant ->
               answer =
@@ -661,7 +711,8 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "Die kantoor open Maandag. Die winkel open Dinsdag. Die toonbank sluit Woensdag. " <>
                       "Daar is 1 sitplek by die deur. Laat veranderinge kos ’n kwart persent. " <>
                       "Die voorbeeld sê Nov 25. Die ou aanpassing was -30%. " <>
-                      "Die hersieningsdatum is 2026-12-05. Die toetswaardes is vyf en tien persent."
+                      "Die hersieningsdatum is 2026-12-05. Die toetswaardes is vyf en tien persent. " <>
+                      "Die kantoor open om 9vm, oftewel 9am. Die toonbank sluit om 5pm."
 
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
@@ -679,7 +730,8 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "The example says Nov 25. The old adjustment was -30%. " <>
                       "The review date is 2026-12-05. The test values are five and ten percent. " <>
                       "Group discounts vary from 10 -20%. The sale runs 15 December 2026 to 2026-12-20. " <>
-                      "The saving is between six and seven percent."
+                      "The saving is between six and seven percent. The office opens at 9am. " <>
+                      "The desk closes at 5pm. The reception is open from 7am to 4pm."
                 end
 
               Map.put(variant, "approved_answer", answer)

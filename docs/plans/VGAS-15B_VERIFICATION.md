@@ -237,6 +237,24 @@ PostgreSQL 18.7 with pgvector 0.8.7. Its container and volume were removed.
 Independent re-review and exact-head CI are pending on the corrected
 candidate.
 
+Independent review at `78c96cb` verified the earlier overlap and range
+corrections and found an uncited URL path suffix, compact time qualifier
+and interval gaps, and a renderer-only adjacent-number regression. Six
+bilingual completion cases and one renderer case failed on that head. The
+correction checks full URL tokens against the allowlist, retains compact
+time qualifiers and interval boundaries, and masks only address bytes
+before scanning adjacent facts. The article publication parser still
+rejects the synthetic email probes, so the adjacent-number regression is
+tested directly at the renderer boundary.
+
+The six denial cases, three cited controls and adjacent-number test passed.
+Eight direct renderer probes also passed, covering URL suffix delimiters,
+time qualifiers and ranges, and numbers on either side of an address.
+The four-file command above exited 0 with 289 tests at seed 0. Format,
+forced strict TEST compile and snapshots exited 0 on disposable PostgreSQL
+18.7 and pgvector 0.8.7. The container and volume were removed. Hosted CI
+and independent re-review are pending on the corrected head.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.

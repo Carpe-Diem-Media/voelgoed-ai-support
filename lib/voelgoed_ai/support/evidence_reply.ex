@@ -7,7 +7,7 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   alias VoelgoedAi.Knowledge.Content
   alias VoelgoedAi.Support.SupportDecision
 
-  @link_fact ~r/https?:\/\/[^\s<>"()\[\]]+|[\p{L}\p{N}._%+-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,}/iu
+  @link_fact ~r/https?:\/\/[^\s<>"]+|[\p{L}\p{N}._%+-]+@[\p{L}\p{N}.-]+\.[\p{L}]{2,}/iu
   @amount_scale ~S"(?:hundreds?|honderde?|thousands?|duisende?|millions?|miljoene?|billions?|miljarde?|biljoene?|trillions?|triljoene?|k|m|mn|mln|mm|b|bn|bln|tn|trn)"
   @currency_code ~S"(?:ZAR|USD|EUR|GBP|AUD|CAD|CHF|CNY|INR|JPY|NZD|R)"
   @currency_name ~S"(?:(?:South\s+African|Suid[-‑ ]Afrikaanse|Australian|Canadian|New\s+Zealand|US|U\.S\.|British)\s+)?(?:rande?|dollars?|euros?|pounds?|ponde?|cents?|sente?|penny|pennies|pence|yen|yuan|rupees?|roepees?|francs?|franke?)"
@@ -74,12 +74,20 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @between_join ~r/\A\h+(?:and|en)\h+\z/iu
   @range_join ~r/\A(?:\h*[\p{Pd}−]\h*|\h+(?:to|through|until|till|tot(?:\h+en\h+met)?)\h+)\z/iu
   @horizontal_gap ~r/\A\h*\z/u
+  @meridiem ~S"(?:am|pm|vm|nm|[apvn]\.m\.?)"
+  @zone ~S"(?:UTC|GMT|SAST|CAT|Z|[-+−]\p{N}{2}:?\p{N}{2})"
+  @clock ~r/
+    (?<![\p{L}\p{M}\p{N}_])
+    (?:\p{N}{1,2}(?:[:.h]\p{N}{2}(?::\p{N}{2})?)?\h*#{@meridiem}|\p{N}{1,2}[:h]\p{N}{2}(?::\p{N}{2})?)
+    (?:\h*#{@zone})?
+    (?![\p{L}\p{M}\p{N}_])
+  /iux
 
   # Compare complete calendar dates and quantity expressions. Date qualifiers,
   # range endpoints and units cannot borrow support from separate source facts.
   @fact_patterns [
-    link: @link_fact,
     calendar: ~r/(?<![\p{L}\p{M}\p{N}_])#{@calendar_fact}/iux,
+    clock: @clock,
     quantity: ~r/#{@quantity}/iux
   ]
   @bare_host ~r|\b[a-z][a-z0-9+.-]*://|iu
@@ -130,21 +138,15 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   defp safe_grounded?(_, _), do: false
 
   defp facts(text) do
-    # A date or quantity may overlap an address. Preserve every address span
-    # for the link checks and keep its digits out of other evidence facts.
-    {links, other} =
-      Enum.flat_map(@fact_patterns, fn {kind, pattern} ->
-        for [{start, length}] <- Regex.scan(pattern, text, return: :index, capture: :first) do
-          {start, length, kind}
-        end
-      end)
-      |> Enum.split_with(fn {_, _, kind} -> kind == :link end)
+    links = fact_spans(text, @link_fact, :link)
+
+    # Mask addresses before scanning other facts. The mask keeps byte offsets
+    # and stops matches at the address without discarding adjacent text.
+    without_links = Regex.replace(@link_fact, text, &:binary.copy(<<0>>, byte_size(&1)))
 
     other =
-      Enum.reject(other, fn {start, length, _} ->
-        Enum.any?(links, fn {offset, width, :link} ->
-          start < offset + width and offset < start + length
-        end)
+      Enum.flat_map(@fact_patterns, fn {kind, pattern} ->
+        fact_spans(without_links, pattern, kind)
       end)
 
     spans = Enum.sort_by(links ++ other, fn {start, length, _} -> {start, -length} end)
@@ -162,6 +164,12 @@ defmodule VoelgoedAi.Support.EvidenceReply do
     |> Enum.reverse()
     |> join_ranges(text)
     |> Enum.map(&fact_text(&1, text))
+  end
+
+  defp fact_spans(text, pattern, kind) do
+    for [{start, length}] <- Regex.scan(pattern, text, return: :index, capture: :first) do
+      {start, length, kind}
+    end
   end
 
   defp join_ranges(
