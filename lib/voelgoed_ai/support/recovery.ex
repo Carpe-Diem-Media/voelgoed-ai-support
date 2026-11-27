@@ -206,8 +206,8 @@ defmodule VoelgoedAi.Support.Recovery do
 
   if Mix.env() == :test do
     alias VoelgoedAi.Repo
-    alias VoelgoedAi.Support.InboundEvent
-    alias VoelgoedAi.Support.Workers.ProcessEvent
+    alias VoelgoedAi.Support.{Configuration, InboundEvent, SupportSession}
+    alias VoelgoedAi.Support.Workers.{ProcessEvent, Sweep}
 
     @batch_size 25
 
@@ -221,12 +221,138 @@ defmodule VoelgoedAi.Support.Recovery do
         for event <- events, do: Ownership.enqueue(ProcessEvent, %{"event_id" => event.id})
         for run <- runs, do: run_deadline(run.id)
         for delivery <- deliveries, do: delivery_deadline(delivery.id)
-        :ok
+        sweep_idle(nil)
       else
         nil -> :ok
         error -> RunProcessing.job_result(error)
       end
     end
+
+    @doc false
+    def sweep_idle(cursor) do
+      with %{shadow_evaluation: true} = fixture <- ChatwootAdapter.fixture(),
+           scope =
+             Map.take(fixture, [:installation_ref, :external_account_id, :external_inbox_id]),
+           {:ok, candidates} <- idle_candidates(scope, cursor),
+           :ok <- continue_idle(candidates) do
+        candidates
+        |> Enum.reduce({:ok, :idle_checked}, fn candidate, outcome ->
+          case check_idle(candidate) do
+            {:ok, _} -> outcome
+            {:error, :scope_denied} -> outcome
+            error -> error
+          end
+        end)
+        |> RunProcessing.job_result()
+      else
+        {:error, _} = error -> RunProcessing.job_result(error)
+        _ -> :ok
+      end
+    end
+
+    defp idle_candidates(scope, cursor) do
+      where =
+        Map.put(scope, :verified_input_at, %{
+          less_than_or_equal: idle_cutoff(ChatwootAdapter.now())
+        })
+
+      where = if cursor, do: Map.put(where, :id, %{greater_than: cursor}), else: where
+
+      Repo.transact(fn ->
+        store_read(SupportSession, :idle_candidates, %{}, where,
+          many: true,
+          sort: [:id],
+          limit: @batch_size
+        )
+      end)
+    end
+
+    # A later batch can progress even if the first page has persistent outages.
+    defp continue_idle(candidates) when length(candidates) == @batch_size do
+      with {:ok, _} <-
+             Ownership.enqueue(Sweep, %{"idle_after" => List.last(candidates).id},
+               unique: [period: 60, states: [:available, :scheduled, :executing, :retryable]]
+             ),
+           do: :ok
+    end
+
+    defp continue_idle(_), do: :ok
+
+    defp check_idle(candidate) do
+      with {:ok, {:eligible, snapshot, deadline}} <-
+             with_idle(candidate, fn config, session, now ->
+               {:ok, {:eligible, Ownership.epoch_snapshot(config, session), DateTime.add(now, 5)}}
+             end),
+           {:ok, observation} <- ChatwootAdapter.observe(candidate, deadline),
+           {:ok, action} <- idle_action(candidate, observation, deadline) do
+        with_idle(candidate, fn config, session, now ->
+          if DateTime.before?(now, deadline) and Ownership.current?(config, session, snapshot) do
+            case action do
+              :observe ->
+                Ownership.observe(config, session, observation, now)
+
+              :route ->
+                Ownership.route_shadow_locked(config, session, observation, now, :idle_triage)
+            end
+          else
+            {:ok, :ineligible}
+          end
+        end)
+      else
+        {:error, reason}
+        when reason in [:deadline, :unavailable, :rate_limited, :history_changed] ->
+          {:ok, :ineligible}
+
+        false ->
+          {:ok, :ineligible}
+
+        result ->
+          result
+      end
+    end
+
+    # A qualified assignment or resolution is independent of idle text proof.
+    defp idle_action(_, %{assignee: :human}, _), do: {:ok, :observe}
+    defp idle_action(_, %{status: :resolved}, _), do: {:ok, :observe}
+
+    defp idle_action(candidate, _, deadline) do
+      with {:ok, %{latest_id: last_id, texts: texts}} <-
+             ChatwootAdapter.receipt_text(candidate, deadline),
+           true <- last_id == candidate.verified_input_id and Map.has_key?(texts, last_id) do
+        {:ok, :route}
+      end
+    end
+
+    defp with_idle(candidate, operation) do
+      Repo.transact(fn ->
+        Ownership.locked_session(candidate.id, fn config, session, now ->
+          with true <- Ownership.shadow_evaluation_enabled?(config),
+               {:ok, %{response_policy: :shadow_decision}} <-
+                 Configuration.current_revision(config.assistant),
+               true <-
+                 session.binding_id == config.binding.id and session.state == :bot_active and
+                   not session.human_inhibit and session.observed_status == :pending and
+                   session.observed_assignee == :bot,
+               true <-
+                 session.ownership_epoch == candidate.ownership_epoch and
+                   session.verified_input_at == candidate.verified_input_at and
+                   session.verified_input_id == candidate.verified_input_id,
+               true <- not DateTime.after?(session.verified_input_at, idle_cutoff(now)),
+               {:ok, false} <- Ownership.pending_input?(session),
+               {:ok, nil} <- Ownership.active_run(session, lock: true),
+               {:ok, nil} <- Ownership.blocking_delivery(session, lock: true) do
+            operation.(config, session, now)
+          else
+            false -> {:ok, :ineligible}
+            {:error, :stale_policy} -> {:ok, :ineligible}
+            {:ok, _} -> {:ok, :ineligible}
+            error -> error
+          end
+        end)
+      end)
+    end
+
+    defp idle_cutoff(now), do: DateTime.add(now, -1800)
 
     defp due(now) do
       opts = [many: true, sort: [:inserted_at, :id], limit: @batch_size]
@@ -278,5 +404,7 @@ defmodule VoelgoedAi.Support.Recovery do
   else
     @doc "Find a bounded set of durable work whose individual job may have been lost."
     def sweep, do: :ok
+    @doc false
+    def sweep_idle(_), do: :ok
   end
 end

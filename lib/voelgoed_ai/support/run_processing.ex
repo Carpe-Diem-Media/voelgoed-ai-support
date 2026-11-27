@@ -6,7 +6,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   use VoelgoedAi.Support.WorkStore, [:read, :create, :update]
 
-  alias VoelgoedAi.Governance.Admission
+  alias VoelgoedAi.Governance.{Admission, MisuseProtection}
   alias VoelgoedAi.Repo
 
   alias VoelgoedAi.Support.{
@@ -46,20 +46,59 @@ defmodule VoelgoedAi.Support.RunProcessing do
         do: ChatwootAdapter.history(event, deadline),
         else: {:ok, []}
 
+    text = receipt_text(event, deadline, history)
+
     Repo.transact(fn ->
       with {:ok, config, session, event, now} <- Ownership.lock_event(event) do
-        decide_event(config, session, event, now, deadline, observation, history)
+        decide_event(config, session, event, now, deadline, observation, history, text)
       end
     end)
     |> job_result()
   end
 
-  defp decide_event(_, _, %{disposition: disposition}, _, _, _, _) when disposition != :pending,
-    do: {:ok, :finished}
+  if Mix.env() == :test do
+    defp receipt_text(event, deadline, {:ok, [_ | _]}) do
+      with %{shadow_evaluation: true} <- ChatwootAdapter.fixture(),
+           {:ok, snapshot} <-
+             Repo.transact(fn ->
+               inbox =
+                 Map.take(event, [:installation_ref, :external_account_id, :external_inbox_id])
 
-  defp decide_event(config, session, event, now, deadline, observation, history) do
+               with {:ok, config} <- Configuration.lock_inbox(inbox) do
+                 receipt_authority(config)
+               end
+             end),
+           {:ok, proof} <- ChatwootAdapter.receipt_text(event, deadline) do
+        {:ok, proof, snapshot}
+      end
+    end
+
+    defp receipt_text(_, _, _), do: nil
+
+    defp receipt_authority(config) do
+      with true <- Ownership.shadow_evaluation_enabled?(config),
+           {:ok, %{response_policy: :shadow_decision} = revision} <-
+             Configuration.current_revision(config.assistant) do
+        {:ok,
+         {revision.id, config.assistant.security_epoch, config.binding.security_epoch,
+          config.control.security_epoch}}
+      else
+        _ -> {:error, :stale_policy}
+      end
+    end
+  else
+    defp receipt_text(_, _, _), do: nil
+  end
+
+  defp decide_event(_, _, %{disposition: disposition}, _, _, _, _, _)
+       when disposition != :pending,
+       do: {:ok, :finished}
+
+  defp decide_event(config, session, event, now, deadline, observation, history, text) do
     cond do
       DateTime.compare(now, deadline) != :lt ->
+        observation = if text == {:error, :scope_denied}, do: text, else: observation
+
         with {:ok, session} <- route_overdue(config, session, event, now, observation) do
           disposition(event, session, :triage, :deadline, now)
         end
@@ -71,7 +110,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
         case {observation, history} do
           {{:ok, observation}, {:ok, history}} ->
             with {:ok, session} <- Ownership.observe(config, session, observation, now) do
-              qualify_input(config, session, event, now, deadline, observation, history)
+              qualify_input(config, session, event, now, deadline, observation, history, text)
             end
 
           _ ->
@@ -99,10 +138,13 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   defp route_overdue(_, session, _, _, _), do: {:ok, session}
 
-  defp qualify_input(_, session, %{kind: kind} = event, now, _, _, _) when kind != :input,
+  defp qualify_input(_, session, %{kind: kind} = event, now, _, _, _, _) when kind != :input,
     do: disposition(event, session, :observed, :accepted, now)
 
-  defp qualify_input(config, session, event, now, deadline, observation, history) do
+  defp qualify_input(_, session, event, now, _, _, _, {:error, :scope_denied}),
+    do: disposition(event, session, :triage, :scope_denied, now)
+
+  defp qualify_input(config, session, event, now, deadline, observation, history, text) do
     with true <-
            session.state == :bot_active and Ownership.eligible_bot?(config, session, observation),
          position when is_integer(position) <-
@@ -111,7 +153,16 @@ defmodule VoelgoedAi.Support.RunProcessing do
          {:ok, active} <- Ownership.active_run(session, lock: true),
          {:ok, batch} <- batch_candidate(active, candidate),
          {:ok, delivery} <- Ownership.blocking_delivery(session, lock: true) do
-      admit(config, session, event, batch, delivery, now, deadline, position)
+      input = %{
+        event: event,
+        batch: batch,
+        delivery: delivery,
+        deadline: deadline,
+        position: position,
+        observation: observation
+      }
+
+      before_admission(config, session, input, now, history, text)
     else
       false -> disposition(event, session, :triage, :scope_denied, now)
       nil -> disposition(event, session, :triage, :history_changed, now)
@@ -119,9 +170,149 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
   end
 
-  defp admit(config, session, event, batch, delivery, now, deadline, position) do
+  if Mix.env() == :test do
+    alias VoelgoedAi.Support.{DecisionTemplates, SupportSession}
+
+    defp before_admission(config, session, input, now, history, {:ok, proof, snapshot}) do
+      if receipt_authority(config) == {:ok, snapshot} do
+        before_shadow_admission(config, session, input, now, history, proof)
+      else
+        disposition(input.event, session, :triage, :stale_policy, now)
+      end
+    end
+
+    defp before_admission(config, session, input, now, _, _),
+      do: admit(config, session, input, now)
+
+    defp before_shadow_admission(config, session, input, now, history, proof) do
+      with {:ok, session} <- mark_activity(session, input.event, now, history, proof),
+           :ok <- admit_slot(input.delivery),
+           {:ok, request} <- pending_human_request(input.event, now, history, proof.texts),
+           :ok <- route_explicit_request(config, session, input, now, request),
+           :ok <- record_standalone_misuse(config, session, input, now, history, proof) do
+        admit(config, session, input, now)
+      else
+        {:error, :ai_cooldown} ->
+          disposition(input.event, session, :ignored, :ai_cooldown, now)
+
+        {:error, :awaiting_operator} ->
+          disposition(input.event, session, :triage, :awaiting_operator, now)
+
+        result ->
+          result
+      end
+    end
+
+    defp pending_human_request(event, now, history, texts) do
+      ids =
+        for %{id: id, sender: :contact} <- history,
+            text = texts[id],
+            DecisionTemplates.human_request?(text),
+            do: id
+
+      case ids do
+        [] ->
+          {:ok, nil}
+
+        _ ->
+          where =
+            event
+            |> Map.take([
+              :installation_ref,
+              :external_account_id,
+              :external_inbox_id,
+              :conversation_id,
+              :contact_id
+            ])
+            |> Map.merge(%{
+              message_id: %{in: ids},
+              kind: :input,
+              event_type: :message_created,
+              state: :dispatched,
+              disposition: :pending,
+              received_at: %{greater_than: DateTime.add(now, -45)}
+            })
+
+          store_read(InboundEvent, :pending, %{}, where,
+            lock: true,
+            sort: [:received_at, :id],
+            limit: 1
+          )
+      end
+    end
+
+    defp route_explicit_request(_, _, _, _, nil), do: :ok
+
+    defp route_explicit_request(config, session, input, now, request) do
+      with {:ok, session} <-
+             Ownership.route_shadow_locked(
+               config,
+               session,
+               input.observation,
+               now,
+               :human_requested
+             ),
+           {:ok, marked} <- disposition(request, session, :triage, :human_requested, now),
+           :ok <- dispose_other_input(input.event, request, session, now) do
+        {:ok, marked}
+      end
+    end
+
+    defp dispose_other_input(%{id: id}, %{id: id}, _session, _now), do: :ok
+
+    defp dispose_other_input(event, _request, session, now) do
+      with {:ok, _} <- disposition(event, session, :ignored, :awaiting_operator, now), do: :ok
+    end
+
+    defp record_standalone_misuse(
+           config,
+           session,
+           %{event: event, batch: nil, delivery: nil},
+           now,
+           history,
+           proof
+         )
+         when event.event_type == :message_created do
+      if latest_verified?(event, history, proof) and
+           MisuseProtection.fixture_match?(proof.texts[event.message_id]) do
+        with :ok <- MisuseProtection.allowed(config, session, now),
+             {:ok, pending?} <- Ownership.pending_input?(session, event.id) do
+          if pending?, do: :ok, else: MisuseProtection.record(event, session, now)
+        end
+      else
+        :ok
+      end
+    end
+
+    defp record_standalone_misuse(_, _, _, _, _, _), do: :ok
+
+    defp latest_verified?(event, history, proof) do
+      proof.latest_id == event.message_id and Map.has_key?(proof.texts, event.message_id) and
+        match?(%{id: id, sender: :contact} when id == event.message_id, List.last(history))
+    end
+
+    defp mark_activity(%SupportSession{} = session, event, now, history, proof) do
+      if latest_verified?(event, history, proof) do
+        store_update(session, :mark_verified_input, %{
+          verified_input_at: now,
+          verified_input_id: event.message_id
+        })
+      else
+        {:ok, session}
+      end
+    end
+  else
+    defp before_admission(config, session, input, now, _, _),
+      do: admit(config, session, input, now)
+  end
+
+  defp admit(config, session, input, now) do
+    %{event: event, batch: batch, delivery: delivery, deadline: deadline, position: position} =
+      input
+
     with :ok <- admit_slot(delivery),
          {:ok, revision} <- Configuration.current_revision(config.assistant),
+         :ok <- MisuseProtection.allowed(config, session, now),
          :ok <- authorize_capacity(batch),
          :ok <- qualify_fixture_input(batch, config, session, event, now),
          {:ok, run} <- schedule(config, session, revision, batch, delivery, now, deadline) do
@@ -142,9 +333,12 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
       {:error, :admission_limited} ->
         # An exhausted AI allowance cannot stop staff routing in shadow.
-        with {:ok, session} <- route_limited_shadow(config, session, now) do
+        with {:ok, session} <- route_limited_shadow(config, session, input.observation, now) do
           disposition(event, session, :triage, :admission_limited, now)
         end
+
+      {:error, :ai_cooldown} ->
+        disposition(event, session, :ignored, :ai_cooldown, now)
 
       {:error, reason} when reason in [:awaiting_operator, :stale_policy] ->
         disposition(event, session, :triage, reason, now)
@@ -155,13 +349,13 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   if Mix.env() == :test do
-    defp route_limited_shadow(config, session, now) do
+    defp route_limited_shadow(config, session, observation, now) do
       if Ownership.shadow_evaluation_enabled?(config),
-        do: Ownership.route_overdue_locked(config, session, now),
+        do: Ownership.route_shadow_locked(config, session, observation, now, :admission_limited),
         else: {:ok, session}
     end
   else
-    defp route_limited_shadow(_config, session, _now), do: {:ok, session}
+    defp route_limited_shadow(_config, session, _observation, _now), do: {:ok, session}
   end
 
   defp route_expired_batch(batch, config, session, now) do
@@ -518,6 +712,9 @@ defmodule VoelgoedAi.Support.RunProcessing do
             generated = Generation.propose(&evidence_owner/0, run, current, items, observed)
             {generated, items}
 
+          {{:ok, %{status: :budget_exhausted}}, _, _} ->
+            {{:error, :budget_exhausted}, []}
+
           {{:ok, %{status: :no_evidence}}, _, _} ->
             {DecisionTemplates.build(locale, "handoff", "missing_evidence"), []}
 
@@ -562,6 +759,18 @@ defmodule VoelgoedAi.Support.RunProcessing do
       by_revision = Map.new(items, &{&1.revision_id, &1.citation_id})
       citations = Enum.map(decision.evidence_revision_ids, &Map.get(by_revision, &1))
       {:evidenced, :shadow, receipts, observation, context, commitment, decision, citations}
+    end
+
+    defp shadow_result(
+           {{:error, :budget_exhausted}, _},
+           receipts,
+           observation,
+           context,
+           commitment,
+           _locale,
+           _finding
+         ) do
+      {:shadow, receipts, observation, context, {:budget_exhausted, commitment}}
     end
 
     defp shadow_result({proposal, _}, receipts, observation, context, commitment, locale, finding) do
@@ -611,12 +820,14 @@ defmodule VoelgoedAi.Support.RunProcessing do
       true ->
         # with_run holds the singleton control row through the count and claim.
         # All claims take that same lock, including claims for other inboxes.
-        with {:ok, running} <-
+        with :ok <- MisuseProtection.allowed(config, session, now),
+             {:ok, running} <-
                store_read(SupportRun, :active, %{}, %{state: :running}, many: true, limit: 5),
              {:ok, nil} <- Ownership.blocking_delivery(session, lock: true) do
           if length(running) < 5, do: claim_run(config, run, session, now), else: {:ok, :capacity}
         else
           {:ok, _} -> finish(run, :cancel, now, :awaiting_operator)
+          {:error, :ai_cooldown} -> finish(run, :cancel, now, :ai_cooldown)
           error -> error
         end
     end
@@ -677,11 +888,19 @@ defmodule VoelgoedAi.Support.RunProcessing do
         finish(run, :cancel, now, :stale_policy)
 
       true ->
-        finalize(config, session, run, now, decision)
+        complete_current(config, session, run, now, decision)
     end
   end
 
   if Mix.env() == :test do
+    defp complete_current(config, session, run, now, decision) do
+      case MisuseProtection.allowed(config, session, now) do
+        :ok -> finalize(config, session, run, now, decision)
+        {:error, :ai_cooldown} -> finish(run, :cancel, now, :ai_cooldown)
+        error -> error
+      end
+    end
+
     alias VoelgoedAi.Knowledge.{GapReview, Retrieval}
     alias VoelgoedAi.Knowledge.Retrieval.Reference
     alias VoelgoedAi.Support.{DecisionTemplates, EvidenceReply, SupportDecision}
@@ -883,6 +1102,32 @@ defmodule VoelgoedAi.Support.RunProcessing do
            config,
            session,
            run,
+           _,
+           _now,
+           observation,
+           {:ok, %{commitment: commitment}},
+           {:budget_exhausted, commitment}
+         ) do
+      now = ChatwootAdapter.now()
+
+      if DateTime.before?(now, run.lease_expires_at) and DateTime.before?(now, run.deadline_at) do
+        with {:ok, failed} <- finish(run, :fail, now, :budget_exhausted),
+             {:ok, _} <-
+               Ownership.route_shadow_locked(config, session, observation, now, :budget_exhausted) do
+          {:ok, failed}
+        end
+      else
+        finish(run, :fail, now, :deadline)
+      end
+    end
+
+    defp decide_shadow(config, session, run, _, _, observation, {:ok, _}, {:budget_exhausted, _}),
+      do: reject_evidence(config, session, run, observation, true)
+
+    defp decide_shadow(
+           config,
+           session,
+           run,
            revision,
            _now,
            observation,
@@ -962,7 +1207,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
   else
-    defp finalize(config, session, run, now, {:fixed, observation, history}),
+    defp complete_current(config, session, run, now, {:fixed, observation, history}),
       do: decide(config, session, run, now, observation, history)
   end
 

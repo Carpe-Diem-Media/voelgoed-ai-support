@@ -32,6 +32,16 @@ defmodule VoelgoedAi.Support.InboundEvent do
     end
 
     custom_indexes do
+      index([:installation_ref, :external_account_id, :contact_id, :processed_at],
+        name: "inbound_events_misuse_window",
+        where: "reason_code = 'verified_misuse'"
+      )
+
+      index([:installation_ref, :external_account_id, :contact_id, :cooldown_until],
+        name: "inbound_events_cooldown_window",
+        where: "cooldown_until IS NOT NULL"
+      )
+
       index([:installation_ref, :external_account_id, :event_type, :message_id],
         name: "inbound_events_message_key",
         unique: true,
@@ -46,6 +56,17 @@ defmodule VoelgoedAi.Support.InboundEvent do
     end
 
     check_constraints do
+      check_constraint(:cooldown_until, "inbound_events_misuse_fact",
+        check: """
+        (reason_code IS DISTINCT FROM 'verified_misuse' OR
+          (state = 'dispatched' AND disposition = 'ignored' AND kind = 'input' AND
+            event_type = 'message_created' AND message_id IS NOT NULL AND
+            session_id IS NOT NULL AND processed_at IS NOT NULL)) AND
+        (cooldown_until IS NULL OR
+          (reason_code IS NOT DISTINCT FROM 'verified_misuse' AND cooldown_until > processed_at))
+        """
+      )
+
       check_constraint(:installation_ref, "inbound_events_lifecycle",
         check: """
         external_account_id > 0 AND external_inbox_id > 0 AND conversation_id > 0 AND contact_id > 0 AND
@@ -129,6 +150,7 @@ defmodule VoelgoedAi.Support.InboundEvent do
       ]
     )
 
+    attribute(:cooldown_until, :utc_datetime_usec, public?: true)
     attribute(:processed_at, :utc_datetime_usec, public?: true, allow_nil?: true)
     attribute(:correlation_id, :uuid, public?: true, allow_nil?: false)
     create_timestamp(:inserted_at)
@@ -152,6 +174,10 @@ defmodule VoelgoedAi.Support.InboundEvent do
     end
 
     read :pending do
+    end
+
+    read :misuse_facts do
+      filter(expr(reason_code == :verified_misuse))
     end
 
     create :register do
@@ -202,6 +228,16 @@ defmodule VoelgoedAi.Support.InboundEvent do
       change(set_attribute(:disposition, :triage))
     end
 
+    update :record_misuse do
+      transaction?(false)
+      require_atomic?(false)
+      accept([:session_id, :processed_at, :cooldown_until])
+      validate({VoelgoedAi.Support.FromState, states: [:dispatched]})
+      validate({VoelgoedAi.Support.FromState, attribute: :disposition, states: [:pending]})
+      change(set_attribute(:disposition, :ignored))
+      change(set_attribute(:reason_code, :verified_misuse))
+    end
+
     update :record_disposition do
       transaction?(false)
       require_atomic?(false)
@@ -225,7 +261,9 @@ defmodule VoelgoedAi.Support.InboundEvent do
              :dispatch,
              :ignore,
              :quarantine,
-             :record_disposition
+             :record_disposition,
+             :record_misuse,
+             :misuse_facts
            ]) do
       authorize_if(VoelgoedAi.Support.WorkStore)
     end

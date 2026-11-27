@@ -54,7 +54,9 @@ defmodule VoelgoedAi.Knowledge.Retrieval.Manifest do
         status: [
           type: :atom,
           allow_nil?: false,
-          constraints: [one_of: [:evidence, :no_evidence, :unavailable, :denied]]
+          constraints: [
+            one_of: [:evidence, :no_evidence, :unavailable, :denied, :budget_exhausted]
+          ]
         ],
         evidence: [
           type: {:array, VoelgoedAi.Knowledge.Retrieval.Evidence},

@@ -16,7 +16,8 @@ defmodule VoelgoedAi.Support.SupportSession do
       conversation_id: :bigint,
       contact_id: :bigint,
       generation: :bigint,
-      ownership_epoch: :bigint
+      ownership_epoch: :bigint,
+      verified_input_id: :bigint
     )
 
     references do
@@ -32,6 +33,11 @@ defmodule VoelgoedAi.Support.SupportSession do
     end
 
     custom_indexes do
+      index([:installation_ref, :external_account_id, :external_inbox_id, :id],
+        name: "support_sessions_idle_candidates",
+        where: "state = 'bot_active' AND verified_input_at IS NOT NULL"
+      )
+
       index([:installation_ref, :external_account_id, :external_inbox_id, :conversation_id],
         name: "support_sessions_one_current",
         unique: true,
@@ -40,6 +46,13 @@ defmodule VoelgoedAi.Support.SupportSession do
     end
 
     check_constraints do
+      check_constraint(:verified_input_at, "support_sessions_activity",
+        check: """
+        (verified_input_at IS NULL) = (verified_input_id IS NULL) AND
+        (verified_input_id IS NULL OR (verified_input_id > 0 AND state = 'bot_active'))
+        """
+      )
+
       check_constraint(:installation_ref, "support_sessions_lifecycle",
         check: """
         external_account_id > 0 AND external_inbox_id > 0 AND conversation_id > 0 AND
@@ -112,6 +125,9 @@ defmodule VoelgoedAi.Support.SupportSession do
       constraints: [one_of: [:bot, :human, :unassigned]]
     )
 
+    attribute(:verified_input_at, :utc_datetime_usec, public?: true)
+    attribute(:verified_input_id, :integer, public?: true, constraints: [min: 1])
+
     attribute(:observed_at, :utc_datetime_usec, public?: true, allow_nil?: true)
     attribute(:closed_at, :utc_datetime_usec, public?: true, allow_nil?: true)
 
@@ -157,6 +173,17 @@ defmodule VoelgoedAi.Support.SupportSession do
     read :by_id do
     end
 
+    read :idle_candidates do
+      filter(expr(state == :bot_active and not human_inhibit and not is_nil(verified_input_at)))
+    end
+
+    update :mark_verified_input do
+      transaction?(false)
+      require_atomic?(false)
+      accept([:verified_input_at, :verified_input_id])
+      validate({VoelgoedAi.Support.FromState, states: [:bot_active]})
+    end
+
     create :register do
       transaction?(false)
 
@@ -193,6 +220,8 @@ defmodule VoelgoedAi.Support.SupportSession do
 
       change(set_attribute(:state, :human_active))
       change(set_attribute(:human_inhibit, true))
+      change(set_attribute(:verified_input_at, nil))
+      change(set_attribute(:verified_input_id, nil))
     end
 
     update :observe_signed_handoff_takeover do
@@ -212,6 +241,8 @@ defmodule VoelgoedAi.Support.SupportSession do
       validate({VoelgoedAi.Support.FromState, states: [:bot_active]})
       change(set_attribute(:state, :handoff_pending))
       change(set_attribute(:human_inhibit, true))
+      change(set_attribute(:verified_input_at, nil))
+      change(set_attribute(:verified_input_id, nil))
     end
 
     update :confirm_handoff do
@@ -253,6 +284,8 @@ defmodule VoelgoedAi.Support.SupportSession do
       )
 
       change(set_attribute(:state, :closed))
+      change(set_attribute(:verified_input_at, nil))
+      change(set_attribute(:verified_input_id, nil))
     end
 
     update :inhibit_closed do
@@ -289,7 +322,9 @@ defmodule VoelgoedAi.Support.SupportSession do
              :return_to_bot,
              :close,
              :inhibit_closed,
-             :verify_owner
+             :verify_owner,
+             :idle_candidates,
+             :mark_verified_input
            ]) do
       authorize_if(VoelgoedAi.Support.WorkStore)
     end

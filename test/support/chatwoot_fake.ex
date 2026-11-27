@@ -23,7 +23,7 @@ defmodule VoelgoedAi.ChatwootFake do
     {observation, barrier} =
       Agent.get_and_update(agent, fn state ->
         {barrier, state} = Map.pop(state, :read_barrier)
-        result = Map.get(state, :conversation_result, state.observation)
+        result = Map.get(state, :conversation_result, remote(state, destination).observation)
         {{result, barrier}, Map.update(state, :conversation_reads, 1, &(&1 + 1))}
       end)
 
@@ -40,6 +40,8 @@ defmodule VoelgoedAi.ChatwootFake do
     end
   end
 
+  defp remote(state, destination), do: get_in(state, [:conversations, destination]) || state
+
   defp qualify(%Observation{destination: destination} = observation, destination),
     do: {:ok, observation}
 
@@ -55,12 +57,14 @@ defmodule VoelgoedAi.ChatwootFake do
       Agent.get_and_update(agent, fn state ->
         {barrier, state} = Map.pop(state, :history_barrier)
 
+        remote = remote(state, destination)
+
         response =
-          with {:ok, _} <- qualify(state.observation, destination) do
+          with {:ok, _} <- qualify(remote.observation, destination) do
             {:ok,
              %History{
                destination: Map.get(state, :history_destination, destination),
-               messages: Enum.take(state.history, -limit)
+               messages: Enum.take(remote.history, -limit)
              }}
           end
 
@@ -88,10 +92,12 @@ defmodule VoelgoedAi.ChatwootFake do
       Agent.get_and_update(agent, fn state ->
         {barrier, state} = Map.pop(state, :decision_history_barrier)
 
+        remote = remote(state, destination)
+
         response =
-          with {:ok, observation} <- qualify(state.observation, destination) do
+          with {:ok, observation} <- qualify(remote.observation, destination) do
             messages =
-              state.history
+              remote.history
               |> Enum.take(-limit)
               |> Enum.map(&text_message(&1, observation.contact, state))
 

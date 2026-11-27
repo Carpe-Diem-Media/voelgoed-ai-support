@@ -258,6 +258,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
             {:error, :unavailable}
         end
       else
+        {:error, :budget_exhausted} = denied -> denied
         _ -> {:error, :unavailable}
       end
     end

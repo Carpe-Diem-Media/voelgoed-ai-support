@@ -59,6 +59,9 @@ defmodule VoelgoedAi.Support.DecisionTemplates do
     })
   end
 
+  @doc false
+  def human_request?(text) when is_binary(text), do: normalize(text) in @human_requests
+
   defp route(phrases, clarification_available?) do
     cond do
       Enum.any?(phrases, &(&1 in @human_requests)) ->

@@ -28,6 +28,13 @@ defmodule VoelgoedAi.Intelligence.Generation do
     max_output_tokens: 500
   }
 
+  defmodule BudgetExhausted do
+    @moduledoc false
+    use Splode.Error, fields: [], class: :invalid
+
+    def message(_), do: "support generation budget exhausted"
+  end
+
   @enforce_keys [:ref]
   defstruct [:ref]
 
@@ -63,7 +70,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
 
     @doc false
     def propose(owner, run, context, evidence, observation) do
-      with %{shadow_inference: %{generation_wire: wire}} <- ChatwootAdapter.fixture(),
+      with %{shadow_inference: %{generation_wire: wire} = options} <- ChatwootAdapter.fixture(),
            true <- is_function(wire, 1),
            {:ok, guard} <- Retrieval.generation_guard(owner, evidence, observation) do
         args = %{
@@ -73,15 +80,24 @@ defmodule VoelgoedAi.Intelligence.Generation do
           evidence: evidence
         }
 
-        with_scope(run.id, run.claim_generation, %{wire: wire, evidence_guard: guard}, fn actor ->
+        settings = options |> Map.take([:day_cap, :month_cap])
+        settings = Map.merge(settings, %{wire: wire, evidence_guard: guard})
+
+        with_scope(run.id, run.claim_generation, settings, fn actor ->
           SupportProposal
           |> Ash.ActionInput.for_action(:generate, args, actor: actor)
           |> Ash.run_action()
+          |> proposal_result()
         end)
       else
         _ -> {:error, :generation_disabled}
       end
     end
+
+    defp proposal_result({:error, %Ash.Error.Invalid{errors: [%BudgetExhausted{}]}}),
+      do: {:error, :budget_exhausted}
+
+    defp proposal_result(result), do: result
 
     @doc "Issue a process-bound generation capability for one synthetic shadow claim."
     def with_fixture(id, claim, %{wire: wire} = options, operation)
@@ -128,10 +144,13 @@ defmodule VoelgoedAi.Intelligence.Generation do
                   {:ok, attempt} <- reserve(config.control, run, now, cutoff, fixture) do
                {:ok, {attempt, payload}}
              end
-           end),
-         {:ok, decision} <- execute(attempt, payload, args, fixture) do
-      {:ok, decision}
+           end) do
+      case execute(attempt, payload, args, fixture) do
+        {:ok, decision} -> {:ok, decision}
+        _ -> {:error, "support proposal unavailable"}
+      end
     else
+      {:error, :budget_exhausted} -> {:error, %BudgetExhausted{}}
       _ -> {:error, "support proposal unavailable"}
     end
   end
@@ -192,6 +211,12 @@ defmodule VoelgoedAi.Intelligence.Generation do
     RunProcessing.with_run(id, fn config, session, run, _now ->
       with true <- settings.shadow_enabled?.(config),
            true <- RunProcessing.valid_run?(config, session, run),
+           :ok <-
+             VoelgoedAi.Governance.MisuseProtection.allowed(
+               config,
+               session,
+               ChatwootAdapter.now()
+             ),
            true <- run.state == :running and run.claim_generation == claim,
            {:ok, revision} <- Configuration.current_revision(config.assistant),
            true <- revision.id == run.assistant_revision_id,
