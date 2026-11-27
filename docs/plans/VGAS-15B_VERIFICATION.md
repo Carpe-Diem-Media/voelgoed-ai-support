@@ -114,6 +114,12 @@ Independent review of `7fb9a49` found two untested paths after the dispatch mark
 
 The disposable runner on port 55435 reported PostgreSQL 18.7 and pgvector 0.8.7. Locked dependency resolution, format, forced TEST compile with warnings as errors and `ash.codegen --check` exited 0. `VGAS_F04_DISPOSABLE=1 mise exec -- mix test test/voelgoed_ai/support/decision_evidence_test.exs --seed 0` exited 0 with 55 passed. The runner removed its container and volume.
 
+## Grounded amount regression
+
+Independent review of `c8d8ba6` closed both dispatch findings and found that the grounded validator reduced `R25 miljoen` and `R25 per persoon` to the same fact. Its synthetic probe reached the Chatwoot fake. The validator now matches supported Afrikaans and English multiplier words and abbreviations as part of the numeric fact. The original reply bytes still pass through unchanged when the fact matches.
+
+On disposable PostgreSQL 18.7 with pgvector 0.8.7, the negative completion cases at seed 0 initially exited 2. All four new multiplier cases failed on the uncorrected matcher. With the correction, `VGAS_F04_DISPOSABLE=1 mise exec -- mix test test/voelgoed_ai/support/decision_evidence_test.exs test/voelgoed_ai/support/shadow_decision_test.exs test/voelgoed_ai/knowledge/retrieval_test.exs --seed 0` exited 0 with 148 passed, including the existing `R25` dispatch control. Format, forced strict TEST compile and `ash.codegen --check` exited 0. The disposable runner removed its container and volume. A direct render probe accepted the cited `R25 miljoen` and rejected the substituted `R25m` and truncated `R25`.
+
 ## Release gates
 
 The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.

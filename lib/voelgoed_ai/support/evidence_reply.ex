@@ -8,7 +8,9 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   alias VoelgoedAi.Support.SupportDecision
 
   @link_fact "https?:\\/\\/[^\\s<>\"()\\[\\]]+|[\\p{L}\\p{N}._%+-]+@[\\p{L}\\p{N}.-]+\\.[\\p{L}]{2,}"
-  @facts ~r/#{@link_fact}|(?:\p{Sc}|(?<!\p{L})(?:ZAR|USD|EUR|GBP|R)\s?)?[-+]?\p{N}+(?:[.,:\/ -]\p{N}+)*\s?%?/iu
+  # Keep the scale with its number so a cited R25 cannot validate R25 miljoen.
+  @amount_scale ~S"(?:\s+|[-‑])?(?:hundreds?|honderde?|thousands?|duisende?|millions?|miljoene?|billions?|miljarde?|biljoene?|trillions?|triljoene?|k|m|mn|mm|b|bn|tn)(?![\p{L}\p{N}_])"
+  @facts ~r/#{@link_fact}|(?:\p{Sc}|(?<!\p{L})(?:ZAR|USD|EUR|GBP|R)\s?)?[-+]?\p{N}+(?:[.,:\/ -]\p{N}+)*(?:#{@amount_scale})*(?:\s*%)?/iu
   @bare_host ~r|\b[a-z][a-z0-9+.-]*://|iu
   @bare_domain ~r/\b(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}\b/u
   @unsafe ~r/[\x00-\x08\x0b-\x1f\x7f<>]|!\[|(?:\]\(|\]:)|(?:javascript|data|file|mailto|tel):|\bwww\.|\b(?:password|passwd|api[_ -]?key|secret|bearer|access[_ -]?token)\b|\b(?:sk|ghp|gho)[_\-][a-zA-Z0-9_\-]{8,}/iu

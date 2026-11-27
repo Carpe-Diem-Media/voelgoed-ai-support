@@ -57,6 +57,10 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
 
   for {label, text} <- [
         {"amount", "Die kaartjies kos R250."},
+        {"Afrikaans amount multiplier", "Die kaartjies kos R25 miljoen."},
+        {"English amount multiplier", "Die kaartjies kos R25 million."},
+        {"abbreviated amount multiplier", "Die kaartjies kos R25m."},
+        {"multiplier separated by extra whitespace", "Die kaartjies kos R25  miljoen."},
         {"currency", "Die kaartjies kos USD 25."},
         {"bare link", "Besoek example.test."},
         {"date", "Die datum is 25/04/2029."},
@@ -75,6 +79,7 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                  RunProcessing.complete_evidence_fixture(ctx.claim, decision, [target.citation_id])
 
         assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
+        assert SupportDBCase.writes(ctx.support) == []
       end)
     end
   end
