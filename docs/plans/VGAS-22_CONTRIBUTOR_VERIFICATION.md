@@ -119,6 +119,28 @@ on the host.
 
 ## Integrity boundary
 
+The contributor proof pins `PGHOSTADDR` to the checked `TEST_DATABASE_HOST`
+and clears `PGSERVICE` before either libpq invocation. PostgreSQL documents
+that `hostaddr` can supply the connection address even if `host` is set.
+[PostgreSQL 18 libpq connection parameters](https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-HOSTADDR)
+
+Independent review of `19be5af` reproduced inherited address and service
+overrides with the disposable listener stopped and no SQL execution. After
+the correction, all three lanes exited 0 on fresh containers from the pinned
+public image with a conflicting loopback address in the environment or a
+synthetic service file. To repeat, define a temporary libpq service named
+`vgas22-regression` with `hostaddr=127.0.0.2` and export its path as
+`PGSERVICEFILE`. With a fresh disposable container for each command, run:
+
+```sh
+PGHOSTADDR=127.0.0.2 bash test/verification/vgas_22_contributors.sh fresh
+PGSERVICE=vgas22-regression bash test/verification/vgas_22_contributors.sh clean
+PGHOSTADDR=127.0.0.2 PGSERVICE=vgas22-regression bash test/verification/vgas_22_contributors.sh upgrade
+```
+
+The corrected runner removed all three run-owned containers and volumes.
+Port 55434 was free after cleanup. Bash syntax and ShellCheck passed.
+
 PostgreSQL requires an existing staff row for `created_by_id`, a non-null
 UUID array containing that creator, and no null elements. SQL permits a
 privileged writer to add a UUID with no staff row or remove a noncreator.

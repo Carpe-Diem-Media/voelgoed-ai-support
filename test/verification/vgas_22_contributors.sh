@@ -10,7 +10,10 @@ if [[ ${MIX_ENV:-} != test || ${TEST_DATABASE_HOST:-} != 127.0.0.1 ||
   exit 1
 fi
 
-unset OPENAI_API_KEY
+# libpq can use hostaddr or a service even when psql receives -h. Keep both
+# psql calls on the same verified loopback address that Repo uses.
+unset OPENAI_API_KEY PGSERVICE
+export PGHOSTADDR="$TEST_DATABASE_HOST"
 bash .github/scripts/verify_postgres.sh 180007
 
 psql_test() {
