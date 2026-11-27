@@ -1,0 +1,115 @@
+# VGAS-15 PR B verification
+
+Plane VGAS-15, Roadmap VGAS-004. PR B implements D1 and the PR A review findings NIT-1, NIT-2 and NIT-4. The orchestrator addendum in [VGAS-15_PLAN.md](VGAS-15_PLAN.md) governs. The executable candidate is `61974704d0bb780a21efbf930b9dc759ff211c85` on base `e0a86cfa1f539ed10e69ece1caa9a1dc521cd01e`. This record follows as a documentation-only commit. Plane lists VGAS-15 as In Progress. The orchestrator owns issue state, the PR, and independent review.
+
+## Decision and delivery
+
+- T04 starts from a locked RUNNING run with the original positive claim and watermark. It resolves opaque citations from the process-bound TEST manifest, re-projects the selected revisions against current public eligibility, and compares the full projection with what was issued. The recheck runs inside the transaction that already owns the support locks. The search and standalone validation entry points still require their own transactions.
+- Exact replies use the approved answer bytes for the selected locale. Grounded replies carry the bounded, validated `reply_text` from SupportDecision. The validator checks mode, the locale tag against the approved variant, selected IDs, links, secret patterns and verbatim numeric and contact facts. It does not establish semantic entailment. Fixed greeting, decline and handoff decisions require an empty citation list. The existing reason-code allowlist still applies.
+- T04 commits the typed decision, minimized references, context digest and either an explicit no-send disposition or a unique public intent with its jobs. The context digest reuses the existing bounded projection commitment, so edits to the included preceding messages also invalidate the reply. A server digest binds the intent to the response bytes and immutable run completion. On stale authority or evidence, no public intent is created. The eligible shadow failure path reuses local handoff. The positive send fixtures use synthetic automatic mode.
+- T06 locks the COMPLETED source run before the delivery. The claim uses the run's original fence and absolute deadline. It re-qualifies history and selected evidence before reserving a delivery claim. The dispatch marker commits before the final read. Then the worker reads fresh Chatwoot observation and qualified text outside the transaction, takes the locks again, checks receipts, pending input, ownership, circuit and time, re-projects the references, and returns the digest-matched payload. The legacy fixed renderer still supplies the same bytes.
+- The shared qualification SQL and its statement timeout use `log: false` and `telemetry_event: nil`. The control lock serializes editorial changes and grant changes with local authorization. The other locks stay in control, assistant, binding, session, run and delivery order. Receipt reads take row locks under the session and control locks. Transport is outside transactions.
+- The owning worker can cancel a proven pre-POST denial. A stale worker leaves the current claim alone. If authorization SQL fails after the marker, the transaction rolls back and leaves the marker for ordinary recovery. There is still a race between final local authorization and remote POST. Chatwoot can change independently of these locks. The existing UNKNOWN policy covers potential writes and the cutoff at dispatch.
+
+## Schema and rollback
+
+Ash 3.38.1 and AshPostgres 2.15.2. The installed source for Ash map casting and embedded storage, Ash action validation, and AshPostgres custom migration statements was checked against `mix.lock`.
+
+- `20261127065646_qualified_support_evidence.exs` adds `support_runs.evidence_refs`, `support_runs.context_digest` and `outbound_deliveries.payload_digest`.
+- Generated snapshots are `outbound_deliveries/20261127065647.json` and `support_runs/20261127065648.json`. Check constraints distinguish existing templates, deterministic shadow decisions and evidence-backed decisions. Triggers protect completion and intent fields, including the completed source fence, against later updates. The existing terminal-state guards still apply.
+- Operational rollback starts by disabling automation and routing affected conversations to staff. Retain intents, receipts, decisions and UNKNOWN rows so they can be reconciled. The down migration was verified with empty tables and with predecessor-format rows. Keep this additive schema while evidence-backed rows exist. The predecessor check constraints cannot represent those rows.
+
+## Builds, static checks and migrations
+
+Toolchain is Erlang 29.1.2 and Elixir 1.20.5-otp-29 through Mise. Every command ran with `OPENAI_API_KEY` unset. Database steps ran with synthetic data on the provided disposable PostgreSQL 18.7/pgvector 0.8.7 runner. The command was:
+
+```sh
+ss -ltn
+timeout 600000 env -u OPENAI_API_KEY bash /home/jcschoeman96/.t3/userdata/attachments/vgas_disposable_pg.sh "$PWD" "$vgas_steps" "$vgas_port"
+```
+
+| Command | Exit and observation |
+| --- | --- |
+| `MIX_ENV=test mise exec -- mix deps.get --check-locked` | 0. Lockfile unchanged. |
+| `MIX_ENV=test mise exec -- mix hex.audit` | 0. No retired packages or advisories reported. |
+| `MIX_ENV=test mise exec -- mix format --check-formatted` | 0. |
+| `mise exec -- mix compile --force --warnings-as-errors`, TEST via the runner | 0. |
+| `MIX_ENV=prod mise exec -- mix compile --force --warnings-as-errors` | 1 on both base and candidate. Same 17 application warning locations and messages after dependencies were compiled. VGAS-19 owns those warnings. The comparison used an archive of the exact base, the candidate worktree, the same locked dependencies and the same build path. |
+| `MIX_ENV=dev HEX_OFFLINE=1 ELIXIR_ERL_OPTIONS="+S 1" mise exec -- mix compile --force --warnings-as-errors`, repeated with `+S 2` | 1 for each run on both archived revisions with the same 17 application warning locations. |
+| `mise exec -- mix ash.codegen qualified_support_evidence` | 0. Reviewed the generated up/down order, constraints, triggers and snapshots. |
+| `mise exec -- mix ash.codegen --check` | 0. |
+| `mise exec -- mix ecto.migrate --strict-version-order`, `mise exec -- mix ecto.rollback --step 1`, `mise exec -- mix ecto.migrate --strict-version-order` | Each exited 0 on 55435. The fresh foundation test then passed 6 tests with its existing predecessor-only exclusion. |
+| `git diff --check e0a86cfa1f539ed10e69ece1caa9a1dc521cd01e...HEAD` | 0. |
+| `python3 .github/scripts/plan_tests.py` | 0. Included the new test file. |
+| Pinned CI Gitleaks image, command below | 0. Code commit scanned with no findings. |
+
+In all upgrade lanes the predecessor files were copied by `git show REV:priv/repo/migrations/FILE`, or by `git archive e0a86cfa1f539ed10e69ece1caa9a1dc521cd01e priv/repo/migrations` for the complete base. The steps used `mise exec -- mix ecto.migrate --migrations-path "$vgas_base_migrations" --strict-version-order`, then `mise exec -- mix ecto.migrate --strict-version-order`, `mise exec -- mix ecto.migrations` and `mise exec -- mix test test/voelgoed_ai/repo_foundation_test.exs --seed 0`. Each lane exited 0 with no down migrations.
+
+- Foundation upgrade used `20261125141215_foundation_extensions_1.exs` from `aa93104fd476d208206288658e67bfe70e0780cd`.
+- VGAS-001 upgrade used that migration plus `20261125205628_add_staff_authorization.exs` from `92ef0e39a7808d4ffa692b37b48ba3ee27a05e30`. Applied `.github/scripts/vgas001_upgrade_fixture.sql` with `psql -X -q -v ON_ERROR_STOP=1 -f` as the disposable TEST role. The foundation command ran with `VGAS_VERIFY_VGAS001_UPGRADE=true`.
+- PR A upgrade used the complete base. A further populated lane inserted a synthetic completed legacy reply run, queued run, completed shadow greeting, pending public intent and UNKNOWN handoff. `psql -XAt -v ON_ERROR_STOP=1` dumped the two affected relations as ordered JSON before upgrade and after excluding the three added columns. `cmp` matched all predecessor fields after upgrade and again after rollback. An explicit count found all three runs and both deliveries with null new columns after upgrade. The final re-migration exited 0. This populated check covers the two altered tables. Knowledge and accounting coverage comes from the full suites.
+
+The linked worktree needed its common Git directory mounted at the host path for the CI-pinned scan. The initial scan mounted the worktree alone and scanned 0 commits. The corrected command scanned the code commit.
+
+```sh
+vgas_git_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+timeout 600000 docker run --rm --user "$(id -u):$(id -g)" \
+  --volume "$PWD:$PWD:ro" --volume "$vgas_git_dir:$vgas_git_dir:ro" --workdir "$PWD" \
+  ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+  git --redact=100 --log-opts=e0a86cfa1f539ed10e69ece1caa9a1dc521cd01e..HEAD --no-banner .
+```
+
+The PROD BEAM check exited 0 with `MIX_ENV=prod mise exec -- elixir -pa _build/prod/lib/voelgoed_ai/ebin -e "$probe"`. It checked that `RunProcessing.complete_evidence_fixture/3`, `Retrieval.with_fixture/2` and `Retrieval.at_decision/4` were absent and that `ChatwootAdapter.fixture/0` returned nil and `decision_context/3` returned unavailable.
+
+## PostgreSQL test results
+
+| Command | Exit | Tests |
+| --- | --- | --- |
+| `mise exec -- mix test test/voelgoed_ai/support/decision_evidence_test.exs test/voelgoed_ai/support/shadow_decision_test.exs test/voelgoed_ai/knowledge/retrieval_test.exs --seed 0` | 0 | 142 passed. |
+| `VGAS_F04_DISPOSABLE=1 mise exec -- mix test --seed 103` | 0 | 657 passed, 0 skipped, 1 inherited predecessor-only exclusion. |
+| `VGAS_F04_DISPOSABLE=1 mise exec -- mix test --seed 8125` | 0 | 657 passed, 0 skipped, 1 inherited predecessor-only exclusion. |
+
+The full runs used port 55434 and the focused runs used 55435. The seed 103 result is from the rerun after the final two fence tests were added. An earlier intermediate focused run had one missing ranked target in a revocation fixture. The repeat focused run and both final full runs passed. The repository's predecessor-only test ran in the VGAS-001 upgrade lane.
+
+### D1 matrix
+
+All 15 required loss cells passed. Stale profile was tested separately from index epoch, bringing the loss cases to 18. The 18 paired controls sent the selected reference's approved bytes once and replay produced no second write.
+
+| Change after rank | After T04 commit, before claim | After marker, before final authorization |
+| --- | --- | --- |
+| Selected revision revoked. T04 emitted no intent. | Cancelled with no attempt. | Cancelled as dispatch_denied. |
+| Expiry at equality. T04 emitted no intent. | Cancelled with no attempt. | Cancelled as dispatch_denied. |
+| Grant withdrawn by publishing a replacement assistant revision. T04 emitted no intent. | Cancelled with no attempt. | Cancelled as dispatch_denied. |
+| Index epoch advanced. T04 emitted no intent. | Cancelled with no attempt. | Cancelled as dispatch_denied. |
+| Stale index profile. T04 emitted no intent. | Cancelled with no attempt. | Cancelled as dispatch_denied. |
+| Signed human takeover. T04 emitted no intent. | Cancelled with no attempt. | UNKNOWN preserved after the signed fence consumed the marker. |
+
+The fixtures rank the target and an eligible decoy from different collections. Grant withdrawal preserves the decoy grant on the replacement revision. Takeover denies the entire support session. All loss cases made zero Chatwoot writes, retained the expected completed fence where one existed, and added no second query wire hit or accounting entry. The matrix moves supported editorial and ownership state in committed transactions while the worker is parked. The index/profile fixtures change only the selected row under control because running a second indexing job would change the inference proof. The supported grant change also changes the assistant pin and epoch, so it tests the combined protection. The baseline tests also cover a grounded synthetic paraphrase, denied invented citations and facts, shadow completion without a send intent, T04 enqueue rollback, immutable completion, failed final SQL, edited history and terminal T06 replay.
+
+## Mutation evidence
+
+Each mutation was applied to the committed candidate in isolation, then reverted with `git checkout -- <mutated-file>`. The following commands ran on 55435, each with `mise exec -- mix test <target> --seed 0`. ExUnit exit 2 means the named assertion observed the defect.
+
+The three matrix mutations targeted `test/voelgoed_ai/support/decision_evidence_test.exs:20`. The two NIT mutations targeted `test/voelgoed_ai/support/shadow_decision_test.exs`. Other targets below are in `decision_evidence_test.exs`.
+
+| Mutation | Exit and failing assertion |
+| --- | --- |
+| T04 returned the selected manifest projection without current SQL and comparison. | 2, 14/18 passed. Revocation, expiry, index epoch and profile persisted a stale decision. |
+| Delivery claim skipped `render_evidenced/3`. | 2, 15/18 passed. Revocation, index epoch and profile consumed an attempt after T04. |
+| Final gate returned the fixture's exact bytes without `render_evidenced/3`. | 2, 14/18 passed. Revocation, expiry, index epoch and profile reached SENT. |
+| Replaced the final worker-claim comparison with a SENDING-state check. `:138` | 2, 0/1 passed. The stale worker sent despite its replaced generation. |
+| Required RUNNING at the persisted-reference stage. `:244` | 2, 0/1 passed. Replay test's current COMPLETED-source control made zero writes. |
+| Bypassed local policy and ownership validation at the final gate. `:163` | 2, 0/1 passed. The worker sent after the global stop. |
+| Accepted citations on fixed decisions. `:43` | 2, 0/1 passed. The cast accepted a nonempty reference list. |
+| Removed the shadow-fixture exclusion from the write predicate. `:61` | 2, 0/1 passed. The published shadow revision on an automatic binding satisfied the write predicate. |
+| Made the generated completion trigger guard RUNNING instead of COMPLETED. `:244` | 2, 0/1 passed. A completed run accepted a commitment update. This ran on a separate fresh disposable database. |
+
+After restoration, `ash.codegen --check` exited 0 and the 142-test focused command above again exited 0. A restored full run at seed 103 also exited 0 with 657 passed and one inherited exclusion.
+
+The claim-gate expiry case has a second guard. Advancing its fake clock to expiry also reaches the read-freshness cutoff before the marker. Revocation and index/profile changes independently killed claim omission without touching that cutoff. The supported grant withdrawal and signed takeover can also be denied by the current revision and ownership guards. The completed-state test changes the state required by the typed reader to RUNNING. A simple state-check removal at one layer is redundant with the completion constraint and the other state check.
+
+## Release gates
+
+The verified adapter here is the synthetic TEST fake. VGAS-8 still needs deployed verification of ordered public text, sender/contact qualification and edit/attachment evidence. PR C owns the real generation and reservation caller, and PR D owns wiring, restricted/no-match routing, and labelled semantic evaluation. Live smoke remains `OWNER_AUTHORIZATION_REQUIRED`. This slice made no live provider, embedding, or Chatwoot calls.
+
+Independent exact-head review and hosted CI are pending with the orchestrator. Merge status is `NOT_VERIFIED_FOR_MERGE`.
