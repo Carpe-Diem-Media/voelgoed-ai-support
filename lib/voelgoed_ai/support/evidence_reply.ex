@@ -79,13 +79,14 @@ defmodule VoelgoedAi.Support.EvidenceReply do
   @between_join ~r/\A\h+(?:and|en)\h+\z/iu
   @range_join ~r/\A(?:\h*[\p{Pd}−]\h*|\h+(?:to|through|until|till|tot(?:\h+en\h+met)?)\h+)\z/iu
   @horizontal_gap ~r/\A\h*\z/u
+  @clock_subdivisions ~S"\p{N}{2}(?::\p{N}{2})?(?:[.,]\p{N}+)?"
   @meridiem ~S"(?:am|pm|vm|nm|[apvn]\.m\.?)"
   @utc_offset ~S"[-+−]\p{N}{2}:?\p{N}{2}"
   @zone "(?:(?:UTC|GMT|SAST|CAT|Z)(?:\\h*#{@utc_offset})?|#{@utc_offset})"
   @clock ~r/
     (?<![\p{L}\p{M}\p{N}_])
     (?:#{@numeric_date}T)?#{@sign}?
-    (?:\p{N}{1,2}(?:[:.h]\p{N}{2}(?::\p{N}{2})?)?\h*#{@meridiem}|\p{N}{1,2}[:h]\p{N}{2}(?::\p{N}{2})?)
+    (?:\p{N}{1,2}(?:[:.h]#{@clock_subdivisions})?\h*#{@meridiem}|\p{N}{1,2}[:h]#{@clock_subdivisions})
     (?:\h*(?:#{@zone}|\(\h*#{@zone}\h*\)))*
     (?![\p{L}\p{M}\p{N}_])
   /iux

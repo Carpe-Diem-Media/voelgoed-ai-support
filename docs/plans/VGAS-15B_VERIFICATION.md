@@ -288,8 +288,27 @@ The four-file focused suite above passed 310 tests at seed 0 on disposable
 PostgreSQL 18.7 and pgvector 0.8.7. The database identity check, format,
 strict TEST compilation and snapshot check exited 0. Both disposable runs
 removed their containers and volumes. Strict DEV compilation exited 1 with
-the same 17 inherited application warnings tracked in VGAS-19. Hosted CI
-and independent review are pending on the corrected candidate.
+the same 17 inherited application warnings tracked in VGAS-19. The
+[Application CI run for `5c14dda`](https://github.com/Carpe-Diem-Media/voelgoed-ai-support/actions/runs/45976825753)
+passed all 16 workflow jobs. The optional Proof check was skipped.
+Independent review confirmed the room number and timezone correction
+on the exact merge tree with 311 focused tests and 41 clock and link
+checks. It also found that masking a clock before matching quantities
+separated fractional seconds from the clock. Citing a stand-alone
+reference number could then authorize an altered fraction.
+
+Both bilingual fraction substitutions reproduced the defect on `5c14dda`
+with exit 2. The clock matcher now keeps the comma or period fraction
+inside the clock span. In the corrected run, the substitutions produced
+zero writes. The cited English form persisted in shadow with zero writes.
+The cited Afrikaans form reached the fake transport once across replay.
+
+The four-file focused run passed 314 tests at seed 0 on disposable
+PostgreSQL 18.7 with pgvector 0.8.7. Database identity, formatting, strict
+TEST compilation and Ash snapshot checks exited 0. Both runs removed
+their containers and volumes. Strict DEV and PROD compilation each
+exited 1 with the same 17 warnings that the independent reviewer
+verified on main. VGAS-19 tracks those warnings.
 
 ## Release gates
 

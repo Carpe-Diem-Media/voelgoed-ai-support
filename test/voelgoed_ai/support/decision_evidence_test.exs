@@ -55,23 +55,30 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
     end)
   end
 
-  test "grounded dispatch preserves a cited room number and zoned clock on replay" do
-    ctx = prepare(:grounded)
+  for {label, reply} <- [
+        {"room number and zoned clock", "Kamer 731 09:00 (UTC)."},
+        {"clock with fractional seconds", "Die sein begin om 09:00:00,123."}
+      ] do
+    @reply reply
 
-    with_ranked(ctx, fn target ->
-      reply = "Kamer 731 09:00 (UTC)."
+    test "grounded dispatch preserves a cited #{label} on replay" do
+      ctx = prepare(:grounded)
 
-      assert {:ok, delivery} =
-               RunProcessing.complete_evidence_fixture(
-                 ctx.claim,
-                 proposal(target, "answer_grounded", reply),
-                 [target.citation_id]
-               )
+      with_ranked(ctx, fn target ->
+        reply = @reply
 
-      assert :ok = Deliver.perform(job(delivery.id))
-      assert :ok = Deliver.perform(job(delivery.id))
-      assert [{:reply, _, ^reply, _}] = SupportDBCase.writes(ctx.support)
-    end)
+        assert {:ok, delivery} =
+                 RunProcessing.complete_evidence_fixture(
+                   ctx.claim,
+                   proposal(target, "answer_grounded", reply),
+                   [target.citation_id]
+                 )
+
+        assert :ok = Deliver.perform(job(delivery.id))
+        assert :ok = Deliver.perform(job(delivery.id))
+        assert [{:reply, _, ^reply, _}] = SupportDBCase.writes(ctx.support)
+      end)
+    end
   end
 
   for {label, text} <- [
@@ -214,6 +221,11 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
          %{"af-ZA" => "Kamer 731 09:00 (SAST).", "en-ZA" => "Room 731 09:00 (SAST)."}},
         {"room number before a zoned clock",
          %{"af-ZA" => "Kamer 991 09:00 (UTC).", "en-ZA" => "Room 991 09:00 (UTC)."}},
+        {"clock with fractional seconds borrowed from a reference number",
+         %{
+           "af-ZA" => "Die sein begin om 09:00:00,456.",
+           "en-ZA" => "The signal starts at 09:00:00.456."
+         }},
         {"zone with an attached offset",
          %{
            "af-ZA" => "Die sessie begin 09:00 UTC+02:00.",
@@ -284,6 +296,7 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
         {"signed clock", "The adjusted time is −9am."},
         {"parenthesized zone", "The session starts 09:00 (UTC)."},
         {"enclosed zone after a room number", "Room 731 09:00 (UTC)."},
+        {"clock with fractional seconds", "The signal starts at 09:00:00.123."},
         {"zone and its offset", "The broadcast starts 07:00 GMT+01:00."},
         {"ISO date and clock", "The appointment is 2026-12-15T09:00Z."}
       ] do
@@ -766,7 +779,8 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "Die kantoor open om 9vm, oftewel 9am. Die toonbank sluit om 5pm. " <>
                       "Die aangepaste tyd is −9vm. Die sessie begin 09:00 (UTC). " <>
                       "Die regstreekse uitsending begin 09:00 UTC. Die tydsverskil is +02:00. " <>
-                      "Die afspraak is 2026-12-15T09:00Z. Kamer 731 09:00 (UTC)."
+                      "Die afspraak is 2026-12-15T09:00Z. Kamer 731 09:00 (UTC). " <>
+                      "Die sein begin om 09:00:00,123. Die verwysing is 456."
 
                   "en-ZA" ->
                     "Tickets cost R25 per person. There are 25 places. Late bookings cost 40 rand. " <>
@@ -788,7 +802,8 @@ defmodule VoelgoedAi.Support.DecisionEvidenceTest do
                       "The desk closes at 5pm. The reception is open from 7am to 4pm. " <>
                       "The adjusted time is −9am. The session starts 09:00 (UTC). " <>
                       "The livestream starts 09:00 UTC. The time offset is +02:00. " <>
-                      "The broadcast starts 07:00 GMT+01:00. The appointment is 2026-12-15T09:00Z. Room 731 09:00 (UTC)."
+                      "The broadcast starts 07:00 GMT+01:00. The appointment is 2026-12-15T09:00Z. " <>
+                      "Room 731 09:00 (UTC). The signal starts at 09:00:00.123. The reference is 456."
                 end
 
               Map.put(variant, "approved_answer", answer)
