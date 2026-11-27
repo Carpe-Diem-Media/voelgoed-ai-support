@@ -42,7 +42,9 @@ criteria and the controlling addendum.
   logs. The existing fixture-volume timing checks still report projected
   statistics. The boot inventory enumerates every attached handler with
   `:telemetry.list_handlers([])`, so no exporter or unreviewed subscriber
-  on any event is registered at application boot.
+  on any event is registered when the application boots under TEST. Handlers
+  attached only by PROD or runtime configuration, or by a release, are not
+  covered by this test. VGAS-8 and VGAS-24 own exporter review for those.
 - PostgreSQL 18.7 with pgvector 0.8.7 had `logging_collector=off`,
   `log_statement=none`, `log_min_error_statement=error`,
   `log_parameter_max_length=-1` and `log_parameter_max_length_on_error=0`.

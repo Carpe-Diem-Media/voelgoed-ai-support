@@ -90,7 +90,9 @@ channel join and message, endpoint, router and error rendering, plus
 LiveView and live component spans including exceptions. The reviewed
 framework loggers honour staff log suppression or the primary crash
 filter. The inventory enumerates every attached handler, not selected prefixes,
-so any Repo, Oban, application or exporter subscriber fails it. The
+so any Repo, Oban, application or exporter subscriber attached in the TEST
+boot fails it. Handlers added only by PROD or runtime configuration need the
+same review before deployment. The
 VGAS-21 base has no steady-state subscriber outside the reviewed framework
 loggers.
 
