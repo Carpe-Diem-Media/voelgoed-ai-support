@@ -519,3 +519,37 @@ retained its local handoff. All disposable containers and volumes were
 removed. Strict DEV and PROD compiles each exited 1 at the same 17
 inherited VGAS-19 warning sites. Hosted exact-head CI and independent
 review remain pending.
+
+### Follow-up on dictionary normalization and message contact scope
+
+Independent review at `927a4f1` reproduced an approved FAQ followed by
+a 1,600-byte token that became 2,400 bytes in the simple dictionary. It
+also reproduced a matching history envelope with a different contact
+on the public message and an unavailable conversation observation.
+Both signed-worker tests failed before this correction with ExUnit
+exit 2.
+
+The shadow preflight checks raw tokens and normalized lexemes using
+the same PostgreSQL configuration as ranking. It checks both current
+text and any explicit prior topic before either can lose a token in
+the coverage query. This check applies even when the original text
+is shorter than the lexeme byte limit.
+[PostgreSQL 18.7 text search parser](https://github.com/postgres/postgres/blob/REL_18_7/src/backend/tsearch/ts_parse.c#L361-L403)
+
+History projection now preserves a mismatched contact on a contact
+message as a scope denial. With observation unavailable, the denial
+authorizes no staff intent. A fresh qualifying observation continues
+to permit the existing local triage path. The scope boundary applies
+before exposing any history text to retrieval or generation.
+
+The same five-check command set immediately above exited 0 on
+disposable PostgreSQL 18.7 and pgvector 0.8.7. The focused suite
+passed 283 tests with the smoke excluded. The normalized oversized
+query routed locally with no inference or external writes. The
+message-level contact mismatch and outage retained zero staff
+intents across replay and Sweep. The earlier raw-token and
+envelope-denial cases and the verified-observation handoff control
+also passed. The runner removed both runs' containers and volumes.
+Strict DEV and PROD compiles each reproduced the 17 inherited
+VGAS-19 warning sites. Hosted CI and independent review are pending
+on the correction.

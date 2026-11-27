@@ -294,7 +294,10 @@ defmodule VoelgoedAi.Support.ShadowDecisionTest do
   end
 
   test "history rejects cross-contact and unverified sender roles" do
-    for attrs <- [[contact_id: 6], [sender: :unknown], [sender: :bot, contact_id: nil]] do
+    assert {:error, :scope_denied} =
+             DecisionContext.project([text_row(1, "Hello", contact_id: 6)], [1], 5)
+
+    for attrs <- [[sender: :unknown], [sender: :bot, contact_id: nil]] do
       assert {:error, :history_changed} =
                DecisionContext.project([text_row(1, "Hello", attrs)], [1], 5)
     end

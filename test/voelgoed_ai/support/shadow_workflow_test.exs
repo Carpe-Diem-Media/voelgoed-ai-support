@@ -70,6 +70,19 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
     end
   end
 
+  test "a token that outgrows the lexeme limit after normalization routes locally" do
+    ctx = setup_faq(:en, "exact")
+    # PostgreSQL lowercases Ⱥ (two bytes) to ⱥ (three bytes).
+    id = queue(ctx, question(:en) <> " " <> String.duplicate("Ⱥ", 800))
+    configure(ctx)
+
+    assert :ok = perform(id)
+    assert {"handoff", "missing_evidence", []} = outcome(run(id))
+    assert_usage(id, 0, 0, :exact)
+    assert_local_handoff(ctx)
+    assert_no_writes(ctx)
+  end
+
   test "a qualified public follow-up uses the preceding contact topic" do
     ctx = setup_faq(:en, "grounded", decoy: &decoy/1)
     text = "And the FAQ?"
@@ -176,6 +189,26 @@ defmodule VoelgoedAi.Support.ShadowWorkflowTest do
 
     Agent.update(ctx.support.fake, fn state ->
       Map.merge(state, %{text_contact: 6, conversation_result: {:error, :unavailable}})
+    end)
+
+    assert :ok = perform(id)
+    assert {:failed, :scope_denied, []} = outcome(run(id))
+    assert :ok = perform(id)
+    assert :ok = Sweep.perform(job("run_id", id))
+    assert %{rows: []} = SupportDBCase.delivery_rows(ctx.support, "id")
+    assert_usage(id, 0, 0, :exact)
+    assert_no_writes(ctx)
+  end
+
+  test "an observation outage cannot override a message contact mismatch" do
+    ctx = setup_faq(:en, "grounded")
+    id = queue(ctx, question(:en))
+    configure(ctx)
+
+    Agent.update(ctx.support.fake, fn state ->
+      state
+      |> put_in([:decision_messages, ctx.support.event.message_id, :contact_id], 6)
+      |> Map.put(:conversation_result, {:error, :unavailable})
     end)
 
     assert :ok = perform(id)

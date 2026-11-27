@@ -343,16 +343,20 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       end
     end
 
-    # PostgreSQL drops lexemes at its byte limit. Check the raw parser
-    # tokens before the tsvector can erase part of either question.
-    defp check_shadow_lexemes(%{shadow_query: query, prior_query: prior})
-         when byte_size(query) >= @lexeme_byte_limit or byte_size(prior) >= @lexeme_byte_limit do
+    # PostgreSQL can drop a token before or after dictionary normalization.
+    # Check both forms using the ranker's configuration before building a vector.
+    defp check_shadow_lexemes(%{shadow_query: query, prior_query: prior}) do
       statement = """
       SELECT EXISTS (
         SELECT 1
         FROM unnest(ARRAY[$1::text, $2::text]) AS input(text)
-        CROSS JOIN LATERAL ts_parse('default', input.text) AS parsed
+        CROSS JOIN LATERAL ts_debug('simple', input.text) AS parsed
         WHERE octet_length(parsed.token) >= $3
+           OR EXISTS (
+             SELECT 1
+             FROM unnest(parsed.lexemes) AS normalized(lexeme)
+             WHERE octet_length(normalized.lexeme) >= $3
+           )
       )
       """
 

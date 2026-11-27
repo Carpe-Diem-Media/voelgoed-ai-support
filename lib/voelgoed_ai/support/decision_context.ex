@@ -22,11 +22,12 @@ defmodule VoelgoedAi.Support.DecisionContext do
 
   @doc "Project a verified ordered history with the current turn as its suffix."
   @spec project(term(), [pos_integer()], pos_integer()) ::
-          {:ok, t()} | {:error, :history_changed}
+          {:ok, t()} | {:error, :history_changed | :scope_denied}
   def project(messages, current_ids, contact)
       when is_list(messages) and length(messages) <= @max_history and is_list(current_ids) and
              length(current_ids) in 1..@max_current and is_integer(contact) and contact > 0 do
-    with true <- Enum.all?(messages, &qualified?(&1, contact)),
+    with :ok <- check_contact_scope(messages, contact),
+         true <- Enum.all?(messages, &qualified?(&1, contact)),
          true <- unique_ids?(messages),
          {earlier, current} <- Enum.split(messages, -length(current_ids)),
          true <- Enum.sort(Enum.map(current, & &1.id)) == Enum.sort(current_ids),
@@ -40,11 +41,23 @@ defmodule VoelgoedAi.Support.DecisionContext do
 
       {:ok, %__MODULE__{prior: public(prior), current: public(current), commitment: commitment}}
     else
+      {:error, :scope_denied} = denial -> denial
       _ -> {:error, :history_changed}
     end
   end
 
   def project(_, _, _), do: {:error, :history_changed}
+
+  # Keep a definite contact denial distinct from an edit, missing input or
+  # other history drift. An observation outage cannot qualify local triage.
+  defp check_contact_scope(messages, contact) do
+    if Enum.any?(messages, fn
+         %TextMessage{sender: :contact, contact_id: id} -> id != contact
+         _ -> false
+       end),
+       do: {:error, :scope_denied},
+       else: :ok
+  end
 
   defp qualified?(
          %TextMessage{visibility: :public, edited?: false, attachments?: false} = row,
