@@ -125,6 +125,10 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
   end
 
   def tls_join(cookie, csrf, topic, payload) do
+    with_tls_socket(cookie, csrf, &tls_message(&1, "1", topic, "phx_join", payload))
+  end
+
+  def with_tls_socket(cookie, csrf, run) do
     {:ssl, socket} = connect(:https)
 
     try do
@@ -134,14 +138,17 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
       {:ok, {:http_response, _, 101, _}} = :ssl.recv(socket, 0, 5_000)
       :ok = receive_upgrade_headers(socket)
       :ok = :ssl.setopts(socket, packet: :raw)
-
-      join = Jason.encode!(["1", "1", topic, "phx_join", payload])
-      {:ok, frame} = WebSockex.Frame.encode_frame({:text, join})
-      :ok = :ssl.send(socket, frame)
-      receive_text_frame(socket, "") |> Jason.decode!()
+      run.(socket)
     after
       :ssl.close(socket)
     end
+  end
+
+  def tls_message(socket, ref, topic, event, payload) do
+    message = Jason.encode!(["1", ref, topic, event, payload])
+    {:ok, frame} = WebSockex.Frame.encode_frame({:text, message})
+    :ok = :ssl.send(socket, frame)
+    receive_reply(socket, ref, "")
   end
 
   defp receive_upgrade_headers(socket) do
@@ -151,14 +158,19 @@ defmodule VoelgoedAi.StaffKnowledgeFixture do
     end
   end
 
-  defp receive_text_frame(socket, buffer) do
+  defp receive_reply(socket, ref, buffer) do
     case WebSockex.Frame.parse_frame(buffer) do
-      {:ok, {:text, text}, _rest} ->
-        text
+      {:ok, {:text, text}, rest} ->
+        case Jason.decode!(text) do
+          [_, ^ref, _, "phx_reply", _] = reply -> reply
+          _ -> receive_reply(socket, ref, rest)
+        end
 
       :incomplete ->
-        {:ok, more} = :ssl.recv(socket, 0, 5_000)
-        receive_text_frame(socket, buffer <> more)
+        case :ssl.recv(socket, 0, 5_000) do
+          {:ok, more} -> receive_reply(socket, ref, buffer <> more)
+          {:error, reason} -> {:error, reason}
+        end
     end
   end
 

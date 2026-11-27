@@ -8,7 +8,9 @@ defmodule VoelgoedAiWeb.StaffKnowledgePortableTest do
   import VoelgoedAi.StaffKnowledgeFixture
   import VoelgoedAi.SupportFixtures, only: [invoke: 4]
 
-  alias VoelgoedAi.Knowledge.{Article, ArticleRevision, Content}
+  alias Ecto.Adapters.SQL
+  alias VoelgoedAi.Repo
+  alias VoelgoedAi.Knowledge.{Article, ArticleRevision, Content, KnowledgeCollection}
   alias VoelgoedAiWeb.Endpoint
 
   @endpoint Endpoint
@@ -49,13 +51,31 @@ defmodule VoelgoedAiWeb.StaffKnowledgePortableTest do
     scope(ctx, hidden)
     draft = draft_revision(ctx, hidden)
     scope(ctx, row)
+    args = %{draft_args(ctx, row) | article_ref: "allowed-" <> alphabetic_suffix(row.slug)}
+    assert {:ok, %{revision: allowed}} = invoke(Article, :create_draft, args, ctx.editor)
 
     forbidden_collection = export(ctx.reviewer, hidden.id, [draft.article_id])
     unknown_collection = export(ctx.reviewer, Ash.UUIDv7.generate(), [draft.article_id])
 
     assert forbidden_collection.status == 401
     assert forbidden_collection.resp_body == unknown_collection.resp_body
-    assert export(ctx.reviewer, row.id, [draft.article_id]).status == 401
+
+    for {actor, collection_id, article_ids} <- [
+          {ctx.reviewer, row.id, [draft.article_id]},
+          {ctx.reviewer, row.id, [allowed.article_id, draft.article_id]},
+          {ctx.editor, row.id, [allowed.article_id]}
+        ] do
+      denied = export(actor, collection_id, article_ids)
+      assert denied.status == 401
+      assert denied.resp_body == forbidden_collection.resp_body
+      assert get_resp_header(denied, "content-disposition") == []
+    end
+
+    scope(ctx, hidden)
+    withdrawn = export(ctx.reviewer, row.id, [allowed.article_id])
+    assert withdrawn.status == 401
+    assert withdrawn.resp_body == forbidden_collection.resp_body
+    assert get_resp_header(withdrawn, "content-disposition") == []
   end
 
   test "export fails closed on a bad CSRF token and over-limit body without logging inputs",
@@ -103,6 +123,123 @@ defmodule VoelgoedAiWeb.StaffKnowledgePortableTest do
              invoke(ArticleRevision, :list_revisions, %{article_id: draft.article_id}, ctx.editor)
 
     assert id == draft.id
+  end
+
+  test "direct preview and apply accept and preserve a bilingual timestamp draft", ctx do
+    row = collection(ctx)
+    doc = timestamp_document(row)
+    bytes = Jason.encode!(doc)
+    args = %{id: row.id, document: bytes}
+
+    preview = invoke(KnowledgeCollection, :preview_import, args, ctx.editor)
+    assert_empty_collection(ctx, row)
+
+    apply = invoke(KnowledgeCollection, :apply_import, args, ctx.editor)
+
+    outcomes =
+      Enum.map([preview, apply], fn result ->
+        if match?({:ok, %{articles: [%{outcome: :create}]}}, result),
+          do: :accepted,
+          else: :rejected
+      end)
+
+    assert outcomes == [:accepted, :accepted], "direct timestamp preview and apply"
+    assert_timestamp_export(ctx, row, doc)
+  end
+
+  test "timestamp upload previews without exposing prose and exports the exact draft", ctx do
+    row = collection(ctx)
+    doc = timestamp_document(row)
+    assert {:ok, view, _} = open_import(ctx, row)
+    assert render_upload(upload(view, Jason.encode!(doc)), "draft.json") =~ "Preview file"
+    preview = render_submit(form(view, "#import-upload"))
+    assert String.contains?(preview, "New article and draft"), "timestamp upload preview"
+    refute String.contains?(preview, "2026-01-01 10:00"), "preview disclosed answer text"
+    assert_empty_collection(ctx, row)
+
+    assert render_submit(form(view, "#apply-import", %{"confirm" => "true"})) =~
+             "Draft import complete."
+
+    assert_timestamp_export(ctx, row, doc)
+  end
+
+  test "direct and uploaded batches reject sensitive patterns and mailbox formats atomically",
+       ctx do
+    row = collection(ctx)
+    doc = Jason.decode!(document(row))
+    [valid] = doc["articles"]
+    marker = "synthetic-rejected-content-probe"
+    mailbox = "From: sender@example.test\r\nSubject: #{marker}\r\n\r\nSynthetic message."
+    envelope = Map.put(doc, "mailbox_message", %{"body" => marker})
+    audit_before = knowledge_audit_count(ctx)
+
+    documents =
+      Enum.map(
+        [
+          email: "nobody@example.test",
+          international: "+27 00 000 0000",
+          domestic: "000 000 0000",
+          identifier: "0000000000000",
+          mixed: "2026-01-01 10:00. Contact nobody@example.test."
+        ],
+        fn {label, answer} ->
+          content =
+            put_in(
+              valid["content"],
+              ["localized_content", Access.at(0), "approved_answer"],
+              marker <> " " <> answer
+            )
+
+          rejected = %{
+            valid
+            | "article_ref" => "rejected-ref",
+              "slug" => "rejected-slug",
+              "content" => content,
+              "source_content_hash" => Content.hash(content)
+          }
+
+          {label, Jason.encode!(%{doc | "articles" => [valid, rejected]})}
+        end
+      )
+
+    documents =
+      documents ++
+        [
+          {:sensitive_ref,
+           Jason.encode!(put_in(doc, ["articles", Access.at(0), "article_ref"], "ref-0000000000"))},
+          {:mailbox, mailbox},
+          {:email_envelope, Jason.encode!(envelope)}
+        ]
+
+    log =
+      ExUnit.CaptureLog.capture_log([level: :debug, metadata: :all], fn ->
+        for {label, bytes} <- documents do
+          for action <- [:preview_import, :apply_import] do
+            result =
+              invoke(KnowledgeCollection, action, %{id: row.id, document: bytes}, ctx.editor)
+
+            assert match?({:error, _}, result), "direct #{label} #{action} accepted"
+            {:error, error} = result
+            message = Exception.message(error)
+
+            assert String.contains?(message, "invalid_portable_document"),
+                   "direct #{label} #{action} returned the wrong denial"
+
+            refute String.contains?(message, marker), "direct #{label} #{action} disclosed input"
+          end
+
+          assert {:ok, view, _} = open_import(ctx, row)
+          assert render_upload(upload(view, bytes), "draft.json") =~ "Preview file"
+          result = render_submit(form(view, "#import-upload"))
+          assert String.contains?(result, "could not be imported"), "upload accepted #{label}"
+          refute String.contains?(result, marker), "upload disclosed #{label}"
+          refute has_element?(view, "#apply-import")
+        end
+      end)
+
+    refute String.contains?(log, marker), "rejected content entered logs"
+    assert_empty_collection(ctx, row)
+    assert knowledge_audit_count(ctx) == audit_before
   end
 
   test "an import creates drafts and rejects imported authority", ctx do
@@ -262,6 +399,61 @@ defmodule VoelgoedAiWeb.StaffKnowledgePortableTest do
     assert render_upload(upload(view, bytes), "draft.json") =~ "Preview file"
     assert render_submit(form(view, "#import-upload")) =~ "Import preview"
     render_submit(form(view, "#apply-import", %{"confirm" => "true"}))
+  end
+
+  defp knowledge_audit_count(ctx) do
+    %{rows: [[count]]} =
+      SQL.query!(
+        Repo,
+        "SELECT count(*) FROM audit_events WHERE actor_staff_id::text = $1 AND target_kind LIKE 'knowledge_%'",
+        [ctx.editor.id]
+      )
+
+    count
+  end
+
+  defp assert_empty_collection(ctx, row) do
+    result = invoke(Article, :list_articles, %{collection_id: row.id}, ctx.editor)
+    assert match?({:ok, %{items: []}}, result), "unexpected imported article"
+  end
+
+  defp assert_timestamp_export(ctx, row, doc) do
+    result = invoke(Article, :list_articles, %{collection_id: row.id}, ctx.editor)
+    assert match?({:ok, %{items: [%{current_revision_id: nil}]}}, result), "draft-only import"
+    {:ok, %{items: [%{id: article_id}]}} = result
+
+    revisions = invoke(ArticleRevision, :list_revisions, %{article_id: article_id}, ctx.editor)
+    assert match?({:ok, %{items: [%{status: :draft}]}}, revisions), "single draft revision"
+
+    conn = export(ctx.reviewer, row.id, [article_id])
+    assert conn.status == 200
+    assert get_resp_header(conn, "cache-control") == ["private, no-store"]
+    assert Jason.decode!(conn.resp_body) === doc, "export differs from canonical content or hash"
+  end
+
+  defp timestamp_document(row) do
+    doc = Jason.decode!(document(row))
+    [entry] = doc["articles"]
+
+    content =
+      update_in(entry["content"]["localized_content"], fn locales ->
+        Enum.map(locales, fn locale ->
+          answer =
+            case locale["locale"] do
+              "af-ZA" -> "Beskikbaar op (2026-01-01 10:00)."
+              "en-ZA" -> "Available on (2026-01-01 10:00)."
+            end
+
+          %{locale | "approved_answer" => answer}
+        end)
+      end)["content"]
+
+    %{
+      doc
+      | "articles" => [
+          %{entry | "content" => content, "source_content_hash" => Content.hash(content)}
+        ]
+    }
   end
 
   defp document(row) do

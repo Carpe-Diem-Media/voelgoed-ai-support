@@ -2,7 +2,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
   use ExUnit.Case, async: false
 
   import VoelgoedAi.KnowledgeFixtures
-  import ExUnit.CaptureLog, only: [capture_log: 1]
+  import ExUnit.CaptureLog, only: [capture_log: 2]
   import VoelgoedAi.SupportFixtures, only: [invoke: 4, blocked_task: 1, assert_blocked_by: 2]
 
   alias Ecto.Adapters.SQL
@@ -44,7 +44,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
 
     try do
       logs =
-        capture_log(fn ->
+        capture_log([level: :debug, metadata: :all], fn ->
           SQL.query!(Repo, "SELECT 9123 AS harmless_query_control")
           assert_received {:repo_query, :control}
 
@@ -67,10 +67,73 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       refute_received {:repo_query, :retrieval}
       refute_received {:repo_query, :sentinel}
       refute String.contains?(logs, sentinel)
-      refute String.contains?(logs, ["WITH eligible AS MATERIALIZED", "tsvector_to_array"])
+
+      refute String.contains?(logs, [
+               "WITH eligible AS MATERIALIZED",
+               "tsvector_to_array",
+               "SET LOCAL statement_timeout = '750ms'",
+               "Synthetic answer."
+             ]),
+             "private retrieval SQL or result entered logs"
     after
       :telemetry.detach(handler)
     end
+  end
+
+  test "an actual PostgreSQL statement timeout returns unavailable without raw Repo diagnostics" do
+    ctx = setup_search()
+    sentinel = "syntheticretrievaltimeout"
+
+    logs =
+      capture_log([level: :debug, metadata: :all], fn ->
+        assert {:ok, :ok} =
+                 Repo.transaction(fn ->
+                   SQL.query!(Repo, "LOCK TABLE article_embeddings IN ACCESS EXCLUSIVE MODE")
+
+                   task =
+                     blocked_task(fn ->
+                       handler = {__MODULE__, make_ref()}
+
+                       :ok =
+                         :telemetry.attach(
+                           handler,
+                           [:voelgoed_ai, :repo, :query],
+                           &__MODULE__.classify_query_event/4,
+                           {self(), sentinel}
+                         )
+
+                       try do
+                         SQL.query!(Repo, "SELECT 9123 AS harmless_query_control")
+                         assert_received {:repo_query, :control}
+
+                         result =
+                           Retrieval.with_fixture(ctx.claim, fn search, _ ->
+                             Knowledge.search_published("FAQ " <> sentinel, actor: search)
+                           end)
+
+                         assert match?({:ok, %{status: :unavailable, evidence: []}}, result),
+                                "retrieval did not return a safe timeout result"
+
+                         refute_received {:repo_query, :retrieval}
+                         refute_received {:repo_query, :sentinel}
+                         :ok
+                       after
+                         :telemetry.detach(handler)
+                       end
+                     end)
+
+                   Task.await(task, 5_000)
+                 end)
+      end)
+
+    refute String.contains?(logs, [
+             sentinel,
+             "WITH eligible AS MATERIALIZED",
+             "tsvector_to_array",
+             "query_canceled",
+             "Synthetic answer."
+           ]),
+           "private retrieval timeout entered logs"
   end
 
   @doc false

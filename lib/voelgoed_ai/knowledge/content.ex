@@ -11,7 +11,9 @@ defmodule VoelgoedAi.Knowledge.Content do
   @locales ["af-ZA", "en-ZA"]
   @source_kinds ["document", "sharepoint", "git", "website"]
   @identifier ~r/\A[a-zA-Z0-9][a-zA-Z0-9._:-]{0,79}\z/
-  @pii ~r/[^\s@]+@[^\s@]+\.[^\s@]+|(?:\+?\d[ .()\-]?){10,}/u
+  @email ~r/[^\s@]+@[^\s@]+\.[^\s@]+/u
+  @contact_digits ~r/(?:\+?\d[ .()\-]?){10,}/u
+  @minute_timestamp ~r/(?<![\p{L}\p{N}_:+-])(?<!\d[ .()\-])([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2})(?![\p{L}\p{N}_:+-]|[ .()\-]\+?\d)/u
   @hash_version 1
 
   def parse(input) do
@@ -155,14 +157,15 @@ defmodule VoelgoedAi.Knowledge.Content do
   defp value(:boolean, item) when is_boolean(item), do: {:ok, item}
 
   defp value(:identifier, text) when is_binary(text) and byte_size(text) in 1..80 do
-    if Regex.match?(@identifier, text) and not Regex.match?(@pii, text),
+    if Regex.match?(@identifier, text) and not Regex.match?(@contact_digits, text),
       do: {:ok, text},
       else: :error
   end
 
   defp value({:text, max}, text) when is_binary(text) and byte_size(text) in 1..max//1 do
     if String.valid?(text) and String.trim(text) != "" and not String.contains?(text, <<0>>) and
-         not Regex.match?(@pii, text),
+         not Regex.match?(@email, text) and
+         not Regex.match?(@contact_digits, mask_timestamps(text)),
        do: {:ok, text},
        else: :error
   end
@@ -191,6 +194,18 @@ defmodule VoelgoedAi.Knowledge.Content do
   end
 
   defp value(_, _), do: :error
+
+  defp mask_timestamps(text) do
+    # Break digit runs in the scan copy only. The original bytes are hashed and stored.
+    Regex.replace(@minute_timestamp, text, fn original, date, time ->
+      with {:ok, _} <- Date.from_iso8601(date),
+           {:ok, _} <- Time.from_iso8601(time <> ":00") do
+        "|"
+      else
+        _ -> original
+      end
+    end)
+  end
 
   @doc false
   def public_link_allowed?(text), do: text in public_link_fixture()

@@ -15,29 +15,6 @@ defmodule VoelgoedAiWeb.StaffKnowledgeAuthTest do
     VoelgoedAi.StaffFixtures.setup()
   end
 
-  test "only the pinned framework loggers can handle staff socket and LiveView telemetry" do
-    # list_handlers/1 matches the whole prefix. This includes mount,
-    # handle_params, handle_event, render and component update spans with
-    # start/stop/exception suffixes, plus the component destroyed event.
-    # New subscribers fail CI until their handling of sensitive metadata is reviewed.
-    for prefix <- [
-          [:phoenix, :socket_connected],
-          [:phoenix, :channel_joined],
-          [:phoenix, :channel_handled_in],
-          [:phoenix, :endpoint],
-          [:phoenix, :router_dispatch],
-          [:phoenix, :error_rendered],
-          [:phoenix, :live_view],
-          [:phoenix, :live_component]
-        ],
-        handler <- :telemetry.list_handlers(prefix) do
-      %{id: id, event_name: event, function: callback} = handler
-
-      assert allowed_logger?(id, event, callback),
-             "Unreviewed telemetry handler for #{inspect(event)}"
-    end
-  end
-
   test "the TLS upgrade requires current staff, same origin and cookie-backed CSRF", %{
     admin: identity
   } do
@@ -82,6 +59,21 @@ defmodule VoelgoedAiWeb.StaffKnowledgeAuthTest do
     denied = StaffEntraFixture.request(:get, "/staff/knowledge")
     assert denied.status == 401
     assert get_resp_header(denied, "cache-control") == ["private, no-store"]
+
+    for path <- [
+          "/staff/entra",
+          "/staff/entra/callback",
+          "/staff/session",
+          "/staff/knowledge/import",
+          "/staff/knowledge/denied",
+          "/staff/assets/knowledge.js"
+        ] do
+      assert https_status(path, [{"Cookie", "_vgas_staff=" <> cookie}]) in [401, 404]
+    end
+
+    export_path = "/staff/knowledge/collections/#{Ash.UUIDv7.generate()}/export"
+    body = URI.encode_query(%{"_csrf_token" => csrf})
+    assert https_post_status(export_path, cookie, body) == 401
   end
 
   test "a current support-only session is denied by HTTP, TLS and connected mount", ctx do
@@ -205,35 +197,4 @@ defmodule VoelgoedAiWeb.StaffKnowledgeAuthTest do
       assert StaffEntraFixture.request(:get, "/staff/assets/#{name}").status == 404
     end
   end
-
-  defp allowed_logger?({Phoenix.Logger, event}, event, callback) do
-    {event, callback} in [
-      {[:phoenix, :socket_connected], &Phoenix.Logger.phoenix_socket_connected/4},
-      {[:phoenix, :channel_joined], &Phoenix.Logger.phoenix_channel_joined/4},
-      {[:phoenix, :channel_handled_in], &Phoenix.Logger.phoenix_channel_handled_in/4},
-      {[:phoenix, :endpoint, :start], &Phoenix.Logger.phoenix_endpoint_start/4},
-      {[:phoenix, :endpoint, :stop], &Phoenix.Logger.phoenix_endpoint_stop/4},
-      {[:phoenix, :router_dispatch, :start], &Phoenix.Logger.phoenix_router_dispatch_start/4},
-      {[:phoenix, :error_rendered], &Phoenix.Logger.phoenix_error_rendered/4}
-    ]
-  end
-
-  defp allowed_logger?(
-         {Phoenix.LiveView.Logger, event},
-         [:phoenix, type, lifecycle, suffix] = event,
-         callback
-       ) do
-    {type, lifecycle, suffix, callback} in [
-      {:live_view, :mount, :start, &Phoenix.LiveView.Logger.lv_mount_start/4},
-      {:live_view, :mount, :stop, &Phoenix.LiveView.Logger.lv_mount_stop/4},
-      {:live_view, :handle_params, :start, &Phoenix.LiveView.Logger.lv_handle_params_start/4},
-      {:live_view, :handle_params, :stop, &Phoenix.LiveView.Logger.lv_handle_params_stop/4},
-      {:live_view, :handle_event, :start, &Phoenix.LiveView.Logger.lv_handle_event_start/4},
-      {:live_view, :handle_event, :stop, &Phoenix.LiveView.Logger.lv_handle_event_stop/4},
-      {:live_component, :handle_event, :start, &Phoenix.LiveView.Logger.lc_handle_event_start/4},
-      {:live_component, :handle_event, :stop, &Phoenix.LiveView.Logger.lc_handle_event_stop/4}
-    ]
-  end
-
-  defp allowed_logger?(_id, _event, _callback), do: false
 end

@@ -81,6 +81,41 @@ Reverting the web change removes the workspace and preserves knowledge
 records and audit history. Use the existing domain procedures for revocation
 or publication recovery.
 
+## Telemetry subscribers and export
+
+The pinned Phoenix and LiveView emitters can build metadata that contains
+staff data. The synchronous telemetry inventory test lists the reviewed
+event, handler ID and callback tuples. It covers Phoenix socket connect,
+channel join and message, endpoint, router and error rendering, plus
+LiveView and live component spans including exceptions. The reviewed
+framework loggers honour staff log suppression or the primary crash
+filter. The inventory enumerates every attached handler, not selected prefixes,
+so any Repo, Oban, application or exporter subscriber attached in the TEST
+boot fails it. Handlers added only by PROD or runtime configuration need the
+same review before deployment. The
+VGAS-21 base has no steady-state subscriber outside the reviewed framework
+loggers.
+
+Staff denial emits a count, an enumerated reason and a generated correlation
+ID. Support alerts emit a count, typed state and reason, and internal record
+and correlation IDs. VGAS-8 owns any future subscriber or exporter. Before
+attaching one, review its exact event, ID and callback. Allowlist operation
+names, bounded reasons and measurements before forwarding. Drop raw
+connections, sockets, joins, exceptions, payloads, SQL, binds and results.
+Prove the filtering callback with synthetic metadata containing prohibited
+fields and check the serialized output and logs for their absence. Updating
+an event, dependency pin or handler requires updating the inventory and
+rerunning the negative attachment and capture tests.
+
+The private retrieval SQL calls suppress Ecto query events and logging
+independently. PostgreSQL and hosted collectors have separate log settings.
+An error or cancellation can log statement text on the server even with
+Ecto suppression. Review `log_statement`, `log_min_error_statement` and
+parameter logging, and run a synthetic cancellation check on the intended
+configuration before approval. Keep diagnostic exports limited to approved
+operational fields. The scoped reviewer export above carries selected
+editorial content and belongs in approved staff storage.
+
 ## VGAS-9 owner decisions
 
 Verify the real Entra identity and local role behavior, the trusted TLS
