@@ -1,10 +1,11 @@
 defmodule VoelgoedAi.Intelligence.GenerationTest do
   use ExUnit.Case, async: false
 
-  import VoelgoedAi.SupportFixtures, only: [invoke: 4, blocked_task: 1, assert_blocked_by: 2]
+  import VoelgoedAi.SupportFixtures,
+    only: [invoke: 4, blocked_task: 1, assert_blocked_by: 2, financial_decision: 4]
 
   alias Ecto.Adapters.SQL
-  alias VoelgoedAi.{Repo, SupportDBCase}
+  alias VoelgoedAi.{KnowledgeFixtures, Repo, SupportDBCase}
   alias VoelgoedAi.Governance.AutomationControl
   alias VoelgoedAi.Intelligence.{Embedding, Generation, InferenceRun, SupportProposal}
   alias VoelgoedAi.Support.{DecisionContext, Ingress, RunProcessing}
@@ -16,10 +17,19 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
 
   setup tags do
     if tags[:generation] do
-      support = SupportDBCase.setup(shadow: :af)
+      {support, extra} =
+        if tags[:vgas20_upgrade] do
+          knowledge = KnowledgeFixtures.setup_knowledge(%{embedding_index: true})
+
+          {SupportDBCase.setup(shadow: :af, staff: {knowledge, knowledge.admin, nil}),
+           %{knowledge: knowledge}}
+        else
+          {SupportDBCase.setup(shadow: :af), %{}}
+        end
+
       now = ~U[2031-01-31 23:59:50Z]
       Agent.update(support.fake, &%{&1 | now: now})
-      setup_turn(support, now)
+      Map.merge(setup_turn(support, now), extra)
     else
       :ok
     end
@@ -547,6 +557,373 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
   end
 
   @tag :generation
+  test "generation reset uses the caps approved for the tripped occurrence", ctx do
+    assert {:error, _} = generate(ctx, overage_options())
+    assert [[true, occurrence]] = inhibit_state(:generation)
+    assert is_binary(occurrence)
+    assert [[_, "settlement", actual, nil]] = ledger_identity(ctx)
+    assert actual == @ceiling + 500
+
+    owner = self()
+
+    wire = fn request ->
+      send(owner, :generation_wire)
+      response(request)
+    end
+
+    sibling = SupportDBCase.next_conversation(ctx.support, 1)
+    blocked = setup_turn(sibling, ctx.now)
+
+    {reset_task, admission_task} =
+      queue_reset_and_admission(ctx, occurrence, blocked, %{wire: wire})
+
+    assert {:error, _} = Task.await(reset_task)
+    assert {:error, _} = Task.await(admission_task)
+    refute_received :generation_wire
+    assert rows(blocked) == []
+    assert [[true, ^occurrence]] = inhibit_state(:generation)
+    assert reset_audits(occurrence) == 0
+
+    SupportDBCase.advance_clock(ctx.support, 15)
+    next = successor(ctx)
+
+    {reset_task, admission_task} =
+      queue_reset_and_admission(ctx, occurrence, next, %{overage_options() | wire: wire})
+
+    assert {:ok, %{lane: :generation, occurrence: ^occurrence}} = Task.await(reset_task)
+    assert {:ok, _} = Task.await(admission_task)
+    assert_received :generation_wire
+    assert [[false, nil]] = inhibit_state(:generation)
+    assert reset_audits(occurrence) == 1
+    assert {:error, _} = reset(ctx, :generation, occurrence)
+    assert reset_audits(occurrence) == 1
+  end
+
+  @tag :generation
+  test "generation reset denies a missing or mismatched admission budget", ctx do
+    assert {:error, _} = generate(ctx, overage_options())
+    assert [[true, occurrence]] = inhibit_state(:generation)
+    SupportDBCase.advance_clock(ctx.support, 15)
+
+    [[approved]] =
+      SQL.query!(Repo, "SELECT generation_inhibit_budget FROM automation_controls").rows
+
+    assert %{"quote" => %{"day_cap" => @ceiling, "month_cap" => @ceiling}} = approved
+
+    for invalid <- [
+          nil,
+          put_in(approved, ["quote", "profile"], "other-profile"),
+          put_in(approved, ["quote", "day_cap"], 2 * @ceiling),
+          Map.put(approved, "attempt_id", Ash.UUIDv7.generate())
+        ] do
+      SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibit_budget = $1", [invalid])
+      assert {:error, _} = reset(ctx, :generation, occurrence)
+      assert [[true, ^occurrence]] = inhibit_state(:generation)
+      assert reset_audits(occurrence) == 0
+    end
+
+    SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibit_budget = $1", [approved])
+    assert {:ok, _} = reset(ctx, :generation, occurrence)
+    assert reset_audits(occurrence) == 1
+  end
+
+  defp queue_reset_and_admission(ctx, occurrence, next, opts) do
+    assert {:ok, tasks} =
+             Repo.transact(fn ->
+               assert %{rows: [[holder]]} =
+                        SQL.query!(
+                          Repo,
+                          "SELECT pg_backend_pid() FROM automation_controls FOR UPDATE"
+                        )
+
+               {reset_task, reset_backend} =
+                 on_connection(fn -> reset(ctx, :generation, occurrence) end)
+
+               assert_blocked_by(reset_backend, holder)
+
+               {admission_task, admission_backend} =
+                 on_connection(fn -> generate(next, opts) end)
+
+               assert_blocked_by(admission_backend, reset_backend)
+               {:ok, {reset_task, admission_task}}
+             end)
+
+    tasks
+  end
+
+  @tag :generation
+  test "unclassified embedding exposure blocks generation admission and reset across rollover",
+       ctx do
+    assert {:error, _} = generate(ctx, overage_options())
+    assert [[true, occurrence]] = inhibit_state(:generation)
+    legacy_inhibit(:embedding)
+    SupportDBCase.advance_clock(ctx.support, 15)
+
+    assert {:error, _} = reset(ctx, :generation, occurrence)
+    assert reset_audits(occurrence) == 0
+
+    # Remove this test's classified generation inhibit to exercise the other
+    # lane's unclassified guard independently of the lane's own flag.
+    SQL.query!(
+      Repo,
+      "UPDATE automation_controls SET generation_inhibited = false, generation_inhibit_occurrence = NULL"
+    )
+
+    next = successor(ctx)
+    owner = self()
+
+    assert {:error, _} =
+             generate(next, %{
+               wire: fn request ->
+                 send(owner, :wire)
+                 response(request)
+               end
+             })
+
+    refute_received :wire
+    assert [[1, "failed", true, "settled", @ceiling, _, 1_050_001, 500]] = rows(ctx)
+    assert [_] = ledger(ctx)
+    assert [[true, nil]] = inhibit_state(:embedding)
+  end
+
+  @tag :generation
+  test "a legacy embedding inhibit at the last wire check preserves the committed hold", ctx do
+    owner = self()
+
+    assert {:error, _} =
+             generate(ctx, %{
+               after_dispatch: fn _ -> legacy_inhibit(:embedding) end,
+               wire: fn request ->
+                 send(owner, :wire)
+                 response(request)
+               end
+             })
+
+    refute_received :wire
+    assert [[1, "unknown", true, "unknown", @ceiling, nil, nil, nil]] = rows(ctx)
+    assert ledger(ctx) == []
+    assert [[true, nil]] = inhibit_state(:embedding)
+  end
+
+  @tag :generation
+  test "trusted usage retrips a legacy generation inhibit without classifying it", ctx do
+    opts = overage_options()
+
+    assert {:error, _} =
+             generate(ctx, %{
+               opts
+               | wire: fn request ->
+                   legacy_inhibit(:generation)
+                   opts.wire.(request)
+                 end
+             })
+
+    assert [[true, nil]] = inhibit_state(:generation)
+    assert [[_, "settlement", actual, nil]] = ledger_identity(ctx)
+    assert actual == @ceiling + 500
+  end
+
+  @finance_version 20_261_127_150_639
+  @tag :generation
+  @tag :vgas20_upgrade
+  @tag skip: System.get_env("VGAS_VERIFY_VGAS20_UPGRADE") != "true"
+  test "populated upgrade preserves a predecessor overflow flag and booked charge", ctx do
+    # This proof changes the schema. Restrict it to the disposable runner.
+    assert System.get_env("VGAS_F04_DISPOSABLE") == "1"
+    assert Repo.config()[:hostname] == "127.0.0.1"
+    assert Repo.config()[:port] in [55434, 55436, 55437, 55438]
+
+    assert [["vgas_test", "vgas_test", "180007", "0.8.7", false, false, false, false, false]] =
+             SQL.query!(Repo, """
+             SELECT current_database(), current_user, current_setting('server_version_num'),
+               (SELECT extversion FROM pg_extension WHERE extname = 'vector'),
+               rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
+             FROM pg_roles WHERE rolname = current_user
+             """).rows
+
+    {_collection, revision} = KnowledgeFixtures.approved(ctx.knowledge)
+    {caller, id, adapter, barrier} = park(ctx, overage_options().wire)
+    SupportDBCase.advance_clock(ctx.support, 30)
+    assert :ok = Generation.recover(id)
+
+    assert {:ok, %{state: :abandoned}} =
+             financial_decision(
+               InferenceRun,
+               :close_unknown_generation,
+               %{id: id, reason: :conservative_closure},
+               ctx.support.admin
+             )
+
+    assert [[settlement, "settlement", @ceiling, nil]] = ledger_identity(ctx)
+
+    assert %{num_rows: 1} =
+             SQL.query!(Repo, "DELETE FROM audit_events WHERE settlement_target_id = $1", [
+               settlement
+             ])
+
+    assert_raise Postgrex.Error, ~r/VGAS-20 rollback would remove financial evidence/, fn ->
+      Ecto.Migrator.run(Repo, :down, step: 1)
+    end
+
+    # The predecessor booked the same ceiling and could only set the flag
+    # when its late correction overflowed. Remove synthetic post-upgrade
+    # evidence before reconstructing that exact shape on the old schema.
+    SQL.query!(Repo, "UPDATE inference_runs SET generation_budget = NULL WHERE id = $1", [
+      uuid(id)
+    ])
+
+    assert [@finance_version] = Ecto.Migrator.run(Repo, :down, step: 1)
+
+    try do
+      legacy_inhibit(:generation)
+
+      assert [[1, "abandoned", true, "conservatively_settled", @ceiling, @ceiling, nil, nil]] =
+               rows(ctx)
+
+      assert [[^settlement, "settlement", @ceiling, nil]] = ledger_identity(ctx)
+    after
+      assert [@finance_version] =
+               Ecto.Migrator.run(Repo, :up, strict_version_order: true, all: true)
+    end
+
+    assert [[true, nil]] = inhibit_state(:generation)
+
+    assert [[nil, nil, nil]] =
+             SQL.query!(
+               Repo,
+               """
+               SELECT generation_budget, overflow_evidence, overflow_resolved_at
+               FROM inference_runs WHERE id = $1
+               """,
+               [uuid(id)]
+             ).rows
+
+    before = {rows(ctx), ledger_identity(ctx), origin_windows()}
+    owner = self()
+    sibling = SupportDBCase.next_conversation(ctx.support, 1)
+    next = setup_turn(sibling, DateTime.add(ctx.now, 30))
+
+    assert {:error, _} =
+             generate(next, %{
+               wire: fn request ->
+                 send(owner, :generation_wire)
+                 response(request)
+               end
+             })
+
+    KnowledgeFixtures.fixture(%{
+      wire: fn request ->
+        send(owner, :embedding_wire)
+        VoelgoedAi.Intelligence.EmbeddingTransport.fixture_wire(request)
+      end
+    })
+
+    [article_embedding, _] = KnowledgeFixtures.request_index(ctx.knowledge, revision)
+    assert :ok = Embedding.index(article_embedding)
+
+    assert [[0]] =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM inference_runs WHERE article_embedding_id = $1",
+               [uuid(article_embedding)]
+             ).rows
+
+    assert rows(next) == []
+    refute_received :generation_wire
+    refute_received :embedding_wire
+    reset_id = Ash.UUIDv7.generate()
+    assert {:error, _} = reset(ctx, :generation, reset_id)
+    assert reset_audits(reset_id) == 0
+    assert {rows(ctx), ledger_identity(ctx), origin_windows()} == before
+
+    send(adapter, {:resume, barrier})
+    assert {:error, _} = Task.await(caller)
+    assert [[true, nil]] = inhibit_state(:generation)
+
+    assert [[^settlement, "settlement", @ceiling, nil], [_, "late-usage", 500, ^settlement]] =
+             ledger_identity(ctx)
+
+    assert [[1, "abandoned", true, "conservatively_settled", @ceiling, @ceiling, 1_050_001, 500]] =
+             rows(ctx)
+
+    assert origin_windows() == [
+             ["day", ~D[2031-01-31], @ceiling + 500],
+             ["month", ~D[2031-01-01], @ceiling + 500]
+           ]
+
+    assert :ok = Generation.recover(id)
+    assert length(ledger_identity(ctx)) == 2
+    assert SupportDBCase.writes(ctx.support) == []
+  end
+
+  defp legacy_inhibit(:embedding) do
+    on_exit(fn ->
+      SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibited = false")
+    end)
+
+    SQL.query!(
+      Repo,
+      "UPDATE automation_controls SET embedding_inhibited = true WHERE NOT embedding_inhibited"
+    )
+  end
+
+  defp legacy_inhibit(:generation) do
+    SQL.query!(
+      Repo,
+      "UPDATE automation_controls SET generation_inhibited = true WHERE NOT generation_inhibited"
+    )
+  end
+
+  defp inhibit_state(:generation) do
+    SQL.query!(
+      Repo,
+      "SELECT generation_inhibited, generation_inhibit_occurrence::text FROM automation_controls"
+    ).rows
+  end
+
+  defp inhibit_state(:embedding) do
+    SQL.query!(
+      Repo,
+      "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+    ).rows
+  end
+
+  defp reset(ctx, lane, occurrence) do
+    financial_decision(
+      AutomationControl,
+      :reset_financial_inhibit,
+      %{lane: lane, occurrence: occurrence},
+      ctx.support.admin
+    )
+  end
+
+  defp reset_audits(occurrence) do
+    [[count]] =
+      SQL.query!(
+        Repo,
+        "SELECT count(*) FROM audit_events WHERE event = 'reset_generation_inhibit' AND correlation_id = $1",
+        [uuid(occurrence)]
+      ).rows
+
+    count
+  end
+
+  defp overage_options do
+    %{
+      day_cap: @ceiling,
+      month_cap: @ceiling,
+      wire:
+        &response(&1, %{
+          "usage" => %{
+            "input_tokens" => 1_050_001,
+            "output_tokens" => 500,
+            "total_tokens" => 1_050_501
+          }
+        })
+    }
+  end
+
+  @tag :generation
   test "stale scope, forged actors and open caller transactions cannot reach dispatch", ctx do
     owner = self()
 
@@ -902,7 +1279,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
      )}
   end
 
-  defp park(ctx) do
+  defp park(ctx, wire \\ &response/1) do
     owner = self()
     barrier = make_ref()
 
@@ -912,7 +1289,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
         send(owner, {barrier, :adapter, self()})
 
         receive do
-          {:resume, ^barrier} -> response(request)
+          {:resume, ^barrier} -> wire.(request)
         after
           10_000 -> raise "unreleased generation test barrier"
         end
@@ -1087,7 +1464,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
 
       SQL.query!(
         Repo,
-        "UPDATE automation_controls SET generation_inhibited = FALSE, generation_inhibit_occurrence = NULL"
+        "UPDATE automation_controls SET generation_inhibited = FALSE, generation_inhibit_occurrence = NULL, generation_inhibit_budget = NULL"
       )
 
       {:ok, :cleaned}

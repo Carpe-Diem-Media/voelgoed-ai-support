@@ -81,11 +81,17 @@ and reset deny unresolved overflow across UTC rollover. A transport result
 without qualified usage retains the UNKNOWN hold.
 
 Reset is scoped to one classified inhibit occurrence. Under the accounting
-lock it checks ambiguous exposure, the current synthetic budget, and
-headroom in both UTC windows including outstanding holds. The reset audit
-commits with the flag change. Repeated faults replace the occurrence ID.
-An inhibit carried forward without an occurrence requires review. Keep
-the other lane and global automation settings as they were.
+lock it checks ambiguous exposure and headroom in both UTC windows,
+including outstanding holds. Generation reset uses the exact TEST caps
+and request profile recorded when the triggering attempt was admitted.
+It denies missing or mismatched quotes, including an inhibit tripped
+under conflicting quotes. The reset audit commits with the flag change.
+
+Repeated faults replace classified occurrence IDs. A predecessor flag
+with no occurrence remains unclassified even after a later trip. It
+blocks new inference and resets in both lanes across UTC rollover.
+Qualified delayed usage can still settle against its original windows.
+Resolving the legacy flag requires separate authority and evidence.
 
 The historical feasibility calculation for Luna was **525,375,000 nano-USD**
 (`1,050,000 × 500 + 500 × 750`), above the **250,000,000 nano-USD**
@@ -109,10 +115,19 @@ routine checks.
 
 The VGAS-20 migration adds evidence fields and an audit reference without
 rewriting previous financial rows. A downgrade can remove the schema
-additions before they have recorded an audit, inhibit occurrence or overflow.
+additions before they have recorded an audit, inhibit occurrence, generation
+budget or overflow.
 After recording evidence, disable automation and financial commands. Retain
 the schema and use a build that can read the recorded audit events and
 overflow evidence.
+
+The populated VGAS-20 upgrade test changes the schema. Run it only through
+the approved disposable PostgreSQL 18.7 and pgvector 0.8.7 runner on its
+isolated TEST port. Use the following command in the runner's steps file.
+
+```sh
+VGAS_F04_DISPOSABLE=1 VGAS_VERIFY_VGAS20_UPGRADE=true mise exec -- mix test test/voelgoed_ai/intelligence/generation_test.exs --only vgas20_upgrade --seed 0
+```
 
 ## Opt-in provider smoke
 

@@ -277,6 +277,18 @@
       "type": "utc_datetime_usec"
     },
     {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "generation_budget",
+      "type": "map"
+    },
+    {
       "allow_nil?": false,
       "default": "nil",
       "generated?": false,

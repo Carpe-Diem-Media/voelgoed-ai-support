@@ -91,7 +91,25 @@ defmodule VoelgoedAi.Intelligence.Generation do
     end
 
     @doc false
-    def fixture_budget(options), do: budget(options)
+    def reset_budget(%{
+          "attempt_id" => attempt_id,
+          "quote" => %{"day_cap" => day, "month_cap" => month} = quote
+        })
+        when is_binary(attempt_id) do
+      config = %{price: @price, day_cap: day, month_cap: month}
+
+      with true <- verified_profile?(%{}),
+           true <- budget_authority(config) === quote,
+           {:ok, %{purpose: :generate, generation_budget: frozen}} <-
+             read_attempt(attempt_id, false),
+           true <- frozen === quote do
+        {:ok, config}
+      else
+        _ -> {:error, :invalid_budget}
+      end
+    end
+
+    def reset_budget(_), do: {:error, :invalid_budget}
 
     defp with_scope(id, claim, options, operation) do
       if is_nil(Process.get(@scope_key)) and not Repo.in_transaction?() do
@@ -265,6 +283,19 @@ defmodule VoelgoedAi.Intelligence.Generation do
     }
   end
 
+  # The quote comes from the same fixture scope as admission. Persist it with
+  # the attempt so delayed settlement cannot substitute another fixture's caps.
+  defp budget_authority(config) do
+    %{
+      "provider" => "openai",
+      "model" => SupportProposal.model(),
+      "profile" => SupportProposal.profile(),
+      "price" => Map.new(config.price, fn {key, value} -> {Atom.to_string(key), value} end),
+      "day_cap" => config.day_cap,
+      "month_cap" => config.month_cap
+    }
+  end
+
   defp verified_profile?(options) do
     Map.get(options, :price, @price) == @price and
       SupportProposal.output_limit() == @price.max_output_tokens
@@ -272,6 +303,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
 
   defp reserve(control, run, now, cutoff, fixture) do
     with true <- verified_profile?(fixture),
+         config = budget(fixture),
          {:ok, slots} <- read(:generation_slots, %{turn_ref: run.turn_ref}, &Ash.read/1),
          {:ok, ordinal} <- next_slot(run, slots),
          {:ok, attempt} <-
@@ -287,6 +319,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
                  model_id: SupportProposal.model(),
                  profile_id: SupportProposal.profile(),
                  prompt_version: SupportProposal.prompt_version(),
+                 generation_budget: budget_authority(config),
                  deadline_at: cutoff,
                  started_at: now,
                  ordinal: ordinal,
@@ -297,7 +330,6 @@ defmodule VoelgoedAi.Intelligence.Generation do
                actor: actor
              )
            end),
-         config = budget(fixture),
          {:ok, _} <-
            account(attempt, :reserve, &Accounting.reserve(&1, control, attempt, now, config)),
          {:ok, _} <-
@@ -383,9 +415,11 @@ defmodule VoelgoedAi.Intelligence.Generation do
          true <- immutable?(attempt, candidate),
          true <- attempt.dispatched_at == candidate.dispatched_at,
          true <- verified_profile?(settings),
+         approved = budget(settings),
+         true <- attempt.generation_budget === budget_authority(approved),
          {:ok, hold} <- reservation(attempt),
          now = ChatwootAdapter.now(),
-         :ok <- Accounting.validate_dispatch(attempt, control, hold, now, budget(settings)),
+         :ok <- Accounting.validate_dispatch(attempt, control, hold, now, approved),
          # Locks may have waited past either cutoff.
          now = ChatwootAdapter.now(),
          true <- DateTime.before?(now, cutoff) and DateTime.before?(now, attempt.deadline_at) do
@@ -647,7 +681,8 @@ defmodule VoelgoedAi.Intelligence.Generation do
       :provider,
       :model_id,
       :profile_id,
-      :prompt_version
+      :prompt_version,
+      :generation_budget
     ]
 
     Map.take(current, keys) == Map.take(candidate, keys)

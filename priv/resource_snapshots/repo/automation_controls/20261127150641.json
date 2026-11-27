@@ -105,6 +105,18 @@
       "references": null,
       "scale": null,
       "size": null,
+      "source": "generation_inhibit_budget",
+      "type": "map"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
       "source": "embedding_inhibit_occurrence",
       "type": "uuid"
     },
@@ -167,7 +179,7 @@
     }
   ],
   "has_create_action": false,
-  "hash": "D1CE78DC5750D250DCE5A58A797E7424F12049070AFEA929CB41AA9C3511F712",
+  "hash": "7689F982284CA3EF02298A356AB1713371E44FF59E0EFFEACE24774AF7532185",
   "identities": [
     {
       "all_tenants?": false,

@@ -1,6 +1,6 @@
 defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
   @moduledoc """
-  Adds closure audit references, inhibit occurrence identifiers and durable overflow evidence.
+  Adds closure audit references, inhibit occurrences, approved generation budgets and overflow evidence.
   Historical charges, attempts and legacy inhibit flags are preserved.
   """
 
@@ -79,11 +79,13 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
 
     alter table(:automation_controls) do
       add(:generation_inhibit_occurrence, :uuid)
+      add(:generation_inhibit_budget, :map)
       add(:embedding_inhibit_occurrence, :uuid)
     end
 
     alter table(:inference_runs) do
       add(:overflow_evidence, :map)
+      add(:generation_budget, :map)
       add(:overflow_resolved_at, :utc_datetime_usec)
     end
 
@@ -112,10 +114,11 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
         SELECT 1 FROM audit_events
         WHERE event IN ('close_unknown_inference','reset_embedding_inhibit','reset_generation_inhibit')
       ) OR EXISTS (
-        SELECT 1 FROM inference_runs WHERE overflow_evidence IS NOT NULL
+        SELECT 1 FROM inference_runs WHERE overflow_evidence IS NOT NULL OR generation_budget IS NOT NULL
       ) OR EXISTS (
         SELECT 1 FROM automation_controls
         WHERE embedding_inhibit_occurrence IS NOT NULL OR generation_inhibit_occurrence IS NOT NULL
+          OR generation_inhibit_budget IS NOT NULL
       ) THEN
         RAISE EXCEPTION 'VGAS-20 rollback would remove financial evidence';
       END IF;
@@ -128,11 +131,13 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
     alter table(:inference_runs) do
       remove(:overflow_resolved_at)
       remove(:overflow_evidence)
+      remove(:generation_budget)
     end
 
     alter table(:automation_controls) do
       remove(:embedding_inhibit_occurrence)
       remove(:generation_inhibit_occurrence)
+      remove(:generation_inhibit_budget)
     end
 
     drop_if_exists(constraint(:audit_events, :audit_events_exact_target))

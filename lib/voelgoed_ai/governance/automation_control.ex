@@ -62,6 +62,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
     attribute(:generation_inhibited, :boolean, allow_nil?: false, default: false)
     attribute(:embedding_inhibited, :boolean, allow_nil?: false, default: false)
     attribute(:generation_inhibit_occurrence, :uuid)
+    attribute(:generation_inhibit_budget, :map)
     attribute(:embedding_inhibit_occurrence, :uuid)
     create_timestamp(:inserted_at)
     update_timestamp(:updated_at)
@@ -102,6 +103,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
     update :inhibit_generation do
       transaction?(false)
       require_atomic?(false)
+      accept([:generation_inhibit_budget])
       change(set_attribute(:generation_inhibited, true))
       change(set_attribute(:generation_inhibit_occurrence, &Ash.UUIDv7.generate/0))
     end
@@ -125,6 +127,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
       require_atomic?(false)
       change(set_attribute(:generation_inhibited, false))
       change(set_attribute(:generation_inhibit_occurrence, nil))
+      change(set_attribute(:generation_inhibit_budget, nil))
     end
 
     update :update_row do

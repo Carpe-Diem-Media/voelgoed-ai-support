@@ -1,5 +1,6 @@
 # Executed by the packaged release. The values below are synthetic and
 # deliberately set in memory to test that PROD cannot acquire TEST authority.
+alias VoelgoedAi.Governance.{AutomationControl, FinancialControl}
 alias VoelgoedAi.Intelligence.{Embedding, EmbeddingTransport, Generation, GenerationTransport}
 alias VoelgoedAi.Knowledge.{Publication, Retrieval}
 alias VoelgoedAi.Support.{ChatwootAdapter, Ingress, Recovery, RunProcessing}
@@ -25,9 +26,9 @@ for {module, function, arity} <- [
       {Retrieval, :sort_fixture_ranks, 1},
       {Generation, :with_fixture, 4},
       {Generation, :propose, 5},
-      {Generation, :fixture_budget, 1},
+      {Generation, :reset_budget, 1},
       {Embedding, :fixture_budget, 0},
-      {VoelgoedAi.Governance.FinancialControl, :with_decision, 4},
+      {FinancialControl, :with_decision, 4},
       {RunProcessing, :claim_evidence_fixture, 1},
       {RunProcessing, :complete_evidence_fixture, 3},
       {Publication, :record_fixture_evaluation, 2},
@@ -51,6 +52,15 @@ for module <- [
 Application.put_env(:voelgoed_ai, :chatwoot_adapter, :fixture)
 Application.put_env(:voelgoed_ai, :support_fixture, %{adapter: {__MODULE__, nil}})
 Application.put_env(:voelgoed_ai, :embedding_fixture, %{mode: :fixture})
+
+reset_input =
+  Ash.ActionInput.for_action(AutomationControl, :reset_financial_inhibit, %{
+    lane: :generation,
+    occurrence: Ash.UUIDv7.generate()
+  })
+
+{:error, %Ash.Error.Forbidden{}} = Ash.run_action(reset_input)
+{:error, "financial inhibit reset denied"} = FinancialControl.run(reset_input, [], %{})
 
 nil = ChatwootAdapter.fixture()
 false = ChatwootAdapter.in_scope?(%{})

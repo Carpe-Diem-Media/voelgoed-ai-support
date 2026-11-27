@@ -806,6 +806,23 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
                  )
       end)
 
+      set_legacy_generation_inhibit()
+
+      assert {:error, _} =
+               financial_decision(AutomationControl, :reset_financial_inhibit, reset, ctx.admin)
+
+      assert %{rows: [[0]]} =
+               SQL.query!(
+                 Repo,
+                 """
+                 SELECT count(*) FROM audit_events
+                 WHERE event = 'reset_embedding_inhibit' AND correlation_id = $1
+                 """,
+                 [Ecto.UUID.dump!(occurrence)]
+               )
+
+      SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibited = false")
+
       assert {:ok, ^reset} =
                financial_decision(AutomationControl, :reset_financial_inhibit, reset, ctx.admin)
 
@@ -934,6 +951,44 @@ defmodule VoelgoedAi.Knowledge.EditorialTest do
     assert :ok = Embedding.index(id)
     assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
     assert [] == ledger_rows(id)
+    refute_received :wire
+  end
+
+  defp set_legacy_generation_inhibit do
+    assert %{rows: [[false, nil, nil]]} =
+             SQL.query!(Repo, """
+             SELECT generation_inhibited, generation_inhibit_occurrence, generation_inhibit_budget
+             FROM automation_controls
+             """)
+
+    SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibited = true")
+
+    on_exit(fn ->
+      SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibited = false")
+    end)
+  end
+
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "article wire entry denies a legacy generation inhibit after the marker", ctx do
+    {_collection, revision} = approved(ctx)
+    [id, _] = request_index(ctx, revision)
+    owner = self()
+
+    fixture(%{
+      wire: fn request ->
+        send(owner, :wire)
+        EmbeddingTransport.fixture_wire(request)
+      end,
+      after_dispatch: fn _ ->
+        set_legacy_generation_inhibit()
+      end
+    })
+
+    assert :ok = Embedding.index(id)
+    assert [["unknown", true, "unknown", 81_920, nil]] = reservation_rows(id)
+    assert [] == ledger_rows(id)
+    assert [["failed", nil]] = vector_rows(id)
     refute_received :wire
   end
 

@@ -101,7 +101,7 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
       # a newly inserted reservation or window. The control lock serializes
       # this aggregate with all reservation and origin-window changes.
       with {:ok, reservation} <- insert(UsageReservation, attrs),
-           {:ok, exposure} <- exposure(),
+           {:ok, exposure} <- exposure(control),
            {:ok, windows} <- lock_windows(dates),
            true <-
              windows.day.settled_nano_usd + exposure <= day and
@@ -126,7 +126,7 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
          true <-
            price(reservation) ==
              Map.merge(%{max_output_tokens: nil, output_rate_nano_usd: nil}, expected),
-         :ok <- headroom(now, day, month, 0) do
+         :ok <- headroom(control, now, day, month, 0) do
       :ok
     else
       _ -> {:error, :admission_denied}
@@ -134,12 +134,12 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
   end
 
   @doc false
-  def reset_headroom(lane, now, %{price: price, day_cap: day, month_cap: month}) do
+  def reset_headroom(control, lane, now, %{price: price, day_cap: day, month_cap: month}) do
     purpose = if lane == :generation, do: :generate, else: :article_embedding
-    control = %{generation_inhibited: false, embedding_inhibited: false}
+    cleared = %{generation_inhibited: false, embedding_inhibited: false}
 
     with true <- valid_caps?(day, month),
-         {:ok, ceiling} <- admission_price(%{purpose: purpose}, control, price),
+         {:ok, ceiling} <- admission_price(%{purpose: purpose}, cleared, price),
          {:ok, %{rows: [[false]]}} <-
            SQL.query(
              Repo,
@@ -152,7 +152,7 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
              """,
              [lane == :generation]
            ) do
-      headroom(now, day, month, ceiling)
+      headroom(control, now, day, month, ceiling)
     else
       _ -> {:error, :unresolved_exposure}
     end
@@ -162,10 +162,10 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
     do:
       is_integer(day) and day in 1..@max_bigint and is_integer(month) and month in 1..@max_bigint
 
-  defp headroom(now, day_cap, month_cap, additional) do
+  defp headroom(control, now, day_cap, month_cap, additional) do
     %{day_window: day, month_window: month} = dates(now)
 
-    with {:ok, risk} <- exposure(),
+    with {:ok, risk} <- exposure(control),
          {:ok, daily} <- projected(:day, day, 0),
          {:ok, monthly} <- projected(:month, month, 0),
          true <- daily + risk + additional <= day_cap and monthly + risk + additional <= month_cap do
@@ -486,9 +486,43 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
 
   defp maybe_inhibit(_control, _attempt, false), do: :ok
 
-  defp inhibit(control, attempt) do
-    action = if attempt.purpose == :generate, do: :inhibit_generation, else: :inhibit_embedding
-    storage(control.__struct__, action, &Ash.update(control, %{}, action: action, actor: &1))
+  # A predecessor flag alone is evidence of an unresolved amount. A later
+  # trip cannot classify it or give an operator an occurrence they can reset.
+  defp inhibit(
+         %{generation_inhibited: true, generation_inhibit_occurrence: nil} = control,
+         %{purpose: :generate}
+       ),
+       do: {:ok, control}
+
+  defp inhibit(control, %{purpose: :generate} = attempt) do
+    quote = attempt.generation_budget
+
+    # Multiple trips under different quotes leave no single approved budget
+    # for this inhibit. In particular a later trip cannot raise the reset cap.
+    budget =
+      if quote &&
+           (not control.generation_inhibited or
+              control.generation_inhibit_budget["quote"] === quote) do
+        %{"attempt_id" => attempt.id, "quote" => quote}
+      end
+
+    storage(control.__struct__, :inhibit_generation, fn actor ->
+      Ash.update(control, %{generation_inhibit_budget: budget},
+        action: :inhibit_generation,
+        actor: actor
+      )
+    end)
+  end
+
+  defp inhibit(%{embedding_inhibited: true, embedding_inhibit_occurrence: nil} = control, _),
+    do: {:ok, control}
+
+  defp inhibit(control, _attempt) do
+    storage(
+      control.__struct__,
+      :inhibit_embedding,
+      &Ash.update(control, %{}, action: :inhibit_embedding, actor: &1)
+    )
   end
 
   defp append(attempt, reservation, entry) do
@@ -517,7 +551,13 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
     insert(UsageLedger, attrs)
   end
 
-  defp exposure do
+  defp exposure(%{embedding_inhibited: true, embedding_inhibit_occurrence: nil}),
+    do: {:error, :unclassified_inhibit}
+
+  defp exposure(%{generation_inhibited: true, generation_inhibit_occurrence: nil}),
+    do: {:error, :unclassified_inhibit}
+
+  defp exposure(_control) do
     case SQL.query(Repo, """
          SELECT COALESCE(sum(r.reserved_nano_usd::numeric)
            FILTER (WHERE r.state IN ('reserved', 'unknown')), 0)::text,

@@ -137,6 +137,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
              :disabled,
              :invalid_price,
              :amount_overflow,
+             :unclassified_inhibit,
              :invalid_budget,
              :budget_exhausted,
              :invalid_content
