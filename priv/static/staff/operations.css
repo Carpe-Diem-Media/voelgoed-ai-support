@@ -1,0 +1,19 @@
+/* Hallmark · shape: app screen · genre: editorial · theme: Almanac (staff system)
+ * nav: staff top bar · signature: support queue and selected session · states: full, empty, offline, error, denied · v2.0.0 */
+/* Hallmark · pre-emit critique: keep the queue and evidence in reading order on narrow screens. */
+.operations-facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  max-width: 38rem;
+}
+
+.operations-facts dd { margin: 0; }
+.operations-list { padding-inline-start: var(--space-6); }
+.operations-list li { overflow-wrap: anywhere; margin-block-end: var(--space-3); }
+.operations-list li p { margin-block: var(--space-1); }
+.operations-list a, .operations-list summary { min-height: 44px; }
+.operations-list a { display: inline-flex; align-items: center; }
+.operations-list summary { align-content: center; cursor: pointer; }
+.phx-connected .operations-offline { display: none; }
+.phx-disconnected button { pointer-events: none; }

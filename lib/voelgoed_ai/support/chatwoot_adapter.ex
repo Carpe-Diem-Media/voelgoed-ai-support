@@ -131,6 +131,15 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
 
   @doc false
   def call(operation, destination, args, deadline) do
+    if operation in [:reply, :open_for_handoff] and
+         VoelgoedAi.Governance.EmergencyOverride.asserted?() do
+      {:error, {:not_issued, :disabled}}
+    else
+      invoke(operation, destination, args, deadline)
+    end
+  end
+
+  defp invoke(operation, destination, args, deadline) do
     budget = min(500, DateTime.diff(deadline, now(), :millisecond))
 
     with true <- budget > 0 and not VoelgoedAi.Repo.in_transaction?(),

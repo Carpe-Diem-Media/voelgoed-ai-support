@@ -19,6 +19,7 @@ defmodule VoelgoedAi.Application do
 
     children = [
       VoelgoedAi.Repo,
+      VoelgoedAi.Governance.EmergencyOverride,
       {Oban, Application.fetch_env!(:voelgoed_ai, Oban)},
       VoelgoedAi.Accounts.EntraPendingStates,
       {Phoenix.PubSub, name: VoelgoedAi.PubSub},

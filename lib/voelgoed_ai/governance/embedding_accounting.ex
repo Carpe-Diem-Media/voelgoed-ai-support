@@ -81,7 +81,8 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
   def reserve(capability, control, attempt, now, %{price: price, day_cap: day, month_cap: month})
       when is_integer(day) and day in 1..@max_bigint and
              is_integer(month) and month in 1..@max_bigint do
-    with :ok <- authorize(capability, attempt, :reserve),
+    with false <- VoelgoedAi.Governance.EmergencyOverride.blocked?(control),
+         :ok <- authorize(capability, attempt, :reserve),
          {:ok, amount} <- admission_price(attempt, control, price) do
       dates = dates(now)
 
@@ -111,6 +112,9 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
         false -> {:error, :budget_exhausted}
         error -> error
       end
+    else
+      true -> {:error, :disabled}
+      error -> error
     end
   end
 
@@ -118,7 +122,8 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
 
   @doc false
   def validate_dispatch(attempt, control, reservation, now, config) do
-    with %{state: :reserved} <- reservation,
+    with false <- VoelgoedAi.Governance.EmergencyOverride.blocked?(control),
+         %{state: :reserved} <- reservation,
          %{price: expected, day_cap: day, month_cap: month} <- config,
          true <- valid_caps?(day, month),
          {_, %{"day_cap" => admitted_day, "month_cap" => admitted_month} = quote} <-
@@ -647,6 +652,39 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
       })
 
     insert(UsageLedger, attrs)
+  end
+
+  @doc "Read exact aggregate exposure and configured fixture caps for a current admin."
+  def staff_exposure(staff) do
+    VoelgoedAi.Accounts.StaffAccess.with_current(staff, :admin, fn _ ->
+      dates = dates(DateTime.utc_now())
+
+      with {:ok, control} <- VoelgoedAi.Support.Configuration.lock_control(),
+           {:ok, outstanding} <- exposure(control),
+           {:ok, %{rows: [[day, month]]}} <-
+             SQL.query(
+               Repo,
+               """
+               SELECT
+                 COALESCE((SELECT settled_nano_usd FROM spend_windows WHERE kind = 'day' AND window_start = $1), 0),
+                 COALESCE((SELECT settled_nano_usd FROM spend_windows WHERE kind = 'month' AND window_start = $2), 0)
+               """,
+               [dates.day_window, dates.month_window],
+               timeout: 750,
+               telemetry_event: nil
+             ) do
+        {:ok,
+         %{
+           day: day,
+           month: month,
+           outstanding: outstanding,
+           generation_caps: VoelgoedAi.Intelligence.Generation.configured_caps(),
+           embedding_caps: VoelgoedAi.Intelligence.Embedding.configured_caps()
+         }}
+      else
+        _ -> {:error, :unavailable}
+      end
+    end)
   end
 
   defp exposure(%{embedding_inhibited: true, embedding_inhibit_occurrence: nil}),

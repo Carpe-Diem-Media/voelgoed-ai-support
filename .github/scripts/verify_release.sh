@@ -156,6 +156,9 @@ check_shutdown() {
 docker run -d --name "$server" "${release_args[@]}" "$image" >/dev/null
 origin="http://$(container_ip "$server"):4000"
 await_health "$origin/health"
+[[ "$(probe --fail "$origin/ready")" == '{"status":"ready"}' ]]
+[[ "$(probe -o /dev/null -w '%{http_code}' "$origin/staff/operations")" == 401 ]]
+
 [[ "$(probe -H 'X-Forwarded-Proto: https' -o /dev/null -w '%{http_code}' "$origin/staff/assets/knowledge.js")" == 401 ]]
 [[ "$(probe -o /dev/null -w '%{http_code}' "$origin/staff/session")" == 401 ]]
 [[ "$(probe -X POST -d 'invalid body' -o /dev/null -w '%{http_code}' "$origin/webhooks/chatwoot/synthetic")" == 404 ]]
@@ -202,6 +205,7 @@ check_asset() {
   sha256sum "$tmp/asset" | awk -v asset="$path" '{print $1, asset}'
 }
 
+[[ "$(probe "${tls_probe[@]}" -o /dev/null -w '%{http_code}' "$tls_origin/staff/assets/operations.css")" == 403 ]]
 check_asset knowledge.css /app/lib/voelgoed_ai-0.1.0/priv/static/staff/knowledge.css 'text/css'
 check_asset knowledge.js /app/lib/voelgoed_ai-0.1.0/priv/static/staff/knowledge.js '(text|application)/javascript'
 check_asset phoenix/phoenix.min.js /app/lib/phoenix-1.8.17/priv/static/phoenix.min.js '(text|application)/javascript'

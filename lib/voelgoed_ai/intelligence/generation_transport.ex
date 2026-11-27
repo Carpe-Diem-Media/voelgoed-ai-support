@@ -28,7 +28,8 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
              false <- Repo.in_transaction?(),
              :ok <- :atomics.compare_exchange(latch, 1, 0, 1),
              {:ok, %DateTime{} = cutoff} <- authorize_entry.(),
-             remaining when remaining > 0 <- remaining(expires, min_cutoff(attempt, cutoff)) do
+             remaining when remaining > 0 <- remaining(expires, min_cutoff(attempt, cutoff)),
+             false <- VoelgoedAi.Governance.EmergencyOverride.asserted?() do
           request = Req.merge(request, timeouts(remaining))
           started = System.monotonic_time(:microsecond)
           {request, response} = call_wire(wire, request)

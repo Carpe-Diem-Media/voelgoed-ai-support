@@ -1,0 +1,801 @@
+{
+  "attributes": [
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"uuidv7()\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": true,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "actor_kind",
+      "type": "text"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "operator_ref",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "\"staff_user\"",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "target_kind",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "event",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "reason_code",
+      "type": "text"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "before_state",
+      "type": "map"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "after_state",
+      "type": "map"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "operational_before",
+      "type": "map"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "operational_after",
+      "type": "map"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "inhibit_quote",
+      "type": "map"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "inhibit_reset_eligible",
+      "type": "boolean"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "correlation_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "occurred_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "inserted_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_inhibit_attempt_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "inference_runs"
+      },
+      "scale": null,
+      "size": null,
+      "source": "inhibit_attempt_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_settlement_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "usage_ledger_entries"
+      },
+      "scale": null,
+      "size": null,
+      "source": "settlement_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "staff_users"
+      },
+      "scale": null,
+      "size": null,
+      "source": "target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_assistant_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "assistants"
+      },
+      "scale": null,
+      "size": null,
+      "source": "assistant_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_revision_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "assistant_revisions"
+      },
+      "scale": null,
+      "size": null,
+      "source": "revision_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_binding_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "inbox_bindings"
+      },
+      "scale": null,
+      "size": null,
+      "source": "binding_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_control_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "automation_controls"
+      },
+      "scale": null,
+      "size": null,
+      "source": "control_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_session_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "support_sessions"
+      },
+      "scale": null,
+      "size": null,
+      "source": "session_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_event_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "inbound_events"
+      },
+      "scale": null,
+      "size": null,
+      "source": "event_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_run_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "support_runs"
+      },
+      "scale": null,
+      "size": null,
+      "source": "run_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_delivery_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "outbound_deliveries"
+      },
+      "scale": null,
+      "size": null,
+      "source": "delivery_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_knowledge_collection_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "knowledge_collections"
+      },
+      "scale": null,
+      "size": null,
+      "source": "knowledge_collection_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_article_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "articles"
+      },
+      "scale": null,
+      "size": null,
+      "source": "article_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_article_revision_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "article_revisions"
+      },
+      "scale": null,
+      "size": null,
+      "source": "article_revision_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_knowledge_gap_target_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "knowledge_gaps"
+      },
+      "scale": null,
+      "size": null,
+      "source": "knowledge_gap_target_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "audit_events_actor_staff_id_fkey",
+        "on_delete": "restrict",
+        "on_update": "restrict",
+        "primary_key?": true,
+        "schema": "public",
+        "table": "staff_users"
+      },
+      "scale": null,
+      "size": null,
+      "source": "actor_staff_id",
+      "type": "uuid"
+    }
+  ],
+  "base_filter": null,
+  "check_constraints": [
+    {
+      "attribute": [
+        "event"
+      ],
+      "base_filter": null,
+      "check": "(event IN ('trip_generation_inhibit','trip_embedding_inhibit') AND inhibit_attempt_id IS NOT NULL\n  AND inhibit_reset_eligible IS NOT NULL\n  AND (NOT inhibit_reset_eligible OR inhibit_quote IS NOT NULL))\nOR (event NOT IN ('trip_generation_inhibit','trip_embedding_inhibit')\n  AND inhibit_attempt_id IS NULL AND inhibit_quote IS NULL AND inhibit_reset_eligible IS NULL)\n",
+      "name": "audit_events_inhibit_shape"
+    },
+    {
+      "attribute": [
+        "actor_kind"
+      ],
+      "base_filter": null,
+      "check": "(actor_kind = 'bootstrap' AND actor_staff_id IS NULL AND operator_ref = 'staff-bootstrap' AND operator_ref IS NOT NULL)\nOR (actor_kind = 'staff' AND actor_staff_id IS NOT NULL AND operator_ref IS NULL)\nOR (actor_kind IN ('support_worker','embedding_worker','publisher') AND actor_staff_id IS NULL AND operator_ref IS NULL)\n",
+      "name": "audit_events_actor_reference"
+    },
+    {
+      "attribute": [
+        "target_kind"
+      ],
+      "base_filter": null,
+      "check": "  num_nonnulls(settlement_target_id, target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id, session_target_id, delivery_target_id, event_target_id, run_target_id, knowledge_collection_target_id, article_target_id, article_revision_target_id, knowledge_gap_target_id) = 1\n  AND (\n    (target_kind = 'staff_user' AND target_id IS NOT NULL\n      AND event IN ('provisioned','activated','signed_in','roles_changed','disabled','reactivated','retired')\n      AND reason_code IN ('allowlisted','verified_oidc','local_admin','approved_reprovision'))\n    OR (target_kind = 'assistant' AND assistant_target_id IS NOT NULL\n      AND event IN ('create','activate','disable','retire','switch_revision'))\n    OR (target_kind = 'assistant_revision' AND revision_target_id IS NOT NULL\n      AND event IN ('create_draft','edit_draft','publish','supersede','discard','grant_collection','remove_collection'))\n    OR (target_kind = 'inbox_binding' AND binding_target_id IS NOT NULL\n      AND event IN ('create_draft','enable','disable','rebind','change_mode','retire','recover_circuit'))\n    OR (target_kind = 'automation_control' AND control_target_id IS NOT NULL\n      AND event IN ('enable_automation','disable_automation','reset_embedding_inhibit','reset_generation_inhibit','trip_generation_inhibit','trip_embedding_inhibit'))\n    OR (target_kind = 'usage_settlement' AND settlement_target_id IS NOT NULL\n      AND event = 'close_unknown_inference' AND reason_code = 'local_admin')\n    OR (target_kind = 'knowledge_collection' AND knowledge_collection_target_id IS NOT NULL\n      AND event IN ('create','enable','disable','retire') AND reason_code = 'local_admin')\n    OR (target_kind = 'knowledge_article' AND article_target_id IS NOT NULL\n      AND ((event = 'create_draft' AND reason_code = 'local_editor')\n        OR (event = 'archive' AND reason_code = 'obsolete')))\n    OR (target_kind = 'knowledge_revision' AND article_revision_target_id IS NOT NULL\n      AND ((event IN ('create_draft','edit_draft','submit_review') AND reason_code = 'local_editor')\n        OR (event = 'request_changes' AND reason_code IN ('source_correction','content_correction'))\n        OR (event = 'approve' AND reason_code IN ('source_verified','self_approval_attested'))\n        OR (event = 'withdraw' AND reason_code = 'withdrawn_by_staff')\n        OR (event IN ('request_publish','retry_publication','request_reindex','request_index_rollback') AND reason_code = 'source_verified')\n        OR (event = 'revoke' AND reason_code = 'obsolete')\n        OR (event IN ('fail_publication','fail_reindex') AND reason_code IN ('deadline','stale_request','transport_unknown','invalid_vector','admission_denied'))\n        OR (event IN ('activate','switch_index') AND reason_code = 'index_ready')\n        OR (event = 'supersede' AND reason_code = 'replaced')\n        OR (event = 'expire' AND reason_code = 'deadline')\n        OR (event = 'rollback_index' AND reason_code = 'evaluated')\n        OR (event = 'archive' AND reason_code = 'obsolete')))\n    OR (target_kind = 'knowledge_gap' AND knowledge_gap_target_id IS NOT NULL\n      AND ((event = 'gap_dismissed' AND reason_code IN ('duplicate_issue','out_of_scope','no_change_needed'))\n        OR (event IN ('gap_reviewed','gap_deferred','gap_addressed') AND reason_code = 'local_admin')))\n    OR (target_kind = 'support_session' AND session_target_id IS NOT NULL\n      AND event IN ('request_handoff','return_to_bot','close_session'))\n    OR (target_kind = 'outbound_delivery' AND delivery_target_id IS NOT NULL\n      AND event IN ('abandon_delivery','request_readback','delivery_unknown','handoff_failed','local_handoff'))\n    OR (target_kind = 'inbound_event' AND event_target_id IS NOT NULL AND event = 'missed_deadline')\n    OR (target_kind = 'support_run' AND run_target_id IS NOT NULL AND event IN ('missed_deadline','hold_reply','release_reply','purge_reply'))\n  )\n",
+      "name": "audit_events_exact_target"
+    },
+    {
+      "attribute": [
+        "target_kind"
+      ],
+      "base_filter": null,
+      "check": "  (target_kind = 'staff_user' AND actor_kind IN ('staff','bootstrap') AND after_state IS NOT NULL\n    AND operational_before IS NULL AND operational_after IS NULL)\n  OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL\n    AND event NOT IN ('hold_reply','release_reply','purge_reply','gap_reviewed','gap_deferred','gap_dismissed','gap_addressed','delivery_unknown','missed_deadline','handoff_failed','fail_publication','fail_reindex','expire','switch_index','rollback_index','trip_generation_inhibit','trip_embedding_inhibit')\n    AND (target_kind <> 'knowledge_revision' OR event NOT IN ('activate','supersede'))\n    AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')\n      OR (target_kind IN ('knowledge_collection','knowledge_article','knowledge_revision'))\n      OR (target_kind NOT IN ('staff_user','support_session','outbound_delivery','knowledge_collection','knowledge_article','knowledge_revision') AND reason_code = 'local_admin')))\n  OR (target_kind = 'support_run' AND before_state IS NULL AND after_state IS NULL\n    AND operational_after->>'retention_occurrence' IS NOT NULL\n    AND (CASE event\n      WHEN 'hold_reply' THEN actor_kind = 'staff' AND reason_code = 'fixture_hold'\n        AND operational_before->>'status' = 'present' AND operational_after->>'status' = 'held'\n      WHEN 'release_reply' THEN actor_kind = 'staff' AND reason_code = 'fixture_release'\n        AND operational_before->>'status' = 'held'\n        AND operational_before->>'retention_occurrence' IS NOT NULL\n        AND operational_after->>'status' IN ('present','purged')\n      WHEN 'purge_reply' THEN actor_kind = 'support_worker' AND reason_code = 'synthetic_cutoff'\n        AND operational_before->>'status' = 'present' AND operational_after->>'status' = 'purged'\n      ELSE false END) IS TRUE)\n  OR (actor_kind = 'staff' AND target_kind = 'knowledge_gap'\n    AND before_state IS NULL AND after_state IS NULL\n    AND (CASE event\n      WHEN 'gap_reviewed' THEN operational_before->>'status' = 'open' AND operational_after->>'status' = 'in_review'\n      WHEN 'gap_deferred' THEN operational_before->>'status' = 'in_review' AND operational_after->>'status' = 'open'\n      WHEN 'gap_dismissed' THEN operational_before->>'status' = 'in_review' AND operational_after->>'status' = 'dismissed'\n      WHEN 'gap_addressed' THEN operational_before->>'status' = 'in_review' AND operational_after->>'status' = 'addressed'\n      ELSE false END) IS TRUE)\n  OR (actor_kind = 'embedding_worker' AND target_kind = 'knowledge_revision'\n    AND event IN ('fail_publication','fail_reindex') AND before_state IS NULL AND after_state IS NULL\n    AND operational_before IS NOT NULL AND operational_after IS NOT NULL)\n  OR (actor_kind = 'publisher' AND target_kind = 'knowledge_revision'\n    AND before_state IS NULL AND after_state IS NULL AND\n    (CASE event\n      WHEN 'activate' THEN operational_before->>'status' = 'publishing' AND operational_after->>'status' = 'published'\n      WHEN 'supersede' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'superseded'\n      WHEN 'expire' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'expired'\n      WHEN 'switch_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'\n      WHEN 'rollback_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'\n      WHEN 'fail_publication' THEN reason_code IN ('deadline','stale_request')\n        AND operational_before->>'status' = 'publishing' AND operational_after->>'status' = 'publish_failed'\n      WHEN 'fail_reindex' THEN reason_code IN ('deadline','stale_request')\n        AND operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'\n      ELSE false END) IS TRUE)\n  OR (target_kind = 'automation_control' AND before_state IS NULL AND after_state IS NULL\n    AND operational_before IS NULL AND operational_after IS NULL\n    AND reason_code IN ('over_reserve','amount_overflow')\n    AND ((actor_kind = 'support_worker' AND event = 'trip_generation_inhibit')\n      OR (actor_kind = 'embedding_worker' AND event = 'trip_embedding_inhibit')))\n  OR (actor_kind = 'support_worker' AND before_state IS NULL AND after_state IS NULL\n    AND operational_before IS NULL AND operational_after IS NULL\n    AND ((event = 'delivery_unknown' AND reason_code IN ('ignored','oversize','admission_limited','human_requested','budget_exhausted','verified_misuse','ai_cooldown','idle_triage','deadline','scope_denied','disabled','human_takeover','resolved','stale_claim','stale_policy','late_input','history_changed','unavailable','ambiguous_write','awaiting_operator','accepted','already_human','explicit_handoff','manual_closure','no_effect','read_exhausted'))\n      OR (event = 'missed_deadline' AND reason_code = 'deadline')\n      OR (event = 'local_handoff' AND target_kind = 'outbound_delivery' AND\n        reason_code IN ('human_requested','admission_limited','budget_exhausted','idle_triage'))\n      OR (event = 'handoff_failed' AND reason_code IN ('deadline','read_exhausted','no_effect'))))\n",
+      "name": "audit_events_state_shape"
+    }
+  ],
+  "create_table_options": null,
+  "custom_indexes": [
+    {
+      "all_tenants?": false,
+      "concurrently": false,
+      "error_fields": [
+        "correlation_id"
+      ],
+      "fields": [
+        {
+          "type": "atom",
+          "value": "correlation_id"
+        }
+      ],
+      "include": null,
+      "include_base_filter?": true,
+      "message": null,
+      "name": "audit_events_inhibit_occurrence",
+      "nulls_distinct": true,
+      "prefix": null,
+      "table": null,
+      "unique": true,
+      "using": null,
+      "where": "event IN ('trip_generation_inhibit','trip_embedding_inhibit')"
+    }
+  ],
+  "custom_statements": [],
+  "has_create_action": true,
+  "hash": "E3695CC0F5765435C1044A5E8326EE5092E3CB59E93BDBAE013ADDEC789FC753",
+  "identities": [
+    {
+      "all_tenants?": false,
+      "base_filter": null,
+      "index_name": "audit_events_settlement_audit_index",
+      "keys": [
+        {
+          "type": "atom",
+          "value": "settlement_target_id"
+        }
+      ],
+      "name": "settlement_audit",
+      "nils_distinct?": true,
+      "where": null
+    }
+  ],
+  "multitenancy": {
+    "attribute": null,
+    "global": null,
+    "strategy": null
+  },
+  "repo": "Elixir.VoelgoedAi.Repo",
+  "schema": null,
+  "table": "audit_events",
+  "temporal": null
+}

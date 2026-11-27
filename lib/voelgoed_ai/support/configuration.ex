@@ -12,7 +12,7 @@ defmodule VoelgoedAi.Support.Configuration do
 
   alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Accounts.StaffAccess.Session
-  alias VoelgoedAi.Governance.{AuditEvent, AutomationControl}
+  alias VoelgoedAi.Governance.{AuditEvent, AutomationControl, EmergencyOverride}
   alias VoelgoedAi.Intelligence.{Assistant, AssistantKnowledgeGrant, AssistantRevision}
   alias VoelgoedAi.Knowledge.KnowledgeCollection
   alias VoelgoedAi.Repo
@@ -24,6 +24,39 @@ defmodule VoelgoedAi.Support.Configuration do
   @grant_limit 20
   @grant_actions [:grant_collection, :remove_collection]
   @routing_fields [:credential_ref, :handoff_team_id]
+
+  @doc "Run one bounded, qualified TEST circuit read under current admin authority."
+  def recover_circuit(staff, session_id) do
+    alias VoelgoedAi.Support.{BindingCircuit, ChatwootAdapter, Ownership}
+
+    with {:ok, {session, snapshot, generation, deadline}} <-
+           StaffAccess.with_current(staff, :admin, fn admin ->
+             Ownership.locked_session(session_id, fn config, session, now ->
+               with :ok <- eligible_binding(config.binding),
+                    {:probe, generation} <- BindingCircuit.reserve_for_admin(config.binding, now),
+                    {:ok, _} <- audit(config.binding, config.binding, :recover_circuit, admin.id) do
+                 {:ok,
+                  {session, Ownership.epoch_snapshot(config, session), generation,
+                   DateTime.add(now, 2)}}
+               else
+                 _ -> {:error, :unavailable}
+               end
+             end)
+           end) do
+      result = ChatwootAdapter.observe(session, deadline)
+
+      StaffAccess.with_current(staff, :admin, fn _ ->
+        Ownership.locked_session(session_id, fn config, current, now ->
+          if Ownership.current?(config, current, snapshot) do
+            :ok = BindingCircuit.finish_probe(config.binding, generation, now, result)
+            {:ok, BindingCircuit.label(config.binding)}
+          else
+            {:error, :stale}
+          end
+        end)
+      end)
+    end
+  end
 
   @impl true
   def run(input, _opts, %{actor: %Session{} = session}) do
@@ -370,14 +403,16 @@ defmodule VoelgoedAi.Support.Configuration do
   defp binding_transition(_, _, _), do: {:error, :invalid_transition}
 
   defp control_transition(_control, :disable_automation, _args),
-    do: {:ok, %{status: :disabled, mode: :disabled}}
+    do: {:ok, %{status: :disabled, mode: :disabled, emergency_latched: false}}
 
-  defp control_transition(%{status: :disabled}, :enable_automation, %{binding_id: id}) do
-    with {:ok, %{status: :enabled} = binding} <- lock_binding(id),
+  defp control_transition(%{status: :disabled} = control, :enable_automation, %{binding_id: id}) do
+    with false <- EmergencyOverride.blocked?(control),
+         {:ok, %{status: :enabled} = binding} <- lock_binding(id),
          :ok <- eligible_binding(binding),
          {:ok, mode} <- control_mode(binding) do
       {:ok, %{status: :enabled, mode: mode}}
     else
+      true -> {:error, :disabled}
       {:ok, _} -> {:error, :invalid_transition}
       error -> error
     end
@@ -392,7 +427,7 @@ defmodule VoelgoedAi.Support.Configuration do
         else: {:ok, :fake}
     end
 
-    defp control_mode(%{operating_mode: :shadow} = binding) do
+    defp control_mode(%{operating_mode: mode} = binding) when mode in [:shadow, :assisted] do
       with true <- VoelgoedAi.Support.Ownership.shadow_fixture?(binding),
            {:ok, assistant} <- get(Assistant, binding.assistant_id),
            {:ok, %{response_policy: :shadow_decision}} <- current_revision(assistant) do

@@ -70,6 +70,7 @@ false = ChatwootAdapter.in_scope?(%{})
 
 {:error, :scope_denied} = Ingress.accept(%{})
 :ok = Recovery.sweep()
+{:error, :unavailable} = RunProcessing.review_draft(nil, Ash.UUIDv7.generate())
 {:error, :disabled} = Embedding.publication_deadline(%{})
 
 # Neither fabricated authority nor an invalid envelope can reach a wire adapter.

@@ -52,7 +52,8 @@ defmodule VoelgoedAi.Support.Delivery do
          {:ok, {:dispatch_current, text}} <-
            with_delivery(id, fn config, session, delivery, _ ->
              dispatch_current(config, session, delivery, authorized, generation, fresh, text)
-           end) do
+           end),
+         :ok <- fixture_barrier(:before_wire) do
       result = post(session, authorized, text)
 
       case with_delivery(id, &settle(&1, &2, &3, &4, authorized, result, generation)) do
@@ -63,11 +64,14 @@ defmodule VoelgoedAi.Support.Delivery do
           RunProcessing.job_result(settled)
       end
     else
-      {:ok, {:probe, session, deadline, generation}} ->
+      {:ok, {:probe, session, deadline, generation, epochs}} ->
         observation = ChatwootAdapter.observe(session, deadline)
 
-        with_delivery(id, fn config, _, _, now ->
-          :ok = BindingCircuit.finish_probe(config.binding, generation, now, observation)
+        with_delivery(id, fn config, current, _, now ->
+          if Ownership.current?(config, current, epochs) do
+            :ok = BindingCircuit.finish_probe(config.binding, generation, now, observation)
+          end
+
           {:ok, :probe_finished}
         end)
         |> RunProcessing.job_result()
@@ -178,7 +182,10 @@ defmodule VoelgoedAi.Support.Delivery do
 
           {:probe, generation} ->
             with {:ok, _} <- fence(delivery, now, :unavailable),
-                 do: {:ok, {:probe, session, delivery.deadline_at, generation}}
+                 do:
+                   {:ok,
+                    {:probe, session, delivery.deadline_at, generation,
+                     Ownership.epoch_snapshot(config, session)}}
 
           :open ->
             fence(delivery, now, :unavailable)
@@ -551,6 +558,9 @@ defmodule VoelgoedAi.Support.Delivery do
       do: confirm(delivery, now, id, :accepted),
       else: unknown(delivery, now, :ambiguous_write)
   end
+
+  defp finish_post(_, delivery, _now, {:error, {:not_issued, :disabled}}),
+    do: fail_intent(delivery, :cancel, :dispatch_denied)
 
   defp finish_post(_, delivery, _now, {:error, {:not_issued, :deadline}}),
     do: fail_intent(delivery, :cancel, :deadline)

@@ -73,6 +73,14 @@ defmodule VoelgoedAi.Support.SupportRun do
         """
       )
 
+      check_constraint(:assisted_draft, "support_runs_assisted_provenance",
+        check: """
+        NOT assisted_draft OR (state = 'completed' AND decision = 'no_send'
+          AND (retention_state = 'purged' OR
+            (shadow_disposition = 'no_send' AND evidence_refs IS NOT NULL))) IS TRUE
+        """
+      )
+
       check_constraint(:shadow_disposition, "support_runs_typed_completion",
         check: """
         CASE
@@ -270,6 +278,7 @@ defmodule VoelgoedAi.Support.SupportRun do
       sensitive?: true
     )
 
+    attribute(:assisted_draft, :boolean, allow_nil?: false, default: false)
     attribute(:shadow_disposition, :atom, constraints: [one_of: [:no_send, :local_handoff]])
 
     attribute(:state, :atom,
@@ -402,7 +411,7 @@ defmodule VoelgoedAi.Support.SupportRun do
 
     update :complete_evidenced do
       description(
-        "Complete a running claim with qualified evidence and its public reply or shadow disposition."
+        "Complete a running claim with qualified evidence and record its delivery or no-send provenance."
       )
 
       transaction?(false)
@@ -413,6 +422,7 @@ defmodule VoelgoedAi.Support.SupportRun do
         :typed_decision,
         :evidence_refs,
         :context_digest,
+        :assisted_draft,
         :shadow_disposition,
         :finished_at
       ])

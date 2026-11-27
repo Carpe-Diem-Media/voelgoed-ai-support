@@ -6,7 +6,7 @@ defmodule VoelgoedAi.Support do
 
   alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Governance.AuditEvent
-  alias VoelgoedAi.Support.{ChatwootAdapter, Delivery, OutboundDelivery, Ownership}
+  alias VoelgoedAi.Support.{ChatwootAdapter, Delivery, OutboundDelivery, Ownership, Recovery}
 
   authorization do
     authorize(:always)
@@ -29,6 +29,21 @@ defmodule VoelgoedAi.Support do
         {:ok, project(updated)}
       end
     end)
+  end
+
+  @doc "Record a local handoff for staff to complete in Chatwoot."
+  def route_locally(staff, session_id) do
+    operator_session(staff, session_id, fn operator, config, session, now ->
+      with {:ok, updated} <- Ownership.request_local_locked(config, session, now),
+           {:ok, _} <- audit(operator, session, updated, :request_handoff) do
+        {:ok, project(updated)}
+      end
+    end)
+  end
+
+  @doc "Request a bounded read-back for an unresolved delivery in the qualified inbox."
+  def request_readback(staff, id) do
+    Recovery.operator_readback(staff, id, &audit/4)
   end
 
   @doc "Project safe intent metadata for an authorized support operator."

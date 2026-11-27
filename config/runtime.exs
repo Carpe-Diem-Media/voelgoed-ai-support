@@ -1,5 +1,10 @@
 import Config
 
+# Unset preserves the persistent control. An invalid explicit value inhibits.
+config :voelgoed_ai,
+       :emergency_override,
+       System.get_env("VGAS_EMERGENCY_DISABLE", "false") != "false"
+
 local_database_prefix =
   case config_env() do
     :dev -> "DEV"

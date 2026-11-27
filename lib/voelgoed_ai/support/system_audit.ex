@@ -36,7 +36,10 @@ defmodule VoelgoedAi.Support.SystemAudit do
       correlation_id: row.correlation_id
     }
 
-    store_create(AuditEvent, :append_system, audit_attributes(attrs))
+    with {:ok, fact} <- store_create(AuditEvent, :append_system, audit_attributes(attrs)),
+         :ok <- VoelgoedAi.Support.OperationalAlert.delivery_fact(row, event) do
+      {:ok, fact}
+    end
   end
 
   @impl true

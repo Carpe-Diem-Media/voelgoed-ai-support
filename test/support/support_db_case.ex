@@ -75,6 +75,7 @@ defmodule VoelgoedAi.SupportDBCase do
         assistant,
         Map.merge(workflow, %{
           shadow_evaluation: not is_nil(shadow),
+          assisted_draft: Keyword.get(opts, :assisted, false),
           evidence_fixture: Keyword.get(opts, :evidence_fixture, false),
           external_inbox_id: inbox_id,
           external_account_id: account_id,
@@ -139,12 +140,14 @@ defmodule VoelgoedAi.SupportDBCase do
 
     assert {:ok, _} = invoke(InboxBinding, :enable, %{id: binding.id}, admin)
 
-    unless shadow do
+    mode = if shadow, do: :assisted, else: :automatic
+
+    if is_nil(shadow) or Keyword.get(opts, :assisted, false) do
       assert {:ok, _} =
                invoke(
                  InboxBinding,
                  :change_mode,
-                 %{id: binding.id, operating_mode: :automatic},
+                 %{id: binding.id, operating_mode: mode},
                  admin
                )
     end

@@ -25,6 +25,17 @@ defmodule VoelgoedAi.SupportFixtures do
 
       SQL.query!(
         Repo,
+        """
+        DELETE FROM support_alert_episodes WHERE binding_id IN (
+          SELECT b.id FROM inbox_bindings b JOIN assistants a ON a.id = b.assistant_id
+          WHERE a.slug IN ($1, $1 || '-other')
+        )
+        """,
+        [slug]
+      )
+
+      SQL.query!(
+        Repo,
         "DELETE FROM inbox_bindings WHERE assistant_id IN (SELECT id FROM assistants WHERE slug IN ($1, $1 || '-other'))",
         [slug]
       )

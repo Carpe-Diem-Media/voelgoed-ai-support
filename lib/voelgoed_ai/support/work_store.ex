@@ -42,7 +42,7 @@ defmodule VoelgoedAi.Support.WorkStore do
     },
     Ownership => %{
       InboundEvent => [:by_id, :pending],
-      OutboundDelivery => [:by_id, :for_session, :prepare],
+      OutboundDelivery => [:by_id, :for_session, :prepare, :cancel],
       SupportRun => [:by_id, :active, :cancel],
       SupportSession => [
         :by_id,
