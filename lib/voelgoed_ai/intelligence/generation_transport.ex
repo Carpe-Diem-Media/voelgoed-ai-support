@@ -2,6 +2,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
   @moduledoc false
 
   alias VoelgoedAi.Intelligence.SupportProposal
+  alias VoelgoedAi.Repo
   alias VoelgoedAi.Support.ChatwootAdapter
 
   @model "gpt-6-luna"
@@ -11,7 +12,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
 
   # ReqLLM runs timed HTTP in a task. The closure carries the committed
   # attempt's authority and its own single-entry latch across that boundary.
-  def options(attempt, {owner, ref}, wire, timeout, cutoff) do
+  def options(attempt, {owner, ref}, wire, timeout, authorize_entry) do
     latch = :atomics.new(1, [])
     key = {ref, attempt.id, attempt.dispatch_fence}
     expires = System.monotonic_time(:millisecond) + timeout
@@ -21,12 +22,16 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
       retry: false,
       max_retries: 0,
       adapter: fn request ->
+        request = protect_errors(request)
+
         with true <- valid_request?(request),
-             remaining when remaining > 0 <- remaining(expires, cutoff),
-             :ok <- :atomics.compare_exchange(latch, 1, 0, 1) do
+             false <- Repo.in_transaction?(),
+             :ok <- :atomics.compare_exchange(latch, 1, 0, 1),
+             {:ok, %DateTime{} = cutoff} <- authorize_entry.(),
+             remaining when remaining > 0 <- remaining(expires, min_cutoff(attempt, cutoff)) do
           request = Req.merge(request, timeouts(remaining))
           started = System.monotonic_time(:microsecond)
-          {request, response} = wire.(request)
+          {request, response} = call_wire(wire, request)
           elapsed = System.monotonic_time(:microsecond) - started
           send(owner, {key, evidence(response, elapsed)})
           {request, bounded_response(response)}
@@ -35,6 +40,51 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
         end
       end
     ] ++ timeouts(timeout)
+  end
+
+  defp min_cutoff(attempt, cutoff), do: Enum.min([attempt.deadline_at, cutoff], DateTime)
+
+  # Req 0.7.5 sends returned decoder errors through the same error steps as
+  # adapter errors. ReqLLM 1.31.0 wraps those errors before emitting telemetry
+  # and fills a missing request_body from the request. Clear both sources.
+  defp protect_errors(request) do
+    request
+    |> Req.Request.prepend_error_steps(generation_safe_error: &redact_error/1)
+    |> Map.update!(:response_steps, fn steps ->
+      Keyword.update!(steps, :llm_decode_response, fn decode ->
+        fn pair -> decode_response(decode, pair) end
+      end)
+    end)
+  end
+
+  defp redact_error({request, %{status: status}}) when is_integer(status) and status in 100..599,
+    do: {%{request | body: nil}, safe_error("provider HTTP failure", status)}
+
+  defp redact_error({request, %Jason.DecodeError{}}),
+    do: {%{request | body: nil}, safe_error("response decode failed")}
+
+  defp redact_error({request, %Req.TransportError{reason: :timeout}}),
+    do: {%{request | body: nil}, safe_error("transport timeout")}
+
+  defp redact_error({request, %ReqLLM.Error.API.Response{}}),
+    do: {%{request | body: nil}, safe_error("response decode failed")}
+
+  defp redact_error({request, _}),
+    do: {%{request | body: nil}, safe_error("request failed")}
+
+  defp safe_error(reason, status \\ nil),
+    do: ReqLLM.Error.API.Request.exception(reason: reason, status: status)
+
+  defp decode_response(decode, {request, _} = pair) do
+    decode.(pair)
+  rescue
+    _ -> {request, ReqLLM.Error.API.Response.exception(reason: "response decode failed")}
+  end
+
+  defp call_wire(wire, request) do
+    wire.(request)
+  rescue
+    _ -> {request, safe_error("request failed")}
   end
 
   defp remaining(expires, cutoff) do
@@ -51,6 +101,11 @@ defmodule VoelgoedAi.Intelligence.GenerationTransport do
       connect_options: [timeout: timeout, protocols: [:http1]]
     ]
   end
+
+  # Bypass provider error parsing for non-200 responses. It logs the body in
+  # debug mode and can turn provider-supplied text into the exception reason.
+  defp bounded_response(%Req.Response{status: status}) when status != 200,
+    do: safe_error("provider HTTP failure", status)
 
   defp bounded_response(%Req.Response{body: bytes})
        when is_binary(bytes) and byte_size(bytes) > @max_body_bytes,

@@ -1,7 +1,8 @@
 defmodule VoelgoedAi.Intelligence.Generation do
   @moduledoc """
   Governs one shadow proposal attempt. Claim and reserve commit together.
-  Dispatch consumes the fence in a second transaction before any HTTP.
+  Dispatch consumes the fence in a second transaction before any HTTP. The
+  adapter checks the committed marker and current authority before wire entry.
   Recovery and late settlement use the original lineage and price even when
   the support claim has lost authority. Only a timely first settlement can
   return a proposal, subject to a fresh support qualification.
@@ -250,7 +251,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
          end) do
       {:ok, {%InferenceRun{} = dispatched, approved_locale}} ->
         barrier(fixture, :after_dispatch, dispatched)
-        outcome = invoke(dispatched, payload, fixture.wire, approved_locale)
+        outcome = invoke(dispatched, payload, fixture, approved_locale)
 
         case transaction(dispatched.id, dispatched.dispatch_fence, fn control, current, hold ->
                settle(control, current, hold, outcome)
@@ -282,32 +283,58 @@ defmodule VoelgoedAi.Intelligence.Generation do
     end
   end
 
-  defp dispatch(%{control: %{generation_inhibited: false} = control}, candidate, cutoff) do
-    with {:ok, %{state: :running, dispatched_at: nil} = attempt} <-
-           read_attempt(candidate.id, true),
+  defp dispatch(config, %{dispatched_at: nil} = candidate, cutoff) do
+    with {:ok, attempt, now} <- dispatch_ready(config, candidate, cutoff) do
+      change(attempt, %{dispatched_at: now})
+    end
+  end
+
+  defp dispatch_ready(
+         %{control: %{generation_inhibited: false, status: :enabled}},
+         candidate,
+         cutoff
+       ) do
+    with {:ok, %{state: :running} = attempt} <- read_attempt(candidate.id, true),
          true <- immutable?(attempt, candidate),
+         true <- attempt.dispatched_at == candidate.dispatched_at,
          {:ok, %{state: :reserved}} <- reservation(attempt),
          # Locks may have waited past either cutoff.
          now = ChatwootAdapter.now(),
-         true <- DateTime.before?(now, cutoff) and DateTime.before?(now, attempt.deadline_at),
-         true <- control.status == :enabled do
-      change(attempt, %{dispatched_at: now})
+         true <- DateTime.before?(now, cutoff) and DateTime.before?(now, attempt.deadline_at) do
+      {:ok, attempt, now}
     else
       _ -> {:error, :dispatch_denied}
     end
   end
 
-  defp dispatch(_, _, _), do: {:error, :dispatch_denied}
+  defp dispatch_ready(_, _, _), do: {:error, :dispatch_denied}
 
-  defp invoke(attempt, payload, wire, approved_locale) do
+  # The closure is bound to the committed attempt and runs in ReqLLM's request
+  # task. Use the same lock order as dispatch and return only after commit.
+  defp wire_cutoff(%{dispatched_at: %DateTime{}} = attempt, shadow_enabled?) do
+    scope = %{run_id: attempt.support_run_id, claim_generation: attempt.claim_generation}
+
+    qualified(scope, shadow_enabled?, fn config, _run, _revision, _now, cutoff ->
+      with {:ok, _, _} <- dispatch_ready(config, attempt, cutoff), do: {:ok, cutoff}
+    end)
+  end
+
+  defp invoke(attempt, payload, fixture, approved_locale) do
     with false <- Repo.in_transaction?(),
          remaining when remaining > 0 <-
            DateTime.diff(attempt.deadline_at, ChatwootAdapter.now(), :millisecond) do
       ref = make_ref()
       timeout = min(remaining, 45_000)
+      authorize_entry = fn -> wire_cutoff(attempt, fixture.shadow_enabled?) end
 
       opts =
-        GenerationTransport.options(attempt, {self(), ref}, wire, timeout, attempt.deadline_at)
+        GenerationTransport.options(
+          attempt,
+          {self(), ref},
+          fixture.wire,
+          timeout,
+          authorize_entry
+        )
 
       key = {__MODULE__, :prompt}
       Process.put(key, {ref, payload, [total_timeout: timeout, req_http_options: opts]})
@@ -388,7 +415,12 @@ defmodule VoelgoedAi.Intelligence.Generation do
        )
        when not is_nil(marker) and state in [:running, :unknown, :abandoned] do
     now = ChatwootAdapter.now()
-    valid = match?({:ok, %VoelgoedAi.Support.SupportDecision{}}, result)
+
+    # The frozen output limit governs proposal eligibility independently of price.
+    valid =
+      is_integer(hold.max_output_tokens) and usage.output_tokens <= hold.max_output_tokens and
+        match?({:ok, %VoelgoedAi.Support.SupportDecision{}}, result)
+
     status = if valid, do: :valid, else: :invalid_proposal
 
     with {:ok, accounting} <-

@@ -138,6 +138,187 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
     end
   end
 
+  for fault <- [:http_failure, :nested_failure, :decode_failure, :provider_decode_failure] do
+    @tag :generation
+    @tag :review_regression
+    @fault fault
+    test "ReqLLM exception telemetry redacts #{fault}", ctx do
+      owner = self()
+      event = [:req_llm, :request, :exception]
+      request_marker = "Sintetiese vraag"
+      response_marker = "synthetic-response-marker"
+      handler = make_ref()
+
+      :ok = :telemetry.attach(handler, event, &__MODULE__.relay_telemetry/4, owner)
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:error, _} =
+               generate(ctx, %{
+                 wire: fn request ->
+                   assert IO.iodata_to_binary(request.body) =~ request_marker
+
+                   case @fault do
+                     :http_failure ->
+                       wire(request, 503, Jason.encode!(%{error: %{message: response_marker}}))
+
+                     :nested_failure ->
+                       {request,
+                        ReqLLM.Error.API.Request.exception(
+                          status: 503,
+                          reason: response_marker,
+                          response_body: response_marker,
+                          request_body: request.body,
+                          cause: %RuntimeError{message: response_marker},
+                          headers: %{"x-synthetic" => [response_marker]},
+                          provider_code: response_marker
+                        )}
+
+                     :decode_failure ->
+                       wire(request, 200, ~s({"#{response_marker}":))
+
+                     :provider_decode_failure ->
+                       response(request, %{"output" => response_marker})
+                   end
+                 end
+               })
+
+      assert_received {^event, %{duration: duration}, metadata}
+      serialized = :erlang.term_to_binary(metadata)
+      assert :binary.match(serialized, request_marker) == :nomatch
+      assert :binary.match(serialized, response_marker) == :nomatch
+      assert duration >= 0
+      assert %{finish_reason: :error, error: %ReqLLM.Error.API.Request{} = error} = metadata
+
+      {status, reason} =
+        if @fault in [:decode_failure, :provider_decode_failure],
+          do: {nil, "response decode failed"},
+          else: {503, "provider HTTP failure"}
+
+      assert metadata.http_status == status
+      assert error.reason == reason
+
+      assert Map.take(error, [:request_body, :response_body, :cause, :headers, :provider_code]) ==
+               %{
+                 request_body: nil,
+                 response_body: nil,
+                 cause: nil,
+                 headers: nil,
+                 provider_code: nil
+               }
+
+      if @fault == :provider_decode_failure do
+        assert rows(ctx) == [[1, "failed", true, "settled", @ceiling, @actual, 10, 5]]
+        assert ledger(ctx) == [["settlement", @actual, nil, ~D[2031-01-31], ~D[2031-01-01]]]
+      else
+        assert rows(ctx) == [[1, "unknown", true, "unknown", @ceiling, nil, nil, nil]]
+        assert ledger(ctx) == []
+      end
+    end
+  end
+
+  for {output, state} <- [{500, "succeeded"}, {501, "failed"}] do
+    @tag :generation
+    @tag :review_regression
+    @output output
+    @expected_state state
+    test "frozen output cap with #{output} correlated output tokens", ctx do
+      owner = self()
+
+      opts = %{
+        wire: fn request ->
+          send(owner, :wire)
+
+          response(request, %{
+            "usage" => %{
+              "input_tokens" => 10,
+              "output_tokens" => @output,
+              "total_tokens" => 10 + @output
+            }
+          })
+        end
+      }
+
+      result = generate(ctx, opts)
+      assert_received :wire
+      actual = 5_000 + 750 * @output
+      expected_ledger = [["settlement", actual, nil, ~D[2031-01-31], ~D[2031-01-01]]]
+      assert ledger(ctx) == expected_ledger
+
+      if @output == 500 do
+        assert {:ok, %{decision: "handoff"}} = result
+      else
+        assert {:error, _} = result
+      end
+
+      assert rows(ctx) == [[1, @expected_state, true, "settled", @ceiling, actual, 10, @output]]
+      assert :ok = Embedding.sweep()
+      assert {:error, _} = generate(ctx, opts)
+      refute_received :wire
+      assert ledger(ctx) == expected_ledger
+    end
+  end
+
+  for disable <- [true, false] do
+    @tag :generation
+    @tag :review_regression
+    @disable disable
+    test "adapter entry after committed marker with automation disable #{disable}", ctx do
+      owner = self()
+      event = [:req_llm, :request, :start]
+      barrier = make_ref()
+      :ok = :telemetry.attach(barrier, event, &__MODULE__.park_request/4, {owner, barrier})
+      on_exit(fn -> :telemetry.detach(barrier) end)
+
+      {caller, backend} =
+        on_connection(fn ->
+          generate(ctx, %{
+            wire: fn request ->
+              send(owner, {barrier, :wire, self(), Repo.in_transaction?()})
+              response(request)
+            end
+          })
+        end)
+
+      assert_receive {^barrier, :request_started, adapter}, 5_000
+      refute adapter == caller.pid
+      assert rows(ctx) == [[1, "running", true, "reserved", @ceiling, nil, nil, nil]]
+      assert_idle(backend)
+
+      if @disable do
+        assert {:ok, _} = invoke(AutomationControl, :disable_automation, %{}, ctx.support.admin)
+      end
+
+      send(adapter, {barrier, :resume})
+      result = Task.await(caller)
+
+      if @disable do
+        assert {:error, _} = result
+        refute_received {^barrier, :wire, _, _}
+        assert rows(ctx) == [[1, "unknown", true, "unknown", @ceiling, nil, nil, nil]]
+        assert ledger(ctx) == []
+      else
+        assert {:ok, %{decision: "handoff"}} = result
+        assert_received {^barrier, :wire, ^adapter, false}
+        refute_received {^barrier, :wire, _, _}
+        assert rows(ctx) == [[1, "succeeded", true, "settled", @ceiling, @actual, 10, 5]]
+      end
+    end
+  end
+
+  def relay_telemetry(event, measurements, metadata, owner) do
+    send(owner, {event, measurements, metadata})
+  end
+
+  def park_request(_event, _measurements, _metadata, {owner, barrier}) do
+    send(owner, {barrier, :request_started, self()})
+
+    receive do
+      {^barrier, :resume} -> :ok
+    after
+      10_000 -> raise "unreleased request-entry barrier"
+    end
+  end
+
   @tag :generation
   test "an unconsumed expired attempt releases while a consumed marker holds", ctx do
     owner = self()
