@@ -62,7 +62,7 @@ defmodule VoelgoedAi.SupportFixtures do
   end
 
   def reject_financial_audit(event, work)
-      when event in [:close_unknown_inference, :reset_embedding_inhibit] do
+      when event in [:close_unknown_inference, :reset_embedding_inhibit, :trip_generation_inhibit] do
     SQL.query!(Repo, """
     ALTER TABLE audit_events ADD CONSTRAINT reject_financial_audit
     CHECK (event <> '#{event}') NOT VALID

@@ -91,22 +91,12 @@ defmodule VoelgoedAi.Intelligence.Generation do
     end
 
     @doc false
-    def reset_budget(%{
-          "attempt_id" => attempt_id,
-          "quote" => %{"day_cap" => day, "month_cap" => month} = quote
-        })
-        when is_binary(attempt_id) do
+    def reset_budget(%{"day_cap" => day, "month_cap" => month} = quote) do
       config = %{price: @price, day_cap: day, month_cap: month}
 
-      with true <- verified_profile?(%{}),
-           true <- budget_authority(config) === quote,
-           {:ok, %{purpose: :generate, generation_budget: frozen}} <-
-             read_attempt(attempt_id, false),
-           true <- frozen === quote do
-        {:ok, config}
-      else
-        _ -> {:error, :invalid_budget}
-      end
+      if verified_profile?(%{}) and budget_authority(config) === quote,
+        do: {:ok, config},
+        else: {:error, :invalid_budget}
     end
 
     def reset_budget(_), do: {:error, :invalid_budget}
@@ -286,14 +276,7 @@ defmodule VoelgoedAi.Intelligence.Generation do
   # The quote comes from the same fixture scope as admission. Persist it with
   # the attempt so delayed settlement cannot substitute another fixture's caps.
   defp budget_authority(config) do
-    %{
-      "provider" => "openai",
-      "model" => SupportProposal.model(),
-      "profile" => SupportProposal.profile(),
-      "price" => Map.new(config.price, fn {key, value} -> {Atom.to_string(key), value} end),
-      "day_cap" => config.day_cap,
-      "month_cap" => config.month_cap
-    }
+    Accounting.budget_quote("openai", SupportProposal.model(), SupportProposal.profile(), config)
   end
 
   defp verified_profile?(options) do

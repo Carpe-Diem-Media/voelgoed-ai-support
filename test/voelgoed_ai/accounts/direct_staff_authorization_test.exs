@@ -23,6 +23,8 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
   @audit_actions [
     append: :create,
     append_financial: :create,
+    append_inhibit_trip: :create,
+    inhibit_trip: :read,
     financial_closure: :read,
     append_knowledge: :create,
     append_publication_failure: :create,
@@ -157,6 +159,26 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
       reason_code: :local_admin,
       after_state: %{status: :invited, roles: [:admin], session_generation: 1},
       correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:append_inhibit_trip, _) do
+    %{
+      actor_kind: :support_worker,
+      target_kind: :automation_control,
+      control_target_id: Ash.UUIDv7.generate(),
+      inhibit_attempt_id: Ash.UUIDv7.generate(),
+      event: :trip_generation_inhibit,
+      reason_code: :over_reserve,
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:inhibit_trip, _) do
+    %{
+      control_id: Ash.UUIDv7.generate(),
+      occurrence: Ash.UUIDv7.generate(),
+      event: :trip_generation_inhibit
     }
   end
 

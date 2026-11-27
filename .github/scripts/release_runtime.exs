@@ -27,7 +27,7 @@ for {module, function, arity} <- [
       {Generation, :with_fixture, 4},
       {Generation, :propose, 5},
       {Generation, :reset_budget, 1},
-      {Embedding, :fixture_budget, 0},
+      {Embedding, :reset_budget, 1},
       {FinancialControl, :with_decision, 4},
       {RunProcessing, :claim_evidence_fixture, 1},
       {RunProcessing, :complete_evidence_fixture, 3},

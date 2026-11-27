@@ -358,6 +358,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
                    provider: EmbeddingProfile.provider(),
                    model_id: EmbeddingProfile.model(),
                    profile_id: EmbeddingProfile.id(),
+                   embedding_budget: budget_authority(config),
                    ordinal: 1,
                    deadline_at: deadline,
                    started_at: now,
@@ -492,6 +493,7 @@ defmodule VoelgoedAi.Intelligence.Embedding do
                    provider: EmbeddingProfile.provider(),
                    model_id: EmbeddingProfile.model(),
                    profile_id: row.profile_id,
+                   embedding_budget: budget_authority(config),
                    ordinal: row.attempt_count + 1,
                    deadline_at: row.deadline_at,
                    dispatch_fence: Ash.UUIDv7.generate(),
@@ -1083,6 +1085,15 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     Enum.find_value(fixture_settings(), {:error, :disabled}, work)
   end
 
+  defp budget_authority(config) do
+    EmbeddingAccounting.budget_quote(
+      EmbeddingProfile.provider(),
+      EmbeddingProfile.model(),
+      EmbeddingProfile.id(),
+      config
+    )
+  end
+
   if Mix.env() == :test do
     @fixture_price %{
       version: "embedding-fixture-v1",
@@ -1127,7 +1138,16 @@ defmodule VoelgoedAi.Intelligence.Embedding do
         Map.get(fixture(), :enqueue_finalisation, &Publication.enqueue_finalisation/1).(revision)
 
     @doc false
-    def fixture_budget, do: gate()
+    def reset_budget(%{"day_cap" => day, "month_cap" => month} = quote) do
+      config = %{price: @fixture_price, day_cap: day, month_cap: month}
+
+      if budget_authority(config) === quote,
+        do: {:ok, config},
+        else: {:error, :invalid_budget}
+    end
+
+    def reset_budget(_), do: {:error, :invalid_budget}
+
     def now, do: Map.get(fixture(), :clock, &DateTime.utc_now/0).()
     defp hook(stage, attempt), do: Map.get(fixture(), stage, fn _ -> :ok end).(attempt)
     defp consume(fence), do: Map.get(fixture(), :consume_dispatch, fn fun -> fun.() end).(fence)

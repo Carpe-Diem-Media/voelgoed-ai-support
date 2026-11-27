@@ -21,7 +21,7 @@ defmodule VoelgoedAi.KnowledgeFixtures do
         %{rows: [value]} =
           SQL.query!(
             Repo,
-            "SELECT embedding_inhibited, embedding_inhibit_occurrence FROM automation_controls"
+            "SELECT embedding_inhibited, embedding_inhibit_occurrence, embedding_inhibit_budget FROM automation_controls"
           )
 
         value
@@ -35,7 +35,7 @@ defmodule VoelgoedAi.KnowledgeFixtures do
 
       SQL.query(
         Repo,
-        "DELETE FROM audit_events WHERE actor_staff_id::text = ANY($1) AND target_kind LIKE 'knowledge_%'",
+        "DELETE FROM audit_events WHERE actor_staff_id::text = ANY($1) AND (target_kind LIKE 'knowledge_%' OR event = 'reset_embedding_inhibit')",
         [[admin.id, editor.id, reviewer.id]]
       )
 
@@ -161,7 +161,7 @@ defmodule VoelgoedAi.KnowledgeFixtures do
 
     SQL.query!(
       Repo,
-      "UPDATE automation_controls SET embedding_inhibited = $1, embedding_inhibit_occurrence = $2",
+      "UPDATE automation_controls SET embedding_inhibited = $1, embedding_inhibit_occurrence = $2, embedding_inhibit_budget = $3",
       original_inhibit
     )
   end
@@ -177,7 +177,7 @@ defmodule VoelgoedAi.KnowledgeFixtures do
     SQL.query!(
       Repo,
       """
-      DELETE FROM audit_events WHERE settlement_target_id IN (
+      DELETE FROM audit_events WHERE inhibit_attempt_id IN (#{attempt}) OR settlement_target_id IN (
         SELECT id FROM usage_ledger_entries WHERE inference_run_id IN (#{attempt})
       )
       """,

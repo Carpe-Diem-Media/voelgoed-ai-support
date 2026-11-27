@@ -134,28 +134,62 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
   end
 
   @doc false
-  def reset_headroom(control, lane, now, %{price: price, day_cap: day, month_cap: month}) do
-    purpose = if lane == :generation, do: :generate, else: :article_embedding
-    cleared = %{generation_inhibited: false, embedding_inhibited: false}
+  def budget_quote(provider, model, profile, config) do
+    %{
+      "provider" => provider,
+      "model" => model,
+      "profile" => profile,
+      "price" => Map.new(config.price, fn {key, value} -> {Atom.to_string(key), value} end),
+      "day_cap" => config.day_cap,
+      "month_cap" => config.month_cap
+    }
+  end
 
-    with true <- valid_caps?(day, month),
-         {:ok, ceiling} <- admission_price(%{purpose: purpose}, cleared, price),
-         {:ok, %{rows: [[false]]}} <-
-           SQL.query(
-             Repo,
-             """
-             SELECT EXISTS (
-               SELECT 1 FROM inference_runs i JOIN usage_reservations r ON r.inference_run_id = i.id
-               WHERE (i.purpose = 'generate') = $1
-               AND (r.state = 'unknown' OR (r.state = 'reserved' AND i.dispatched_at IS NOT NULL))
-             )
-             """,
-             [lane == :generation]
-           ) do
-      headroom(control, now, day, month, ceiling)
-    else
-      _ -> {:error, :unresolved_exposure}
+  if Mix.env() == :test do
+    alias VoelgoedAi.Intelligence.InferenceRun
+
+    @doc false
+    def reset_headroom(control, lane, occurrence, now) do
+      cleared = %{generation_inhibited: false, embedding_inhibited: false}
+
+      with {true, ^occurrence, %{"attempt_id" => id, "quote" => quote} = reference} <-
+             inhibit_state(control, lane),
+           true <- is_map(quote) and trip_matches?(control, lane, occurrence, reference),
+           {:ok, %InferenceRun{dispatched_at: %DateTime{}} = attempt} <-
+             query(InferenceRun, :storage_row, %{id: id}, &Ash.read_one/1, false),
+           {^lane, ^quote} <- attempt_quote(attempt),
+           {:ok, %{price: expected, day_cap: day, month_cap: month} = config} <-
+             reset_budget(lane, quote),
+           true <- valid_caps?(day, month),
+           true <-
+             budget_quote(attempt.provider, attempt.model_id, attempt.profile_id, config) ===
+               quote,
+           {:ok, ceiling} <- admission_price(attempt, cleared, expected),
+           {:ok, %UsageReservation{reserved_nano_usd: ^ceiling} = reservation} <-
+             query(UsageReservation, :for_attempt, %{id: id}, &Ash.read_one/1, false),
+           true <-
+             price(reservation) ===
+               Map.merge(%{max_output_tokens: nil, output_rate_nano_usd: nil}, expected),
+           {:ok, %{rows: [[false]]}} <-
+             SQL.query(
+               Repo,
+               """
+               SELECT EXISTS (
+                 SELECT 1 FROM inference_runs i JOIN usage_reservations r ON r.inference_run_id = i.id
+                 WHERE (i.purpose = 'generate') = $1
+                 AND (r.state = 'unknown' OR (r.state = 'reserved' AND i.dispatched_at IS NOT NULL))
+               )
+               """,
+               [lane == :generation]
+             ) do
+        headroom(control, now, day, month, ceiling)
+      else
+        _ -> {:error, :unresolved_exposure}
+      end
     end
+
+    defp reset_budget(:generation, quote), do: Generation.reset_budget(quote)
+    defp reset_budget(:embedding, quote), do: Embedding.reset_budget(quote)
   end
 
   defp valid_caps?(day, month),
@@ -400,15 +434,16 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
          {:ok, month} <- projected(:month, reservation.month_window, entry.amount_nano_usd),
          {:ok, ledger} <- append(attempt, reservation, entry),
          {:ok, _} <- update_reservation(reservation, entry, terminal, now),
-         :ok <- maybe_inhibit(control, attempt, discrepancy?),
          {:ok, windows} <- lock_windows(reservation),
          {:ok, _} <- change(windows.day, %{settled_nano_usd: day}),
          {:ok, _} <- change(windows.month, %{settled_nano_usd: month}),
+         :ok <- maybe_inhibit(control, attempt, now, discrepancy?),
          :ok <- audit_closure(attempt, ledger, entry, now) do
       {:ok, entry.reason_code}
     else
       {:error, :amount_overflow} when entry.reason_code == :conservative_closure ->
-        with {:ok, _} <- inhibit(control, attempt), do: {:ok, :amount_overflow}
+        with {:ok, _} <- inhibit(control, attempt, now, :amount_overflow),
+             do: {:ok, :amount_overflow}
 
       {:error, :amount_overflow} ->
         inhibit_and_hold(control, attempt, reservation, now)
@@ -467,61 +502,117 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
        when not is_nil(evidence), do: {:ok, :amount_overflow}
 
   defp inhibit_and_hold(control, attempt, reservation, now) do
-    with {:ok, _} <- inhibit(control, attempt) do
+    hold =
       if reservation.state in [:reserved, :unknown] do
         settle(control, attempt, reservation, now, {:hold, :amount_overflow})
       else
         {:ok, :amount_overflow}
       end
-      |> case do
-        {:ok, _} -> {:ok, :amount_overflow}
-        error -> error
-      end
+
+    with {:ok, _} <- hold,
+         {:ok, _} <- inhibit(control, attempt, now, :amount_overflow) do
+      {:ok, :amount_overflow}
     end
   end
 
-  defp maybe_inhibit(control, attempt, true) do
-    with {:ok, _} <- inhibit(control, attempt), do: :ok
+  defp maybe_inhibit(control, attempt, now, true) do
+    with {:ok, _} <- inhibit(control, attempt, now, :over_reserve), do: :ok
   end
 
-  defp maybe_inhibit(_control, _attempt, false), do: :ok
+  defp maybe_inhibit(_control, _attempt, _now, false), do: :ok
 
-  # A predecessor flag alone is evidence of an unresolved amount. A later
-  # trip cannot classify it or give an operator an occurrence they can reset.
-  defp inhibit(
-         %{generation_inhibited: true, generation_inhibit_occurrence: nil} = control,
-         %{purpose: :generate}
-       ),
-       do: {:ok, control}
+  defp inhibit(control, attempt, now, reason) do
+    {lane, quote} = attempt_quote(attempt)
 
-  defp inhibit(control, %{purpose: :generate} = attempt) do
-    quote = attempt.generation_budget
+    case inhibit_state(control, lane) do
+      # A later trip cannot classify unresolved predecessor exposure.
+      {true, nil, _} ->
+        {:ok, control}
 
-    # Multiple trips under different quotes leave no single approved budget
-    # for this inhibit. In particular a later trip cannot raise the reset cap.
-    budget =
-      if quote &&
-           (not control.generation_inhibited or
-              control.generation_inhibit_budget["quote"] === quote) do
-        %{"attempt_id" => attempt.id, "quote" => quote}
-      end
+      {inhibited, previous, reference} ->
+        # A conflicting or unverifiable prior quote cannot authorize a reset.
+        budget =
+          if is_map(quote) and
+               (not inhibited or
+                  (reference["quote"] === quote and
+                     trip_matches?(control, lane, previous, reference))) do
+            %{"attempt_id" => attempt.id, "quote" => quote}
+          end
 
-    storage(control.__struct__, :inhibit_generation, fn actor ->
-      Ash.update(control, %{generation_inhibit_budget: budget},
-        action: :inhibit_generation,
-        actor: actor
-      )
-    end)
+        {action, field, _event, _actor} = trip_attributes(lane)
+
+        with {:ok, updated} <-
+               storage(control.__struct__, action, fn actor ->
+                 Ash.update(control, %{field => budget}, action: action, actor: actor)
+               end),
+             {true, occurrence, _} <- inhibit_state(updated, lane),
+             {:ok, _} <-
+               append_trip(control, attempt, occurrence, not is_nil(budget), now, reason) do
+          {:ok, updated}
+        end
+    end
   end
 
-  defp inhibit(%{embedding_inhibited: true, embedding_inhibit_occurrence: nil} = control, _),
-    do: {:ok, control}
+  defp attempt_quote(%{purpose: :generate, generation_budget: quote}), do: {:generation, quote}
 
-  defp inhibit(control, _attempt) do
+  defp attempt_quote(%{purpose: purpose, embedding_budget: quote})
+       when purpose in [:article_embedding, :query_embedding],
+       do: {:embedding, quote}
+
+  defp inhibit_state(control, :generation) do
+    {control.generation_inhibited, control.generation_inhibit_occurrence,
+     control.generation_inhibit_budget}
+  end
+
+  defp inhibit_state(control, :embedding) do
+    {control.embedding_inhibited, control.embedding_inhibit_occurrence,
+     control.embedding_inhibit_budget}
+  end
+
+  defp trip_attributes(:generation),
+    do:
+      {:inhibit_generation, :generation_inhibit_budget, :trip_generation_inhibit, :support_worker}
+
+  defp trip_attributes(:embedding),
+    do:
+      {:inhibit_embedding, :embedding_inhibit_budget, :trip_embedding_inhibit, :embedding_worker}
+
+  defp trip_matches?(control, lane, occurrence, %{"attempt_id" => id, "quote" => quote}) do
+    {_action, _field, event, _actor} = trip_attributes(lane)
+    args = %{control_id: control.id, occurrence: occurrence, event: event}
+
+    case query(AuditEvent, :inhibit_trip, args, &Ash.read_one/1, false) do
+      {:ok, %{inhibit_attempt_id: ^id, inhibit_quote: frozen, inhibit_reset_eligible: true}} ->
+        frozen === quote
+
+      _ ->
+        false
+    end
+  end
+
+  defp trip_matches?(_control, _lane, _occurrence, _reference), do: false
+
+  defp append_trip(control, attempt, occurrence, reset_eligible?, now, reason) do
+    {lane, quote} = attempt_quote(attempt)
+    {_action, _field, event, actor_kind} = trip_attributes(lane)
+
+    attrs = %{
+      actor_kind: actor_kind,
+      target_kind: :automation_control,
+      control_target_id: control.id,
+      event: event,
+      reason_code: reason,
+      inhibit_attempt_id: attempt.id,
+      inhibit_quote: quote,
+      inhibit_reset_eligible: reset_eligible?,
+      correlation_id: occurrence,
+      occurred_at: now
+    }
+
     storage(
-      control.__struct__,
-      :inhibit_embedding,
-      &Ash.update(control, %{}, action: :inhibit_embedding, actor: &1)
+      AuditEvent,
+      :append_inhibit_trip,
+      &Ash.create(AuditEvent, attrs, action: :append_inhibit_trip, actor: &1)
     )
   end
 

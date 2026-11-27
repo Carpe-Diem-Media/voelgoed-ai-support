@@ -2,7 +2,13 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
   use ExUnit.Case, async: false
 
   import VoelgoedAi.SupportFixtures,
-    only: [invoke: 4, blocked_task: 1, assert_blocked_by: 2, financial_decision: 4]
+    only: [
+      invoke: 4,
+      blocked_task: 1,
+      assert_blocked_by: 2,
+      financial_decision: 4,
+      reject_financial_audit: 2
+    ]
 
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.{KnowledgeFixtures, Repo, SupportDBCase}
@@ -627,6 +633,99 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
     assert reset_audits(occurrence) == 1
   end
 
+  @tag :generation
+  @tag :reset_authority
+  test "an unrelated successful attempt cannot attest a generation trip", ctx do
+    sibling = setup_turn(SupportDBCase.next_conversation(ctx.support, 1), ctx.now)
+    assert {:ok, _} = generate(sibling, %{wire: &response/1})
+
+    assert [[attempt, quote]] =
+             SQL.query!(
+               Repo,
+               "SELECT id::text, generation_budget FROM inference_runs WHERE turn_ref = $1",
+               [uuid(sibling.turn_ref)]
+             ).rows
+
+    SupportDBCase.advance_clock(ctx.support, 15)
+
+    tripping =
+      setup_turn(
+        SupportDBCase.next_conversation(ctx.support, 2),
+        VoelgoedAi.Support.ChatwootAdapter.now()
+      )
+
+    assert {:error, _} = generate(tripping, overage_options())
+    assert [[true, occurrence]] = inhibit_state(:generation)
+
+    SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibit_budget = $1", [
+      %{"attempt_id" => attempt, "quote" => quote}
+    ])
+
+    assert {:error, _} = reset(tripping, :generation, occurrence)
+    assert [[true, ^occurrence]] = inhibit_state(:generation)
+    assert reset_audits(occurrence) == 0
+  end
+
+  @tag :generation
+  @tag :reset_authority
+  test "a rejected trip audit rolls back the inhibit and settlement", ctx do
+    before = origin_windows()
+
+    reject_financial_audit(:trip_generation_inhibit, fn ->
+      assert {:error, _} = generate(ctx, overage_options())
+    end)
+
+    assert [[false, nil]] = inhibit_state(:generation)
+    assert [] = ledger_identity(ctx)
+    assert [[1, "running", true, "reserved", @ceiling, nil, nil, nil]] = rows(ctx)
+    assert Enum.all?(origin_windows(), fn [_, _, total] -> total == 0 end)
+    assert Enum.all?(before, fn [_, _, total] -> total == 0 end)
+  end
+
+  @tag :generation
+  @tag :reset_authority
+  test "a conflicting retrip cannot become resettable even with its own quote", ctx do
+    first_budget = %{day_cap: 2 * @ceiling, month_cap: 2 * @ceiling}
+    conflicting = setup_turn(SupportDBCase.next_conversation(ctx.support, 1), ctx.now)
+    high_budget = %{day_cap: 3 * @ceiling, month_cap: 3 * @ceiling}
+    wire = overage_options().wire
+    {first, _, first_adapter, first_barrier} = park(ctx, wire, first_budget)
+    {second, second_id, second_adapter, second_barrier} = park(conflicting, wire, high_budget)
+
+    send(first_adapter, {:resume, first_barrier})
+    assert {:error, _} = Task.await(first)
+    assert [[true, first_occurrence]] = inhibit_state(:generation)
+
+    send(second_adapter, {:resume, second_barrier})
+    assert {:error, _} = Task.await(second)
+    assert [[true, occurrence]] = inhibit_state(:generation)
+    refute occurrence == first_occurrence
+    SupportDBCase.advance_clock(ctx.support, 15)
+
+    assert {:error, _} = reset(ctx, :generation, first_occurrence)
+    assert {:error, _} = reset(ctx, :generation, occurrence)
+
+    assert [[quote, false]] =
+             SQL.query!(
+               Repo,
+               """
+               SELECT inhibit_quote, inhibit_reset_eligible
+               FROM audit_events
+               WHERE event = 'trip_generation_inhibit' AND correlation_id = $1 AND inhibit_attempt_id = $2
+               """,
+               [uuid(occurrence), uuid(second_id)]
+             ).rows
+
+    SQL.query!(Repo, "UPDATE automation_controls SET generation_inhibit_budget = $1", [
+      %{"attempt_id" => second_id, "quote" => quote}
+    ])
+
+    assert {:error, _} = reset(ctx, :generation, occurrence)
+    assert [[true, ^occurrence]] = inhibit_state(:generation)
+    assert reset_audits(first_occurrence) == 0
+    assert reset_audits(occurrence) == 0
+  end
+
   defp queue_reset_and_admission(ctx, occurrence, next, opts) do
     assert {:ok, tasks} =
              Repo.transact(fn ->
@@ -772,6 +871,32 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
       uuid(id)
     ])
 
+    # Exercise the downgrade guard when the trip audit is the only new evidence.
+    # The synthetic row models an occurrence that is no longer on the control.
+    %{rows: [[trip_id]]} =
+      SQL.query!(
+        Repo,
+        """
+        INSERT INTO audit_events (
+          id, actor_kind, target_kind, control_target_id, event, reason_code,
+          inhibit_attempt_id, inhibit_reset_eligible, correlation_id, occurred_at
+        )
+        SELECT $1, 'support_worker', 'automation_control', id, 'trip_generation_inhibit',
+          'amount_overflow', $2, false, $3, now()
+        FROM automation_controls
+        RETURNING id
+        """,
+        [uuid(Ash.UUIDv7.generate()), uuid(id), uuid(Ash.UUIDv7.generate())]
+      )
+
+    try do
+      assert_raise Postgrex.Error, ~r/VGAS-20 rollback would remove financial evidence/, fn ->
+        Ecto.Migrator.run(Repo, :down, step: 1)
+      end
+    after
+      SQL.query!(Repo, "DELETE FROM audit_events WHERE id = $1", [trip_id])
+    end
+
     assert [@finance_version] = Ecto.Migrator.run(Repo, :down, step: 1)
 
     try do
@@ -788,11 +913,11 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
 
     assert [[true, nil]] = inhibit_state(:generation)
 
-    assert [[nil, nil, nil]] =
+    assert [[nil, nil, nil, nil]] =
              SQL.query!(
                Repo,
                """
-               SELECT generation_budget, overflow_evidence, overflow_resolved_at
+               SELECT generation_budget, embedding_budget, overflow_evidence, overflow_resolved_at
                FROM inference_runs WHERE id = $1
                """,
                [uuid(id)]
@@ -1279,7 +1404,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
      )}
   end
 
-  defp park(ctx, wire \\ &response/1) do
+  defp park(ctx, wire \\ &response/1, budget \\ %{}) do
     owner = self()
     barrier = make_ref()
 
@@ -1301,7 +1426,7 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
         Repo.checkout(fn ->
           %{rows: [[backend]]} = SQL.query!(Repo, "SELECT pg_backend_pid()")
           send(owner, {barrier, :backend, backend})
-          generate(ctx, opts)
+          generate(ctx, Map.merge(opts, budget))
         end)
       end)
 
@@ -1428,7 +1553,9 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
       SQL.query!(
         Repo,
         """
-        DELETE FROM audit_events WHERE settlement_target_id IN (
+        DELETE FROM audit_events WHERE inhibit_attempt_id IN (
+          SELECT id FROM inference_runs WHERE turn_ref = $1
+        ) OR settlement_target_id IN (
           SELECT l.id FROM usage_ledger_entries l JOIN inference_runs i ON i.id = l.inference_run_id
           WHERE i.turn_ref = $1
         )

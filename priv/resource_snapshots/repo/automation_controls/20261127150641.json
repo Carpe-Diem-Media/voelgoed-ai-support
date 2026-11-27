@@ -121,6 +121,18 @@
       "type": "uuid"
     },
     {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "embedding_inhibit_budget",
+      "type": "map"
+    },
+    {
       "allow_nil?": false,
       "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
       "generated?": false,
@@ -179,7 +191,7 @@
     }
   ],
   "has_create_action": false,
-  "hash": "7689F982284CA3EF02298A356AB1713371E44FF59E0EFFEACE24774AF7532185",
+  "hash": "2A8001096984B0620B3B9E3EF8865DFF8243CE4B12FD1B95FD4FA2789962D8C6",
   "identities": [
     {
       "all_tenants?": false,

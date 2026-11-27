@@ -178,6 +178,7 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
 
     attribute(:overflow_resolved_at, :utc_datetime_usec)
     attribute(:generation_budget, :map)
+    attribute(:embedding_budget, :map)
 
     attribute(:correlation_id, :uuid, allow_nil?: false)
     create_timestamp(:inserted_at)
@@ -247,6 +248,7 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
         :provider,
         :model_id,
         :profile_id,
+        :embedding_budget,
         :ordinal,
         :deadline_at,
         :dispatch_fence,
@@ -264,6 +266,7 @@ defmodule VoelgoedAi.Intelligence.InferenceRun do
         :provider,
         :model_id,
         :profile_id,
+        :embedding_budget,
         :ordinal,
         :deadline_at,
         :dispatch_fence,

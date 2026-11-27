@@ -82,10 +82,12 @@ without qualified usage retains the UNKNOWN hold.
 
 Reset is scoped to one classified inhibit occurrence. Under the accounting
 lock it checks ambiguous exposure and headroom in both UTC windows,
-including outstanding holds. Generation reset uses the exact TEST caps
-and request profile recorded when the triggering attempt was admitted.
-It denies missing or mismatched quotes, including an inhibit tripped
-under conflicting quotes. The reset audit commits with the flag change.
+including outstanding holds. Both lanes use the TEST profile, price and
+caps recorded at admission. A separate append-only audit binds the
+occurrence to the actual tripping attempt and its quote in the same
+transaction as the financial changes. Reset verifies that audit, the
+attempt and its reservation. It denies missing evidence, mismatched
+quotes and conflicting retrips. The reset audit commits with the flag change.
 
 Repeated faults replace classified occurrence IDs. A predecessor flag
 with no occurrence remains unclassified even after a later trip. It
@@ -115,8 +117,8 @@ routine checks.
 
 The VGAS-20 migration adds evidence fields and an audit reference without
 rewriting previous financial rows. A downgrade can remove the schema
-additions before they have recorded an audit, inhibit occurrence, generation
-budget or overflow.
+additions before they have recorded a financial audit, inhibit occurrence,
+admitted budget or overflow.
 After recording evidence, disable automation and financial commands. Retain
 the schema and use a build that can read the recorded audit events and
 overflow evidence.

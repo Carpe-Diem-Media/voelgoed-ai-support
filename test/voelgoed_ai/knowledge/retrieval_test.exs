@@ -1190,6 +1190,86 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     end
   end
 
+  @tag :reset_authority
+  @tag :requires_pgvector
+  @tag :embedding_index
+  test "a later fixture budget cannot reset a query embedding overage" do
+    alias VoelgoedAi.Governance.AutomationControl
+
+    origin = ~U[2028-01-31 23:59:50Z]
+    ctx = setup_search(%{}, query_clock: origin)
+
+    fixture(%{
+      clock: fn -> origin end,
+      day_cap: 81_920,
+      month_cap: 81_920,
+      wire: &wire_result(&1, :over_reserve)
+    })
+
+    assert {:ok, %{status: :unavailable, evidence: []}} = search(ctx.claim)
+    assert [["succeeded", true, "settled", 100_000]] = query_rows(ctx)
+
+    assert [[true, occurrence]] =
+             SQL.query!(
+               Repo,
+               "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+             ).rows
+
+    reset = %{lane: :embedding, occurrence: occurrence}
+
+    decide = fn ->
+      VoelgoedAi.SupportFixtures.financial_decision(
+        AutomationControl,
+        :reset_financial_inhibit,
+        reset,
+        ctx.knowledge.admin
+      )
+    end
+
+    assert {:error, _} = decide.()
+    fixture(%{clock: fn -> origin end, day_cap: 10_000_000, month_cap: 100_000_000})
+    assert {:error, _} = decide.()
+
+    assert [[true, ^occurrence]] =
+             SQL.query!(
+               Repo,
+               "SELECT embedding_inhibited, embedding_inhibit_occurrence::text FROM automation_controls"
+             ).rows
+
+    assert [[0]] =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM audit_events WHERE event = 'reset_embedding_inhibit' AND correlation_id = $1",
+               [Ecto.UUID.dump!(occurrence)]
+             ).rows
+
+    fixture(%{clock: fn -> DateTime.add(origin, 15) end, day_cap: 1, month_cap: 1})
+
+    [[approved]] =
+      SQL.query!(Repo, "SELECT embedding_inhibit_budget FROM automation_controls").rows
+
+    [[replacement_id, replacement_quote] | _] =
+      SQL.query!(
+        Repo,
+        "SELECT id::text, embedding_budget FROM inference_runs WHERE purpose = 'article_embedding' AND state = 'succeeded' AND embedding_budget IS NOT NULL ORDER BY id"
+      ).rows
+
+    for invalid <- [nil, %{"attempt_id" => replacement_id, "quote" => replacement_quote}] do
+      SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibit_budget = $1", [invalid])
+      assert {:error, _} = decide.()
+    end
+
+    assert [[0]] =
+             SQL.query!(
+               Repo,
+               "SELECT count(*) FROM audit_events WHERE event = 'reset_embedding_inhibit' AND correlation_id = $1",
+               [uuid(occurrence)]
+             ).rows
+
+    SQL.query!(Repo, "UPDATE automation_controls SET embedding_inhibit_budget = $1", [approved])
+    assert {:ok, ^reset} = decide.()
+  end
+
   for {name, result, expected} <- [
         {:unavailable, 503, ["unknown", true, "unknown", nil]},
         {:timeout, :timeout, ["unknown", true, "unknown", nil]},
@@ -1752,6 +1832,14 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
           end
         end
       )
+
+    support =
+      if now = Keyword.get(opts, :query_clock) do
+        Agent.update(support.fake, &%{&1 | now: now})
+        put_in(support.event.received_at, now)
+      else
+        support
+      end
 
     {claim, now} = create_run(support)
 

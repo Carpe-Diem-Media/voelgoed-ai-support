@@ -16,7 +16,7 @@ defmodule VoelgoedAi.Governance.FinancialControl do
     alias VoelgoedAi.Accounts.StaffAccess
     alias VoelgoedAi.Accounts.StaffAccess.Session
     alias VoelgoedAi.Governance.{AuditEvent, EmbeddingAccounting}
-    alias VoelgoedAi.Intelligence.{Embedding, Generation}
+    alias VoelgoedAi.Intelligence.Embedding
     alias VoelgoedAi.Knowledge.Storage
     alias VoelgoedAi.Repo
     alias VoelgoedAi.Support.Configuration
@@ -47,11 +47,6 @@ defmodule VoelgoedAi.Governance.FinancialControl do
 
     defp approved?(action, actor, target),
       do: not is_nil(target) and Process.get(@decision) == {action, actor, target}
-
-    defp budget(:embedding, _control), do: Embedding.fixture_budget()
-
-    defp budget(:generation, control),
-      do: Generation.reset_budget(control.generation_inhibit_budget)
 
     defp target(%{id: id}), do: id
     defp target(%{lane: lane, occurrence: occurrence}), do: {lane, occurrence}
@@ -91,8 +86,7 @@ defmodule VoelgoedAi.Governance.FinancialControl do
       {flag, current, action, event, now} = reset_attributes(control, lane)
 
       with true <- flag and current == occurrence,
-           {:ok, config} <- budget(lane, control),
-           :ok <- EmbeddingAccounting.reset_headroom(control, lane, now, config),
+           :ok <- EmbeddingAccounting.reset_headroom(control, lane, occurrence, now),
            {:ok, _} <-
              storage(
                control.__struct__,

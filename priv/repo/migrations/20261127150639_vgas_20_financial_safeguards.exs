@@ -1,12 +1,29 @@
 defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
   @moduledoc """
-  Adds closure audit references, inhibit occurrences, approved generation budgets and overflow evidence.
+  Adds closure and inhibit audit evidence, admitted budgets and overflow evidence.
   Historical charges, attempts and legacy inhibit flags are preserved.
   """
 
   use Ecto.Migration
 
   def up do
+    alter table(:audit_events) do
+      add(:inhibit_quote, :map)
+      add(:inhibit_reset_eligible, :boolean)
+
+      add(
+        :inhibit_attempt_id,
+        references(:inference_runs,
+          column: :id,
+          name: "audit_events_inhibit_attempt_id_fkey",
+          type: :uuid,
+          prefix: "public",
+          on_delete: :restrict,
+          on_update: :restrict
+        )
+      )
+    end
+
     alter table(:audit_events) do
       add(
         :settlement_target_id,
@@ -44,7 +61,7 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
             OR (target_kind = 'inbox_binding' AND binding_target_id IS NOT NULL
               AND event IN ('create_draft','enable','disable','rebind','change_mode','retire'))
             OR (target_kind = 'automation_control' AND control_target_id IS NOT NULL
-              AND event IN ('enable_automation','disable_automation','reset_embedding_inhibit','reset_generation_inhibit'))
+              AND event IN ('enable_automation','disable_automation','reset_embedding_inhibit','reset_generation_inhibit','trip_generation_inhibit','trip_embedding_inhibit'))
             OR (target_kind = 'usage_settlement' AND settlement_target_id IS NOT NULL
               AND event = 'close_unknown_inference' AND reason_code = 'local_admin')
             OR (target_kind = 'knowledge_collection' AND knowledge_collection_target_id IS NOT NULL
@@ -77,15 +94,82 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
       )
     )
 
+    drop_if_exists(constraint(:audit_events, :audit_events_state_shape))
+
+    create(
+      constraint(:audit_events, :audit_events_state_shape,
+        check: """
+            (target_kind = 'staff_user' AND actor_kind IN ('staff','bootstrap') AND after_state IS NOT NULL
+            AND operational_before IS NULL AND operational_after IS NULL)
+          OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL
+            AND event NOT IN ('delivery_unknown','missed_deadline','handoff_failed','fail_publication','fail_reindex','expire','switch_index','rollback_index','trip_generation_inhibit','trip_embedding_inhibit')
+            AND (target_kind <> 'knowledge_revision' OR event NOT IN ('activate','supersede'))
+            AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')
+              OR (target_kind IN ('knowledge_collection','knowledge_article','knowledge_revision'))
+              OR (target_kind NOT IN ('staff_user','support_session','outbound_delivery','knowledge_collection','knowledge_article','knowledge_revision') AND reason_code = 'local_admin')))
+          OR (actor_kind = 'embedding_worker' AND target_kind = 'knowledge_revision'
+            AND event IN ('fail_publication','fail_reindex') AND before_state IS NULL AND after_state IS NULL
+            AND operational_before IS NOT NULL AND operational_after IS NOT NULL)
+          OR (actor_kind = 'publisher' AND target_kind = 'knowledge_revision'
+            AND before_state IS NULL AND after_state IS NULL AND
+            (CASE event
+              WHEN 'activate' THEN operational_before->>'status' = 'publishing' AND operational_after->>'status' = 'published'
+              WHEN 'supersede' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'superseded'
+              WHEN 'expire' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'expired'
+              WHEN 'switch_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              WHEN 'rollback_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              WHEN 'fail_publication' THEN reason_code IN ('deadline','stale_request')
+                AND operational_before->>'status' = 'publishing' AND operational_after->>'status' = 'publish_failed'
+              WHEN 'fail_reindex' THEN reason_code IN ('deadline','stale_request')
+                AND operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              ELSE false END) IS TRUE)
+          OR (target_kind = 'automation_control' AND before_state IS NULL AND after_state IS NULL
+            AND operational_before IS NULL AND operational_after IS NULL
+            AND reason_code IN ('over_reserve','amount_overflow')
+            AND ((actor_kind = 'support_worker' AND event = 'trip_generation_inhibit')
+              OR (actor_kind = 'embedding_worker' AND event = 'trip_embedding_inhibit')))
+          OR (actor_kind = 'support_worker' AND before_state IS NULL AND after_state IS NULL
+            AND operational_before IS NULL AND operational_after IS NULL
+            AND ((event = 'delivery_unknown' AND reason_code IN ('ignored','oversize','admission_limited','deadline','scope_denied','disabled','human_takeover','resolved','stale_claim','stale_policy','late_input','history_changed','unavailable','ambiguous_write','awaiting_operator','accepted','already_human','explicit_handoff','manual_closure','no_effect','read_exhausted'))
+              OR (event = 'missed_deadline' AND reason_code = 'deadline')
+              OR (event = 'handoff_failed' AND reason_code IN ('deadline','read_exhausted','no_effect'))))
+
+        """
+      )
+    )
+
+    create(
+      constraint(:audit_events, :audit_events_inhibit_shape,
+        check: """
+          (event IN ('trip_generation_inhibit','trip_embedding_inhibit') AND inhibit_attempt_id IS NOT NULL
+          AND inhibit_reset_eligible IS NOT NULL
+          AND (NOT inhibit_reset_eligible OR inhibit_quote IS NOT NULL))
+        OR (event NOT IN ('trip_generation_inhibit','trip_embedding_inhibit')
+          AND inhibit_attempt_id IS NULL AND inhibit_quote IS NULL AND inhibit_reset_eligible IS NULL)
+
+        """
+      )
+    )
+
+    create(
+      index(:audit_events, [:correlation_id],
+        name: "audit_events_inhibit_occurrence",
+        unique: true,
+        where: "event IN ('trip_generation_inhibit','trip_embedding_inhibit')"
+      )
+    )
+
     alter table(:automation_controls) do
       add(:generation_inhibit_occurrence, :uuid)
       add(:generation_inhibit_budget, :map)
       add(:embedding_inhibit_occurrence, :uuid)
+      add(:embedding_inhibit_budget, :map)
     end
 
     alter table(:inference_runs) do
       add(:overflow_evidence, :map)
       add(:generation_budget, :map)
+      add(:embedding_budget, :map)
       add(:overflow_resolved_at, :utc_datetime_usec)
     end
 
@@ -112,13 +196,15 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
     BEGIN
       IF EXISTS (
         SELECT 1 FROM audit_events
-        WHERE event IN ('close_unknown_inference','reset_embedding_inhibit','reset_generation_inhibit')
+        WHERE event IN ('close_unknown_inference','reset_embedding_inhibit','reset_generation_inhibit',
+                        'trip_generation_inhibit','trip_embedding_inhibit')
       ) OR EXISTS (
         SELECT 1 FROM inference_runs WHERE overflow_evidence IS NOT NULL OR generation_budget IS NOT NULL
+          OR embedding_budget IS NOT NULL
       ) OR EXISTS (
         SELECT 1 FROM automation_controls
         WHERE embedding_inhibit_occurrence IS NOT NULL OR generation_inhibit_occurrence IS NOT NULL
-          OR generation_inhibit_budget IS NOT NULL
+          OR generation_inhibit_budget IS NOT NULL OR embedding_inhibit_budget IS NOT NULL
       ) THEN
         RAISE EXCEPTION 'VGAS-20 rollback would remove financial evidence';
       END IF;
@@ -132,13 +218,60 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
       remove(:overflow_resolved_at)
       remove(:overflow_evidence)
       remove(:generation_budget)
+      remove(:embedding_budget)
     end
 
     alter table(:automation_controls) do
       remove(:embedding_inhibit_occurrence)
       remove(:generation_inhibit_occurrence)
       remove(:generation_inhibit_budget)
+      remove(:embedding_inhibit_budget)
     end
+
+    drop_if_exists(constraint(:audit_events, :audit_events_state_shape))
+
+    create(
+      constraint(:audit_events, :audit_events_state_shape,
+        check: """
+            (target_kind = 'staff_user' AND actor_kind IN ('staff','bootstrap') AND after_state IS NOT NULL
+            AND operational_before IS NULL AND operational_after IS NULL)
+          OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL
+            AND event NOT IN ('delivery_unknown','missed_deadline','handoff_failed','fail_publication','fail_reindex','expire','switch_index','rollback_index')
+            AND (target_kind <> 'knowledge_revision' OR event NOT IN ('activate','supersede'))
+            AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')
+              OR (target_kind IN ('knowledge_collection','knowledge_article','knowledge_revision'))
+              OR (target_kind NOT IN ('staff_user','support_session','outbound_delivery','knowledge_collection','knowledge_article','knowledge_revision') AND reason_code = 'local_admin')))
+          OR (actor_kind = 'embedding_worker' AND target_kind = 'knowledge_revision'
+            AND event IN ('fail_publication','fail_reindex') AND before_state IS NULL AND after_state IS NULL
+            AND operational_before IS NOT NULL AND operational_after IS NOT NULL)
+          OR (actor_kind = 'publisher' AND target_kind = 'knowledge_revision'
+            AND before_state IS NULL AND after_state IS NULL AND
+            (CASE event
+              WHEN 'activate' THEN operational_before->>'status' = 'publishing' AND operational_after->>'status' = 'published'
+              WHEN 'supersede' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'superseded'
+              WHEN 'expire' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'expired'
+              WHEN 'switch_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              WHEN 'rollback_index' THEN operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              WHEN 'fail_publication' THEN reason_code IN ('deadline','stale_request')
+                AND operational_before->>'status' = 'publishing' AND operational_after->>'status' = 'publish_failed'
+              WHEN 'fail_reindex' THEN reason_code IN ('deadline','stale_request')
+                AND operational_before->>'status' = 'published' AND operational_after->>'status' = 'published'
+              ELSE false END) IS TRUE)
+          OR (actor_kind = 'support_worker' AND before_state IS NULL AND after_state IS NULL
+            AND operational_before IS NULL AND operational_after IS NULL
+            AND ((event = 'delivery_unknown' AND reason_code IN ('ignored','oversize','admission_limited','deadline','scope_denied','disabled','human_takeover','resolved','stale_claim','stale_policy','late_input','history_changed','unavailable','ambiguous_write','awaiting_operator','accepted','already_human','explicit_handoff','manual_closure','no_effect','read_exhausted'))
+              OR (event = 'missed_deadline' AND reason_code = 'deadline')
+              OR (event = 'handoff_failed' AND reason_code IN ('deadline','read_exhausted','no_effect'))))
+
+        """
+      )
+    )
+
+    drop(constraint(:audit_events, :audit_events_inhibit_shape))
+
+    drop(index(:audit_events, [:correlation_id], name: "audit_events_inhibit_occurrence"))
+
+    drop(constraint(:audit_events, "audit_events_inhibit_attempt_id_fkey"))
 
     drop_if_exists(constraint(:audit_events, :audit_events_exact_target))
 
@@ -198,6 +331,9 @@ defmodule VoelgoedAi.Repo.Migrations.Vgas20FinancialSafeguards do
 
     alter table(:audit_events) do
       remove(:settlement_target_id)
+      remove(:inhibit_attempt_id)
+      remove(:inhibit_quote)
+      remove(:inhibit_reset_eligible)
     end
   end
 end

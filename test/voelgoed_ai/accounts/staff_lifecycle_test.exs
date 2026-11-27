@@ -70,6 +70,7 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
              [
                :append,
                :append_financial,
+               :append_inhibit_trip,
                :append_knowledge,
                :append_operational,
                :append_publication_failure,
@@ -78,6 +79,7 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
                :append_support_operator,
                :append_system,
                :financial_closure,
+               :inhibit_trip,
                :knowledge_history,
                :knowledge_rows,
                :operational_history,
