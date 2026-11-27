@@ -215,12 +215,12 @@ check settings against the hosted run before merge consideration.
 
 ## Review 1 corrections
 
-Review 1 of PR #20 on `b0a0b95` was **APPROVE**, with four LOW findings and three NITs. The orchestrator applied the corrections below on top of that head. They touch documentation, a comment and `.gitignore` only, with no change to workflow behaviour.
+Review 1 of PR #20 on `b0a0b95` was **APPROVE**, with three LOW findings and three NITs. The orchestrator applied the corrections below on top of that head. They touch documentation, a comment and `.gitignore` only, with no change to workflow behaviour.
 
 - **LOW-1, runbook portability.** `docs/development/application-ci.md` now documents the disposable workflow with the public, CI-pinned `pgvector/pgvector@sha256:4bdc1604…6e00` image, using `docker run --rm` and the same bootstrap SQL as CI. The local helper is described as optional. To check the documented block, it was extracted and run verbatim from the correction worktree on loopback 55436 under `env -u OPENAI_API_KEY bash -e`:
   - The run exited 0.
   - `verify_postgres.sh 180007` printed `vgas_test|vgas_test|180007|0.8.7|vgas_test|t|f|f|f|f|f|1`.
-  - Migrations applied.
+  - `mix ecto.migrate` completed. The block ran under `bash -e`, so the overall exit 0 covers this step; no separate migration log line was captured.
   - `VGAS_F04_DISPOSABLE=1 mix test --seed 0` reported 570 passed and 1 excluded in 76.1 s.
   - Afterwards no container remained and port 55436 was released.
   - The run log contained no generated password.
@@ -237,3 +237,5 @@ Correction checks:
 | `mise exec -- mix format --check-formatted` | 0 |
 | `python3 -B .github/scripts/plan_tests.py` | 0 |
 | `git diff --check` | 0 |
+
+An independent check of this delta asked for the LOW count above to be corrected and suggested noting the runbook's host tools, its failure-path cleanup and the F08 port boundary. Those notes were added to `docs/development/application-ci.md` with no change to the commands.

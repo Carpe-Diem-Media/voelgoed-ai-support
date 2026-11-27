@@ -62,6 +62,10 @@ the same public image that CI pins. The commands below do the same bootstrap
 as CI. The container, volume and credentials last for one run only. Never use
 55432 (shared DevCore DEV) or 55433 (shared DevCore TEST) for this workflow.
 
+The block needs `docker`, `psql`, `openssl`, `ss` and `mise` on the host. Run
+it under `bash -e`. If a step fails, run `docker stop "$name"` before retrying,
+or add `trap 'docker stop "$name"' EXIT` after the container starts.
+
 ```sh
 image=pgvector/pgvector@sha256:4bdc16048580b56345bca441bffe8d9b45dd2f5d76963808c853df1661df6e00
 port=55436 # use 55437 for the full suite; must be free
@@ -94,7 +98,8 @@ role-creation privilege. To run a migration lane, start a fresh container for
 each lane. Apply that lane's predecessor steps from the workflow before running
 the candidate migrations. The F04 guard accepts only loopback on 55434, 55436
 or 55437. Before creating fixtures it checks the database, the role, and the
-PostgreSQL and vector versions.
+PostgreSQL and vector versions. The older F08 guard also accepts 55433 without
+a host check; VGAS-24 tracks narrowing it.
 
 The orchestrator's own runs used an approved local helper. It wraps these same
 steps, adds cleanup reporting and strips provider keys. Its use is optional.
