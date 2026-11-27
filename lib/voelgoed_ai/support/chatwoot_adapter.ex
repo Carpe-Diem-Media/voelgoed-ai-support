@@ -178,21 +178,26 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
     end
   end
 
-  @doc false
-  def decision_context(session, ids, deadline) do
-    destination = destination(session)
-    contact = session.contact_id
+  if Mix.env() == :test do
+    @doc false
+    def decision_context(session, ids, deadline) do
+      destination = destination(session)
+      contact = session.contact_id
 
-    with %{adapter: {module, _}, shadow_evaluation: true} <- fixture(),
-         true <- function_exported?(module, :decision_history, 4),
-         {:ok, %TextHistory{destination: ^destination, contact: ^contact, messages: messages}} <-
-           call(:decision_history, destination, [15], deadline) do
-      VoelgoedAi.Support.DecisionContext.project(messages, ids, contact)
-    else
-      {:ok, _} -> {:error, :scope_denied}
-      {:error, _} = error -> error
-      _ -> {:error, :unavailable}
+      with %{adapter: {module, _}, shadow_evaluation: true} <- fixture(),
+           true <- function_exported?(module, :decision_history, 4),
+           {:ok, %TextHistory{destination: ^destination, contact: ^contact, messages: messages}} <-
+             call(:decision_history, destination, [15], deadline) do
+        VoelgoedAi.Support.DecisionContext.project(messages, ids, contact)
+      else
+        {:ok, _} -> {:error, :scope_denied}
+        {:error, _} = error -> error
+        _ -> {:error, :unavailable}
+      end
     end
+  else
+    @doc false
+    def decision_context(_, _, _), do: {:error, :unavailable}
   end
 
   defp public_message?(%Message{visibility: :public, id: id, sender: sender}),

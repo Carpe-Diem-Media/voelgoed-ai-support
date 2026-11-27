@@ -16,7 +16,7 @@ defmodule VoelgoedAi.Support.Configuration do
   alias VoelgoedAi.Intelligence.{Assistant, AssistantKnowledgeGrant, AssistantRevision}
   alias VoelgoedAi.Knowledge.KnowledgeCollection
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ActionScope, DecisionTemplates, InboxBinding, Ownership}
+  alias VoelgoedAi.Support.{ActionScope, InboxBinding, Ownership}
   alias VoelgoedAi.Support.ActionScope.Storage
 
   @revision_fields [:workflow_version, :template_version, :locale, :response_policy]
@@ -531,18 +531,23 @@ defmodule VoelgoedAi.Support.Configuration do
     end
   end
 
-  defp fixture_hash(%{response_policy: :shadow_decision} = revision, collection_ids) do
-    version = DecisionTemplates.version()
+  if Mix.env() == :test do
+    defp fixture_hash(%{response_policy: :shadow_decision} = revision, collection_ids) do
+      version = VoelgoedAi.Support.DecisionTemplates.version()
 
-    with %{shadow_evaluation: true} = fixture <- fixture(),
-         true <- revision.workflow_version == version and revision.template_version == version,
-         true <- revision.config_hash_version == 2,
-         true <- same_fields?(revision, fixture, [:assistant_id | @revision_fields]) do
-      value = Enum.map(@revision_fields, &Map.fetch!(revision, &1))
-      {:ok, hash_revision([2, value, collection_ids])}
-    else
-      _ -> {:error, :unverified_test_revision}
+      with %{shadow_evaluation: true} = fixture <- fixture(),
+           true <- revision.workflow_version == version and revision.template_version == version,
+           true <- revision.config_hash_version == 2,
+           true <- same_fields?(revision, fixture, [:assistant_id | @revision_fields]) do
+        value = Enum.map(@revision_fields, &Map.fetch!(revision, &1))
+        {:ok, hash_revision([2, value, collection_ids])}
+      else
+        _ -> {:error, :unverified_test_revision}
+      end
     end
+  else
+    defp fixture_hash(%{response_policy: :shadow_decision}, _),
+      do: {:error, :unverified_test_revision}
   end
 
   defp fixture_hash(revision, collection_ids) do
