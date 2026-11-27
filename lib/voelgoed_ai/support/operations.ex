@@ -86,7 +86,7 @@ defmodule VoelgoedAi.Support.Operations do
     alias VoelgoedAi.{Repo, Support}
     alias VoelgoedAi.Support.{BindingCircuit, ChatwootAdapter, Ownership}
 
-    @timeout 750
+    @query_options [timeout: 1_000, log: false, telemetry_event: nil]
 
     defp configuration do
       with %{} = fixture <- ChatwootAdapter.fixture(),
@@ -217,11 +217,27 @@ defmodule VoelgoedAi.Support.Operations do
     end
 
     defp rows(query, arguments) do
-      case SQL.query(Repo, query, arguments, timeout: @timeout, log: false, telemetry_event: nil) do
-        {:ok, %{rows: rows}} -> {:ok, rows}
+      # The staff transaction already owns the connection. Let PostgreSQL
+      # enforce the timeout and roll it back with this read-only savepoint.
+      with {:ok, _} <- projection_query("SAVEPOINT staff_operations_projection"),
+           result <- timed_projection(query, arguments),
+           {:ok, _} <- projection_query("ROLLBACK TO SAVEPOINT staff_operations_projection"),
+           {:ok, _} <- projection_query("RELEASE SAVEPOINT staff_operations_projection"),
+           {:ok, %{rows: rows}} <- result do
+        {:ok, rows}
+      else
         {:error, _} -> {:error, :unavailable}
       end
     end
+
+    defp timed_projection(query, arguments) do
+      with {:ok, _} <- projection_query("SET LOCAL statement_timeout = '750ms'") do
+        projection_query(query, arguments)
+      end
+    end
+
+    defp projection_query(query, arguments \\ []),
+      do: SQL.query(Repo, query, arguments, @query_options)
 
     defp inbox(row),
       do: Map.take(row, [:installation_ref, :external_account_id, :external_inbox_id])

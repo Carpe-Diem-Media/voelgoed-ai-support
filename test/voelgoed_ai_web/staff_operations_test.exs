@@ -100,4 +100,66 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
       )
     end
   end
+
+  test "refresh reports a locked queue projection before the transaction deadline" do
+    %{operator: operator} = SupportDBCase.setup()
+
+    assert {:ok, :timeout_preserved} =
+             Repo.transact(fn ->
+               SQL.query!(Repo, "SET LOCAL statement_timeout = '3s'")
+
+               assert {:ok, %{operator: %{available: true}}} =
+                        VoelgoedAi.Support.Operations.snapshot(operator, nil)
+
+               assert %{rows: [["3s"]]} = SQL.query!(Repo, "SHOW statement_timeout")
+               {:ok, :timeout_preserved}
+             end)
+
+    page = read_page(operator, "/staff/operations")
+    session = %{"staff" => {operator.id, operator.generation, operator.expiry, operator.binding}}
+    page = put_private(page, :live_view_connect_info, %{session: session})
+    assert {:ok, view, _} = live(page)
+    assert has_element?(view, "h2", "Support queue")
+
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        Repo.transact(
+          fn ->
+            SQL.query!(Repo, "LOCK TABLE support_alert_episodes IN ACCESS EXCLUSIVE MODE")
+            send(parent, :projection_locked)
+
+            receive do
+              :release_projection -> {:ok, :released}
+            after
+              22_000 -> {:error, :lock_test_timed_out}
+            end
+          end,
+          timeout: 25_000
+        )
+      end)
+
+    try do
+      assert_receive :projection_locked, 3_000
+      started_at = System.monotonic_time(:millisecond)
+      render_click(view, "refresh", %{})
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert has_element?(
+               view,
+               "[role=status]",
+               "The operations page could not load. Try Refresh."
+             )
+
+      assert elapsed < 3_000
+    after
+      send(holder.pid, :release_projection)
+      assert {:ok, :released} = Task.await(holder)
+    end
+
+    render_click(view, "refresh", %{})
+    assert has_element?(view, "h2", "Support queue")
+    refute has_element?(view, "[role=status]", "The operations page could not load. Try Refresh.")
+  end
 end

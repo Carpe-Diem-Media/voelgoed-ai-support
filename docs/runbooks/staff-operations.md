@@ -24,7 +24,9 @@ rules. VGAS-28 supplies the purge and replay rules.
   reference in the queue. An unavailable session can indicate that the
   reference is stale or outside the qualified inbox. Editorial roles have
   their own route and socket grants. The operations stylesheet requires a
-  current operations grant.
+  current operations grant. PostgreSQL limits each queue projection query
+  to 750 ms. If a query times out, the page reports that it could not load.
+  Use **Refresh** after database contention clears.
 - To route locally, use **Route to staff locally**. This fences unsent work,
   advances the ownership epoch and records one audit and one terminal status
   intent in one transaction. Staff complete the handoff in Chatwoot. The
