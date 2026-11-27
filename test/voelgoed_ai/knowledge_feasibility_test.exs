@@ -10,13 +10,19 @@ defmodule VoelgoedAi.KnowledgeFeasibilityTest do
   @other_profile "synthetic-incompatible-profile"
 
   setup do
-    assert System.get_env("TEST_DATABASE_PORT") == "55434"
+    assert Repo.config()[:hostname] == "127.0.0.1"
+    assert Repo.config()[:port] in [55434, 55436, 55437]
 
-    assert %{rows: [["vgas_test", "vgas_test", "180007", "0.8.7", false]]} =
+    assert %{
+             rows: [
+               ["vgas_test", "vgas_test", "180007", "0.8.7", false, false, false, false, false]
+             ]
+           } =
              Repo.query!("""
              SELECT current_database(), current_user, current_setting('server_version_num'),
                (SELECT extversion FROM pg_extension WHERE extname = 'vector'),
-               (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+               rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
+             FROM pg_roles WHERE rolname = current_user
              """)
 
     store = Knowledge.create!()

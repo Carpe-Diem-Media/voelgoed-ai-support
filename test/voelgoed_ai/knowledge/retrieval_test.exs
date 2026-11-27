@@ -1232,10 +1232,12 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
     @tag :split_clock
     test "split-clock query settlement from #{state} charges once with only RUNNING allowed to rank" do
       ctx = setup_search()
+      late = DateTime.add(ctx.now, 35, :day)
       owner = self()
       barrier = make_ref()
       {:ok, clock} = Agent.start_link(fn -> ctx.now end)
       origin_rows = query_spend(ctx.now)
+      late_accounting = query_window_accounting(late)
 
       fixture(%{
         clock: fn -> Agent.get(clock, & &1) end,
@@ -1258,7 +1260,6 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
         assert query_rows(ctx) == [["running", true, "reserved", nil]]
 
         if @settlement_state == :unknown do
-          late = DateTime.add(ctx.now, 35, :day)
           Agent.update(clock, fn _ -> late end)
           assert :ok = Embedding.sweep()
           assert :ok = Embedding.sweep()
@@ -1267,7 +1268,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
                    [["unknown", "deadline", "unknown", "deadline", 81_920, nil, nil, nil]]
 
           assert query_spend(ctx.now) == origin_rows
-          assert query_spend(late) == []
+          assert query_window_accounting(late) == late_accounting
         end
 
         assert_current_support_claim(ctx)
@@ -1310,7 +1311,7 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
                  [kind, start, spent + 18]
                end)
 
-      assert query_spend(DateTime.add(ctx.now, 35, :day)) == []
+      assert query_window_accounting(late) == late_accounting
       refute_received {:embedding_parked, ^barrier, _}
     end
   end
@@ -1356,6 +1357,23 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
       """,
       [day, Date.beginning_of_month(day)]
     ).rows
+  end
+
+  defp query_window_accounting(time) do
+    day = DateTime.to_date(time)
+
+    reservations =
+      SQL.query!(
+        Repo,
+        """
+        SELECT id, state, reserved_nano_usd FROM usage_reservations
+        WHERE day_window = $1 OR month_window = $2
+        ORDER BY id
+        """,
+        [day, Date.beginning_of_month(day)]
+      ).rows
+
+    {query_spend(time), reservations}
   end
 
   test "late correlated usage settles the original window after recovery and yields no evidence" do
