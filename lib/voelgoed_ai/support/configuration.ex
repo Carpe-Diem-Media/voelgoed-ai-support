@@ -401,6 +401,8 @@ defmodule VoelgoedAi.Support.Configuration do
         _ -> {:error, :unverified_test_binding}
       end
     end
+  else
+    defp control_mode(%{operating_mode: :automatic}), do: {:ok, :fake}
   end
 
   defp control_mode(_), do: {:error, :invalid_transition}

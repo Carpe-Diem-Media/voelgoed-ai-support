@@ -156,10 +156,14 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
   end
 
-  defp route_limited_shadow(config, session, now) do
-    if Ownership.shadow_evaluation_enabled?(config),
-      do: Ownership.route_overdue_locked(config, session, now),
-      else: {:ok, session}
+  if Mix.env() == :test do
+    defp route_limited_shadow(config, session, now) do
+      if Ownership.shadow_evaluation_enabled?(config),
+        do: Ownership.route_overdue_locked(config, session, now),
+        else: {:ok, session}
+    end
+  else
+    defp route_limited_shadow(_config, session, _now), do: {:ok, session}
   end
 
   defp route_expired_batch(batch, config, session, now) do
@@ -401,9 +405,6 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
       {:shadow, receipts, observation, context}
     end
-  else
-    defp evaluate({:shadow, receipts}, _, _, _),
-      do: {:shadow, receipts, {:error, :unavailable}, {:error, :history_changed}}
   end
 
   @doc false
@@ -470,19 +471,23 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
   end
 
-  defp claim_work(config, session, run) do
-    if Ownership.shadow_evaluation_enabled?(config) do
-      with {:ok, %{response_policy: :shadow_decision}} <-
-             Configuration.current_revision(config.assistant),
-           {:ok, receipts} <- covered_receipts(session, run) do
-        {:ok, {:shadow, receipts}}
+  if Mix.env() == :test do
+    defp claim_work(config, session, run) do
+      if Ownership.shadow_evaluation_enabled?(config) do
+        with {:ok, %{response_policy: :shadow_decision}} <-
+               Configuration.current_revision(config.assistant),
+             {:ok, receipts} <- covered_receipts(session, run) do
+          {:ok, {:shadow, receipts}}
+        else
+          {:ok, _} -> {:error, :stale_policy}
+          error -> error
+        end
       else
-        {:ok, _} -> {:error, :stale_policy}
-        error -> error
+        {:ok, :fixed}
       end
-    else
-      {:ok, :fixed}
     end
+  else
+    defp claim_work(_config, _session, _run), do: {:ok, :fixed}
   end
 
   defp complete(config, session, run, claim, now, decision) do
@@ -505,93 +510,96 @@ defmodule VoelgoedAi.Support.RunProcessing do
   defp finalize(config, session, run, now, {:fixed, observation, history}),
     do: decide(config, session, run, now, observation, history)
 
-  defp finalize(config, session, run, now, {:shadow, receipts, {:ok, observation}, context}) do
-    cond do
-      not Ownership.shadow_evaluation_enabled?(config) ->
-        finish(run, :cancel, now, :stale_policy)
+  if Mix.env() == :test do
+    defp finalize(config, session, run, now, {:shadow, receipts, {:ok, observation}, context}) do
+      cond do
+        not Ownership.shadow_evaluation_enabled?(config) ->
+          finish(run, :cancel, now, :stale_policy)
 
-      not Ownership.eligible_bot?(config, session, observation) ->
-        with {:ok, _} <- finish(run, :cancel, now, :scope_denied) do
-          Ownership.observe(config, session, observation, now)
-        end
+        not Ownership.eligible_bot?(config, session, observation) ->
+          with {:ok, _} <- finish(run, :cancel, now, :scope_denied) do
+            Ownership.observe(config, session, observation, now)
+          end
 
-      true ->
-        with {:ok, ^receipts} <- covered_receipts(session, run),
-             {:ok, false} <- Ownership.pending_input?(session),
-             {:ok, revision} <- Configuration.current_revision(config.assistant) do
-          decide_shadow(config, session, run, revision, now, observation, context)
-        else
-          {:ok, _} ->
-            finish(run, :fail, now, :history_changed)
+        true ->
+          with {:ok, ^receipts} <- covered_receipts(session, run),
+               {:ok, false} <- Ownership.pending_input?(session),
+               {:ok, revision} <- Configuration.current_revision(config.assistant) do
+            decide_shadow(config, session, run, revision, now, observation, context)
+          else
+            {:ok, _} ->
+              finish(run, :fail, now, :history_changed)
 
-          {:error, reason} when reason in [:history_changed, :stale_policy] ->
-            finish(run, :fail, now, reason)
+            {:error, reason} when reason in [:history_changed, :stale_policy] ->
+              finish(run, :fail, now, reason)
 
-          error ->
-            error
-        end
+            error ->
+              error
+          end
+      end
     end
-  end
 
-  defp finalize(_, _, run, now, {:shadow, _, {:error, reason}, _}) do
-    finish(run, :fail, now, if(reason == :scope_denied, do: reason, else: :unavailable))
-  end
-
-  defp decide_shadow(config, session, run, revision, _now, observation, {:ok, context}) do
-    # Treat the same session as unresolved until a verified close creates a
-    # new generation. A new phrase alone cannot reset the clarification cap.
-    with {:ok, prior} <-
-           store_read(SupportRun, :shadow_clarifications, %{}, %{session_id: session.id},
-             many: true,
-             limit: 2
-           ),
-         now = ChatwootAdapter.now(),
-         true <- DateTime.before?(now, run.lease_expires_at),
-         {:ok, decision} <- DecisionTemplates.decide(context, revision.locale, length(prior) < 2),
-         handoff? = decision.decision == "handoff",
-         {:ok, completed} <-
-           store_update(run, :complete_shadow, %{
-             typed_decision: decision,
-             shadow_disposition: if(handoff?, do: :local_handoff, else: :no_send),
-             finished_at: now
-           }) do
-      if handoff?,
-        do: Ownership.route_shadow_locked(config, session, observation, now),
-        else: {:ok, completed}
-    else
-      false -> finish(run, :fail, ChatwootAdapter.now(), :deadline)
-      error -> error
+    defp finalize(_, _, run, now, {:shadow, _, {:error, reason}, _}) do
+      finish(run, :fail, now, if(reason == :scope_denied, do: reason, else: :unavailable))
     end
-  end
 
-  defp decide_shadow(config, session, run, _, now, observation, {:error, :history_changed}) do
-    with {:ok, _} <- finish(run, :fail, now, :history_changed) do
-      Ownership.route_shadow_locked(config, session, observation, now)
+    defp decide_shadow(config, session, run, revision, _now, observation, {:ok, context}) do
+      # Treat the same session as unresolved until a verified close creates a
+      # new generation. A new phrase alone cannot reset the clarification cap.
+      with {:ok, prior} <-
+             store_read(SupportRun, :shadow_clarifications, %{}, %{session_id: session.id},
+               many: true,
+               limit: 2
+             ),
+           now = ChatwootAdapter.now(),
+           true <- DateTime.before?(now, run.lease_expires_at),
+           {:ok, decision} <-
+             DecisionTemplates.decide(context, revision.locale, length(prior) < 2),
+           handoff? = decision.decision == "handoff",
+           {:ok, completed} <-
+             store_update(run, :complete_shadow, %{
+               typed_decision: decision,
+               shadow_disposition: if(handoff?, do: :local_handoff, else: :no_send),
+               finished_at: now
+             }) do
+        if handoff?,
+          do: Ownership.route_shadow_locked(config, session, observation, now),
+          else: {:ok, completed}
+      else
+        false -> finish(run, :fail, ChatwootAdapter.now(), :deadline)
+        error -> error
+      end
     end
-  end
 
-  defp covered_receipts(session, run) do
-    with {:ok, inputs} when inputs != [] <- inputs(run.id) do
-      Enum.reduce_while(inputs, {:ok, []}, fn input, {:ok, ids} ->
-        case Ownership.get(InboundEvent, input.event_id, lock: true) do
-          {:ok, %InboundEvent{state: :dispatched, disposition: :covered, kind: :input} = event}
-          when event.session_id == session.id and event.contact_id == session.contact_id ->
-            if ChatwootAdapter.destination(event) == ChatwootAdapter.destination(session) do
-              {:cont, {:ok, [{event.id, event.message_id} | ids]}}
-            else
+    defp decide_shadow(config, session, run, _, now, observation, {:error, :history_changed}) do
+      with {:ok, _} <- finish(run, :fail, now, :history_changed) do
+        Ownership.route_shadow_locked(config, session, observation, now)
+      end
+    end
+
+    defp covered_receipts(session, run) do
+      with {:ok, inputs} when inputs != [] <- inputs(run.id) do
+        Enum.reduce_while(inputs, {:ok, []}, fn input, {:ok, ids} ->
+          case Ownership.get(InboundEvent, input.event_id, lock: true) do
+            {:ok, %InboundEvent{state: :dispatched, disposition: :covered, kind: :input} = event}
+            when event.session_id == session.id and event.contact_id == session.contact_id ->
+              if ChatwootAdapter.destination(event) == ChatwootAdapter.destination(session) do
+                {:cont, {:ok, [{event.id, event.message_id} | ids]}}
+              else
+                {:halt, {:error, :history_changed}}
+              end
+
+            {:ok, _} ->
               {:halt, {:error, :history_changed}}
-            end
 
-          {:ok, _} ->
-            {:halt, {:error, :history_changed}}
-
-          error ->
-            {:halt, error}
-        end
-      end)
-    else
-      {:ok, []} -> {:error, :history_changed}
-      error -> error
+            error ->
+              {:halt, error}
+          end
+        end)
+      else
+        {:ok, []} -> {:error, :history_changed}
+        error -> error
+      end
     end
   end
 

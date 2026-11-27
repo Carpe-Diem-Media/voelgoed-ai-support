@@ -312,14 +312,19 @@ defmodule VoelgoedAi.Support.Ownership do
 
   def route_overdue_locked(_, session, _), do: {:ok, session}
 
-  @doc false
-  def route_shadow_locked(config, session, observation, now) do
-    if session.state == :bot_active and shadow_evaluation_enabled?(config) and
-         eligible_bot?(config, session, observation) do
-      stage_handoff(config, session, now, :explicit_handoff)
-    else
-      {:error, :scope_denied}
+  if Mix.env() == :test do
+    @doc false
+    def route_shadow_locked(config, session, observation, now) do
+      if session.state == :bot_active and shadow_evaluation_enabled?(config) and
+           eligible_bot?(config, session, observation) do
+        stage_handoff(config, session, now, :explicit_handoff)
+      else
+        {:error, :scope_denied}
+      end
     end
+  else
+    @doc false
+    def route_shadow_locked(_, _, _, _), do: {:error, :scope_denied}
   end
 
   defp stage_handoff(config, session, now, reason) do
