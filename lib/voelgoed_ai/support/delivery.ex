@@ -48,7 +48,9 @@ defmodule VoelgoedAi.Support.Delivery do
            with_delivery(id, &authorize(&1, &2, &3, &4, claim, generation)),
          :ok <- fixture_barrier(:after_authorization),
          {:ok, :dispatch_current} <-
-           with_delivery(id, &dispatch_current(&1, &2, &3, &4, authorized, generation)) do
+           with_delivery(id, fn config, session, delivery, _ ->
+             dispatch_current(config, session, delivery, authorized, generation)
+           end) do
       result = post(session, authorized, text)
 
       case with_delivery(id, &settle(&1, &2, &3, &4, authorized, result, generation)) do
@@ -387,14 +389,24 @@ defmodule VoelgoedAi.Support.Delivery do
   defp render(config, delivery),
     do: Configuration.render_fixed_reply(config.assistant, config.run, delivery)
 
-  defp dispatch_current(config, session, delivery, now, authorized, generation) do
+  defp dispatch_current(config, session, delivery, authorized, generation) do
+    now = ChatwootAdapter.now()
+
     cond do
-      not current_claim?(delivery, authorized) ->
+      not current_claim?(delivery, authorized) or
+          delivery.dispatch_authorized_at != authorized.dispatch_authorized_at ->
         {:ok, :stale_claim}
+
+      not DateTime.before?(now, delivery.lease_expires_at) or
+          not DateTime.before?(now, delivery.deadline_at) ->
+        unknown(delivery, now, :ambiguous_write)
 
       not valid?(config, session, delivery, now) or
           not BindingCircuit.closed?(config.binding, generation) ->
-        fence(delivery, now, :stale_policy)
+        # Only this worker reached the gate directly from its own authorization.
+        # A denial here never enters post/3. Other callers must treat the marker
+        # as a possible write and leave the attempt for reconciliation.
+        store_update(delivery, :cancel, %{reason_code: :dispatch_denied})
 
       true ->
         {:ok, :dispatch_current}

@@ -155,7 +155,7 @@ defmodule VoelgoedAi.Support.OutboundDelivery do
       public?: true,
       allow_nil?: true,
       constraints: [
-        one_of: VoelgoedAi.Support.ReasonCode.values()
+        one_of: [:dispatch_denied | VoelgoedAi.Support.ReasonCode.values()]
       ]
     )
 

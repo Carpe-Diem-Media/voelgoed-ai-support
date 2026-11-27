@@ -31,7 +31,8 @@ defmodule VoelgoedAi.Support.WorkStore do
     },
     Ingress => %{
       InboundEvent => [:by_identity, :register, :ignore, :quarantine, :dispatch, :pending],
-      SupportRun => [:active]
+      SupportRun => [:active],
+      SupportSession => [:observe_signed_handoff_takeover]
     },
     Ownership => %{
       InboundEvent => [:by_id],
