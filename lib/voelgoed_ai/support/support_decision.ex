@@ -63,7 +63,7 @@ defmodule VoelgoedAi.Support.SupportDecision do
   defp valid_payload?("answer_exact", [_], nil), do: true
   defp valid_payload?("answer_grounded", [_ | _], reply), do: valid_reply?(reply, 3_000)
   defp valid_payload?("clarify", [], reply), do: is_nil(reply) or valid_reply?(reply, 500)
-  defp valid_payload?(decision, _, nil) when decision in ~w(decline handoff greeting), do: true
+  defp valid_payload?(decision, [], nil) when decision in ~w(decline handoff greeting), do: true
   defp valid_payload?(_, _, _), do: false
 
   defp valid_reply?(text, limit) do

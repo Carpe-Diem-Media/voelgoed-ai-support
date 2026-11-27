@@ -64,3 +64,34 @@ defmodule VoelgoedAi.Knowledge.Retrieval.Manifest do
       ]
     ]
 end
+
+defmodule VoelgoedAi.Knowledge.Retrieval.Reference do
+  @moduledoc "The bounded publication and claim metadata needed to requalify selected evidence."
+
+  @hash [match: ~r/\A[a-f0-9]{64}\z/]
+  @fields [
+    article_id: [type: :uuid],
+    revision_id: [type: :uuid],
+    collection_id: [type: :uuid],
+    collection_epoch: [type: :integer, constraints: [min: 0]],
+    content_hash: [type: :string, constraints: @hash],
+    locale: [type: :string, constraints: [match: ~r/\A(?:af|en)-ZA\z/]],
+    mode: [type: :atom, constraints: [one_of: [:exact, :grounded]]],
+    profile_id: [type: :string, constraints: @hash],
+    generation: [type: :integer, constraints: [min: 1]],
+    index_epoch: [type: :integer, constraints: [min: 0]],
+    scope: [type: VoelgoedAi.Knowledge.Retrieval.Scope],
+    assistant_revision_id: [type: :uuid],
+    assistant_hash: [type: :string, constraints: @hash],
+    claim_generation: [type: :integer, constraints: [min: 1]]
+  ]
+
+  use Ash.Type.NewType,
+    subtype_of: :map,
+    constraints: [
+      fields: Enum.map(@fields, fn {key, opts} -> {key, [allow_nil?: false] ++ opts} end)
+    ]
+
+  @doc false
+  def from_evidence(evidence), do: Map.take(evidence, Keyword.keys(@fields))
+end

@@ -53,15 +53,28 @@ defmodule VoelgoedAi.Support.SupportRun do
         """
       )
 
-      check_constraint(:shadow_disposition, "support_runs_shadow_completion",
+      check_constraint(:shadow_disposition, "support_runs_typed_completion",
         check: """
-        (shadow_disposition IS NULL AND typed_decision IS NULL) OR
-        (shadow_disposition IS NOT NULL AND typed_decision IS NOT NULL
-          AND state = 'completed' AND decision = 'no_send' AND claim_generation > 0
-          AND jsonb_typeof(typed_decision) = 'object'
-          AND typed_decision->>'decision' IS NOT NULL
-          AND (shadow_disposition = 'local_handoff' AND typed_decision->>'decision' = 'handoff'
-            OR shadow_disposition = 'no_send' AND typed_decision->>'decision' IN ('greeting', 'clarify', 'decline')))
+        CASE
+          WHEN typed_decision IS NULL THEN
+            decision IS DISTINCT FROM 'typed_reply' AND
+            shadow_disposition IS NULL AND evidence_refs IS NULL AND context_digest IS NULL
+          WHEN state <> 'completed' OR claim_generation <= 0 OR
+            jsonb_typeof(typed_decision) IS DISTINCT FROM 'object' THEN false
+          WHEN evidence_refs IS NULL THEN
+            context_digest IS NULL AND decision = 'no_send' AND coalesce(
+              (shadow_disposition = 'local_handoff' AND typed_decision->>'decision' = 'handoff')
+              OR (shadow_disposition = 'no_send' AND typed_decision->>'decision' IN ('greeting', 'clarify', 'decline')),
+              false)
+          ELSE coalesce(
+            context_digest ~ '^[a-f0-9]{64}$' AND
+            cardinality(evidence_refs) BETWEEN 1 AND 4 AND array_position(evidence_refs, NULL) IS NULL AND
+            ((decision = 'no_send' AND shadow_disposition = 'no_send') OR
+              (decision = 'typed_reply' AND shadow_disposition IS NULL)) AND
+            ((typed_decision->>'decision' = 'answer_exact' AND cardinality(evidence_refs) = 1) OR
+              typed_decision->>'decision' = 'answer_grounded'),
+            false)
+        END
         """
       )
     end
@@ -96,6 +109,29 @@ defmodule VoelgoedAi.Support.SupportRun do
         """)
 
         down("DROP TRIGGER support_runs_immutable_shadow_completion ON support_runs")
+      end
+
+      statement :guard_typed_completion do
+        after_tables(["support_runs"])
+
+        up("""
+        CREATE TRIGGER support_runs_immutable_typed_completion
+          BEFORE UPDATE OF decision, evidence_refs, context_digest, claim_generation,
+            session_id, assistant_revision_id, ownership_epoch, assistant_epoch,
+            binding_epoch, control_epoch, watermark, deadline_at ON support_runs
+          FOR EACH ROW
+          WHEN (OLD.state = 'completed' AND OLD.typed_decision IS NOT NULL AND (
+            ROW(OLD.decision, OLD.evidence_refs, OLD.context_digest, OLD.claim_generation,
+                OLD.session_id, OLD.assistant_revision_id, OLD.ownership_epoch, OLD.assistant_epoch,
+                OLD.binding_epoch, OLD.control_epoch, OLD.watermark, OLD.deadline_at)
+            IS DISTINCT FROM
+            ROW(NEW.decision, NEW.evidence_refs, NEW.context_digest, NEW.claim_generation,
+                NEW.session_id, NEW.assistant_revision_id, NEW.ownership_epoch, NEW.assistant_epoch,
+                NEW.binding_epoch, NEW.control_epoch, NEW.watermark, NEW.deadline_at)))
+          EXECUTE FUNCTION guard_support_run_shadow_completion();
+        """)
+
+        down("DROP TRIGGER support_runs_immutable_typed_completion ON support_runs")
       end
     end
   end
@@ -146,10 +182,20 @@ defmodule VoelgoedAi.Support.SupportRun do
     attribute(:decision, :atom,
       public?: true,
       allow_nil?: true,
-      constraints: [one_of: [:fixed_reply, :handoff, :no_send]]
+      constraints: [one_of: [:fixed_reply, :handoff, :no_send, :typed_reply]]
     )
 
     attribute(:typed_decision, VoelgoedAi.Support.SupportDecision, sensitive?: true)
+
+    attribute(:evidence_refs, {:array, VoelgoedAi.Knowledge.Retrieval.Reference},
+      constraints: [min_length: 1, max_length: 4, nil_items?: false],
+      sensitive?: true
+    )
+
+    attribute(:context_digest, :string,
+      constraints: [match: ~r/\A[a-f0-9]{64}\z/],
+      sensitive?: true
+    )
 
     attribute(:shadow_disposition, :atom, constraints: [one_of: [:no_send, :local_handoff]])
 
@@ -280,6 +326,36 @@ defmodule VoelgoedAi.Support.SupportRun do
       change(set_attribute(:lease_expires_at, nil))
     end
 
+    update :complete_evidenced do
+      description(
+        "Complete a running claim with qualified evidence and its public reply or shadow disposition."
+      )
+
+      transaction?(false)
+      require_atomic?(false)
+
+      accept([
+        :decision,
+        :typed_decision,
+        :evidence_refs,
+        :context_digest,
+        :shadow_disposition,
+        :finished_at
+      ])
+
+      require_attributes([
+        :decision,
+        :typed_decision,
+        :evidence_refs,
+        :context_digest,
+        :finished_at
+      ])
+
+      validate({VoelgoedAi.Support.FromState, states: [:running]})
+      change(set_attribute(:state, :completed))
+      change(set_attribute(:lease_expires_at, nil))
+    end
+
     update :cancel do
       transaction?(false)
       require_atomic?(false)
@@ -358,6 +434,7 @@ defmodule VoelgoedAi.Support.SupportRun do
              :claim,
              :complete,
              :complete_shadow,
+             :complete_evidenced,
              :shadow_clarifications,
              :cancel,
              :supersede,

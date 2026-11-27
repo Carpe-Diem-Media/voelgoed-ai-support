@@ -184,7 +184,8 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
       destination = destination(session)
       contact = session.contact_id
 
-      with %{adapter: {module, _}, shadow_evaluation: true} <- fixture(),
+      with %{adapter: {module, _}} = settings <- fixture(),
+           true <- settings[:shadow_evaluation] == true or settings[:evidence_fixture] == true,
            true <- function_exported?(module, :decision_history, 4),
            {:ok, %TextHistory{destination: ^destination, contact: ^contact, messages: messages}} <-
              call(:decision_history, destination, [15], deadline) do

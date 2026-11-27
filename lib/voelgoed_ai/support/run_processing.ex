@@ -506,10 +506,122 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
   end
 
-  defp finalize(config, session, run, now, {:fixed, observation, history}),
-    do: decide(config, session, run, now, observation, history)
-
   if Mix.env() == :test do
+    alias VoelgoedAi.Knowledge.Retrieval
+    alias VoelgoedAi.Knowledge.Retrieval.Reference
+    alias VoelgoedAi.Support.{EvidenceReply, SupportDecision}
+
+    @doc false
+    def claim_evidence_fixture(id) do
+      with {:ok, {:claimed, run, session, _}} <- with_run(id, &claim/4),
+           {:ok, receipts} <-
+             with_run(id, fn _, current, row, _ -> covered_receipts(current, row) end),
+           {:ok, context} <- read_evidence_context(session, receipts, run.lease_expires_at) do
+        {:ok, {run, session, receipts, context}}
+      end
+    end
+
+    @doc false
+    def complete_evidence_fixture({claim, session, receipts, original}, proposal, citations) do
+      with {:ok, decision} <- SupportDecision.cast(proposal) do
+        observation = ChatwootAdapter.observe(session, claim.lease_expires_at)
+        context = read_evidence_context(session, receipts, claim.lease_expires_at)
+
+        with_run(claim.id, fn config, session, run, now ->
+          complete(
+            config,
+            session,
+            run,
+            claim,
+            now,
+            {:evidenced, receipts, observation, context, original.commitment, decision, citations}
+          )
+        end)
+      end
+    end
+
+    defp read_evidence_context(session, receipts, deadline) do
+      ChatwootAdapter.decision_context(session, Enum.map(receipts, &elem(&1, 1)), deadline)
+    end
+
+    defp evidence_owner, do: __MODULE__
+
+    defp finalize(config, session, run, now, {:fixed, observation, history}),
+      do: decide(config, session, run, now, observation, history)
+
+    defp finalize(
+           config,
+           session,
+           run,
+           now,
+           {:evidenced, receipts, {:ok, observation}, {:ok, context}, commitment, decision,
+            citations}
+         ) do
+      shadow? = Ownership.shadow_evaluation_enabled?(config)
+
+      cond do
+        not (shadow? or Ownership.write_enabled?(config)) ->
+          finish(run, :cancel, now, :stale_policy)
+
+        not Ownership.eligible_bot?(config, session, observation) ->
+          with {:ok, _} <- finish(run, :cancel, now, :scope_denied) do
+            Ownership.observe(config, session, observation, now)
+          end
+
+        true ->
+          with true <- context.commitment == commitment,
+               {:ok, ^receipts} <- covered_receipts(session, run),
+               {:ok, false} <- Ownership.pending_input?(session),
+               {:ok, items} <- Retrieval.at_decision(&evidence_owner/0, config, run, citations),
+               {:ok, text} <- EvidenceReply.render(decision, items),
+               finished_at = ChatwootAdapter.now(),
+               :lt <-
+                 DateTime.compare(
+                   finished_at,
+                   Enum.min([run.deadline_at, run.lease_expires_at], DateTime)
+                 ),
+               {:ok, completed} <-
+                 store_update(run, :complete_evidenced, %{
+                   decision: if(shadow?, do: :no_send, else: :typed_reply),
+                   typed_decision: decision,
+                   evidence_refs: Enum.map(items, &Reference.from_evidence/1),
+                   context_digest: Base.encode16(commitment, case: :lower),
+                   shadow_disposition: if(shadow?, do: :no_send),
+                   finished_at: finished_at
+                 }) do
+            if shadow? do
+              {:ok, completed}
+            else
+              Ownership.prepare(
+                config,
+                session,
+                completed,
+                {:typed_reply, EvidenceReply.digest(completed, text)},
+                run.deadline_at
+              )
+            end
+          else
+            cutoff when cutoff in [:eq, :gt] ->
+              finish(run, :fail, ChatwootAdapter.now(), :deadline)
+
+            {:error, reason} when reason in [:stale_evidence, :history_changed] ->
+              reject_evidence(config, session, run, observation, shadow?)
+
+            {:ok, _} ->
+              reject_evidence(config, session, run, observation, shadow?)
+
+            false ->
+              reject_evidence(config, session, run, observation, shadow?)
+
+            error ->
+              error
+          end
+      end
+    end
+
+    defp finalize(_, _, run, now, {:evidenced, _, _, _, _, _, _}),
+      do: finish(run, :fail, now, :history_changed)
+
     defp finalize(config, session, run, now, {:shadow, receipts, {:ok, observation}, context}) do
       cond do
         not Ownership.shadow_evaluation_enabled?(config) ->
@@ -580,29 +692,46 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
-    defp covered_receipts(session, run) do
-      with {:ok, inputs} when inputs != [] <- inputs(run.id) do
-        Enum.reduce_while(inputs, {:ok, []}, fn input, {:ok, ids} ->
-          case Ownership.get(InboundEvent, input.event_id, lock: true) do
-            {:ok, %InboundEvent{state: :dispatched, disposition: :covered, kind: :input} = event}
-            when event.session_id == session.id and event.contact_id == session.contact_id ->
-              if ChatwootAdapter.destination(event) == ChatwootAdapter.destination(session) do
-                {:cont, {:ok, [{event.id, event.message_id} | ids]}}
-              else
-                {:halt, {:error, :history_changed}}
-              end
+    defp reject_evidence(config, session, run, observation, shadow?) do
+      now = ChatwootAdapter.now()
 
-            {:ok, _} ->
-              {:halt, {:error, :history_changed}}
-
-            error ->
-              {:halt, error}
-          end
-        end)
-      else
-        {:ok, []} -> {:error, :history_changed}
-        error -> error
+      with {:ok, failed} <- finish(run, :fail, now, :history_changed) do
+        if shadow?,
+          do: Ownership.route_shadow_locked(config, session, observation, now),
+          else: {:ok, failed}
       end
+    end
+  else
+    defp finalize(config, session, run, now, {:fixed, observation, history}),
+      do: decide(config, session, run, now, observation, history)
+  end
+
+  # Inbound event locks are taken only with the session lock held. Ingress
+  # acquires control before receipt work and takes the session before
+  # registering a signed human event, so it cannot invert this order.
+  @doc false
+  def covered_receipts(session, run) do
+    with {:ok, inputs} when inputs != [] <- inputs(run.id) do
+      Enum.reduce_while(inputs, {:ok, []}, fn input, {:ok, ids} ->
+        case Ownership.get(InboundEvent, input.event_id, lock: true) do
+          {:ok, %InboundEvent{state: :dispatched, disposition: :covered, kind: :input} = event}
+          when event.session_id == session.id and event.contact_id == session.contact_id ->
+            if ChatwootAdapter.destination(event) == ChatwootAdapter.destination(session) do
+              {:cont, {:ok, [{event.id, event.message_id} | ids]}}
+            else
+              {:halt, {:error, :history_changed}}
+            end
+
+          {:ok, _} ->
+            {:halt, {:error, :history_changed}}
+
+          error ->
+            {:halt, error}
+        end
+      end)
+    else
+      {:ok, []} -> {:error, :history_changed}
+      error -> error
     end
   end
 

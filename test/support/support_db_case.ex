@@ -75,6 +75,7 @@ defmodule VoelgoedAi.SupportDBCase do
         assistant,
         Map.merge(workflow, %{
           shadow_evaluation: not is_nil(shadow),
+          evidence_fixture: Keyword.get(opts, :evidence_fixture, false),
           external_inbox_id: inbox_id,
           external_account_id: account_id,
           adapter: {ChatwootFake, fake},
