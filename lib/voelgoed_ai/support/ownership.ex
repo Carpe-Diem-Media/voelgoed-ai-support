@@ -93,7 +93,30 @@ defmodule VoelgoedAi.Support.Ownership do
   def write_enabled?(config) do
     permitted?(config) and config.binding.operating_mode == :automatic and
       config.control.status == :enabled and config.control.mode == :fake and
-      match?(%{adapter: {_, _}}, ChatwootAdapter.fixture())
+      match?(%{adapter: {_, _}}, ChatwootAdapter.fixture()) and
+      not match?(%{response_policy: :shadow_decision}, ChatwootAdapter.fixture())
+  end
+
+  @doc false
+  def shadow_fixture?(binding) do
+    ChatwootAdapter.in_scope?(binding) and
+      match?(
+        %{
+          shadow_evaluation: true,
+          response_policy: :shadow_decision,
+          assistant_id: id,
+          adapter: {_, _}
+        }
+        when id == binding.assistant_id,
+        ChatwootAdapter.fixture()
+      )
+  end
+
+  @doc false
+  def shadow_evaluation_enabled?(config) do
+    permitted?(config) and config.binding.operating_mode == :shadow and
+      config.control.status == :enabled and config.control.mode == :shadow_test and
+      shadow_fixture?(config.binding)
   end
 
   @doc false
@@ -110,6 +133,18 @@ defmodule VoelgoedAi.Support.Ownership do
   def current?(config, session, row) do
     epochs = epoch_snapshot(config, session)
     Map.take(row, Map.keys(epochs)) == epochs
+  end
+
+  @doc false
+  def pending_input?(session) do
+    where =
+      session
+      |> Map.take([:installation_ref, :external_account_id, :external_inbox_id, :conversation_id])
+      |> Map.merge(%{kind: :input, state: :dispatched, disposition: :pending})
+
+    with {:ok, rows} <- store_read(InboundEvent, :pending, %{}, where, many: true, limit: 1) do
+      {:ok, rows != []}
+    end
   end
 
   @doc false
@@ -271,6 +306,16 @@ defmodule VoelgoedAi.Support.Ownership do
   end
 
   def route_overdue_locked(_, session, _), do: {:ok, session}
+
+  @doc false
+  def route_shadow_locked(config, session, observation, now) do
+    if session.state == :bot_active and shadow_evaluation_enabled?(config) and
+         eligible_bot?(config, session, observation) do
+      stage_handoff(config, session, now, :explicit_handoff)
+    else
+      {:error, :scope_denied}
+    end
+  end
 
   defp stage_handoff(config, session, now, reason) do
     with :ok <- fence(session, now, reason),

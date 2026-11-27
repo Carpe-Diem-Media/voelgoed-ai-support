@@ -8,7 +8,15 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   alias VoelgoedAi.Governance.Admission
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, Delivery, InboundEvent}
+
+  alias VoelgoedAi.Support.{
+    ChatwootAdapter,
+    Configuration,
+    DecisionTemplates,
+    Delivery,
+    InboundEvent
+  }
+
   alias VoelgoedAi.Support.{Ownership, RunInput, SupportRun, SystemAudit}
   alias VoelgoedAi.Support.Workers.{ProcessRun, Sweep}
 
@@ -134,12 +142,24 @@ defmodule VoelgoedAi.Support.RunProcessing do
           disposition(event, session, :triage, :late_input, now)
         end
 
-      {:error, reason} when reason in [:admission_limited, :awaiting_operator, :stale_policy] ->
+      {:error, :admission_limited} ->
+        # An exhausted AI allowance cannot stop staff routing in shadow.
+        with {:ok, session} <- route_limited_shadow(config, session, now) do
+          disposition(event, session, :triage, :admission_limited, now)
+        end
+
+      {:error, reason} when reason in [:awaiting_operator, :stale_policy] ->
         disposition(event, session, :triage, reason, now)
 
       error ->
         error
     end
+  end
+
+  defp route_limited_shadow(config, session, now) do
+    if Ownership.shadow_evaluation_enabled?(config),
+      do: Ownership.route_overdue_locked(config, session, now),
+      else: {:ok, session}
   end
 
   defp route_expired_batch(batch, config, session, now) do
@@ -337,17 +357,16 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
   end
 
-  @doc "Claim the current batch and render or suppress its fixed response."
+  @doc "Claim the current batch and complete its fixed or shadow workflow."
   def process_run(id), do: VoelgoedAi.Support.JobAction.invoke(SupportRun, :process_run, id)
 
   @doc false
   def perform_run(id) do
-    with {:ok, {:claimed, run, session}} <- with_run(id, &claim/4) do
-      observation = ChatwootAdapter.observe(session, run.deadline_at)
-      history = ChatwootAdapter.history(session, run.deadline_at)
+    with {:ok, {:claimed, run, session, work}} <- with_run(id, &claim/4) do
+      decision = evaluate(work, session, run.lease_expires_at, run.deadline_at)
 
       with_run(id, fn config, session, current, now ->
-        complete(config, session, current, run, now, observation, history)
+        complete(config, session, current, run, now, decision)
       end)
       |> job_result()
     else
@@ -356,13 +375,39 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
   end
 
+  defp evaluate(:fixed, session, _lease, deadline) do
+    {:fixed, ChatwootAdapter.observe(session, deadline),
+     ChatwootAdapter.history(session, deadline)}
+  end
+
+  defp evaluate({:shadow, receipts}, session, lease, _deadline) do
+    ids = Enum.map(receipts, &elem(&1, 1))
+
+    # Read twice outside the transaction. Compare ordered IDs, roles and text
+    # before accepting a projection whose messages might have been edited.
+    first = ChatwootAdapter.decision_context(session, ids, lease)
+    observation = ChatwootAdapter.observe(session, lease)
+
+    context =
+      with {:ok, original} <- first,
+           {:ok, _} <- observation,
+           {:ok, current} <- ChatwootAdapter.decision_context(session, ids, lease),
+           true <- original.commitment == current.commitment do
+        {:ok, current}
+      else
+        _ -> {:error, :history_changed}
+      end
+
+    {:shadow, receipts, observation, context}
+  end
+
   @doc false
   def with_run(id, operation) do
     Repo.transact(fn ->
       with {:ok, %SupportRun{} = candidate} <- Ownership.get(SupportRun, id) do
-        Ownership.locked_session(candidate.session_id, fn config, session, now ->
+        Ownership.locked_session(candidate.session_id, fn config, session, _now ->
           with {:ok, %SupportRun{} = run} <- Ownership.get(SupportRun, id, lock: true) do
-            operation.(config, session, run, now)
+            operation.(config, session, run, ChatwootAdapter.now())
           end
         end)
       else
@@ -389,7 +434,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
         with {:ok, running} <-
                store_read(SupportRun, :active, %{}, %{state: :running}, many: true, limit: 5),
              {:ok, nil} <- Ownership.blocking_delivery(session, lock: true) do
-          if length(running) < 5, do: claim_run(run, session, now), else: {:ok, :capacity}
+          if length(running) < 5, do: claim_run(config, run, session, now), else: {:ok, :capacity}
         else
           {:ok, _} -> finish(run, :cancel, now, :awaiting_operator)
           error -> error
@@ -399,23 +444,43 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   defp claim(_, _, _, _), do: {:ok, :finished}
 
-  defp claim_run(run, session, now) do
-    lease = DateTime.add(now, 5)
-
-    attrs = %{
-      lease_expires_at: lease,
-      claim_generation: run.claim_generation + 1,
-      attempt_count: run.attempt_count + 1,
-      started_at: now
-    }
-
-    with {:ok, run} <- store_update(run, :claim, attrs),
+  defp claim_run(config, run, session, now) do
+    with {:ok, work} <- claim_work(config, session, run),
+         lease = if(work == :fixed, do: DateTime.add(now, 5), else: run.deadline_at),
+         {:ok, run} <-
+           store_update(run, :claim, %{
+             lease_expires_at: lease,
+             claim_generation: run.claim_generation + 1,
+             attempt_count: run.attempt_count + 1,
+             started_at: now
+           }),
          {:ok, _} <- Ownership.enqueue(Sweep, %{"run_id" => run.id}, scheduled_at: lease) do
-      {:ok, {:claimed, run, session}}
+      {:ok, {:claimed, run, session, work}}
+    else
+      {:error, reason} when reason in [:history_changed, :stale_policy] ->
+        finish(run, :cancel, now, reason)
+
+      error ->
+        error
     end
   end
 
-  defp complete(config, session, run, claim, now, observation, history) do
+  defp claim_work(config, session, run) do
+    if Ownership.shadow_evaluation_enabled?(config) do
+      with {:ok, %{response_policy: :shadow_decision}} <-
+             Configuration.current_revision(config.assistant),
+           {:ok, receipts} <- covered_receipts(session, run) do
+        {:ok, {:shadow, receipts}}
+      else
+        {:ok, _} -> {:error, :stale_policy}
+        error -> error
+      end
+    else
+      {:ok, :fixed}
+    end
+  end
+
+  defp complete(config, session, run, claim, now, decision) do
     cond do
       run.state != :running or run.claim_generation != claim.claim_generation ->
         {:ok, :stale_claim}
@@ -428,7 +493,100 @@ defmodule VoelgoedAi.Support.RunProcessing do
         finish(run, :cancel, now, :stale_policy)
 
       true ->
-        decide(config, session, run, now, observation, history)
+        finalize(config, session, run, now, decision)
+    end
+  end
+
+  defp finalize(config, session, run, now, {:fixed, observation, history}),
+    do: decide(config, session, run, now, observation, history)
+
+  defp finalize(config, session, run, now, {:shadow, receipts, {:ok, observation}, context}) do
+    cond do
+      not Ownership.shadow_evaluation_enabled?(config) ->
+        finish(run, :cancel, now, :stale_policy)
+
+      not Ownership.eligible_bot?(config, session, observation) ->
+        with {:ok, _} <- finish(run, :cancel, now, :scope_denied) do
+          Ownership.observe(config, session, observation, now)
+        end
+
+      true ->
+        with {:ok, ^receipts} <- covered_receipts(session, run),
+             {:ok, false} <- Ownership.pending_input?(session),
+             {:ok, revision} <- Configuration.current_revision(config.assistant) do
+          decide_shadow(config, session, run, revision, now, observation, context)
+        else
+          {:ok, _} ->
+            finish(run, :fail, now, :history_changed)
+
+          {:error, reason} when reason in [:history_changed, :stale_policy] ->
+            finish(run, :fail, now, reason)
+
+          error ->
+            error
+        end
+    end
+  end
+
+  defp finalize(_, _, run, now, {:shadow, _, {:error, reason}, _}) do
+    finish(run, :fail, now, if(reason == :scope_denied, do: reason, else: :unavailable))
+  end
+
+  defp decide_shadow(config, session, run, revision, _now, observation, {:ok, context}) do
+    # Treat the same session as unresolved until a verified close creates a
+    # new generation. A new phrase alone cannot reset the clarification cap.
+    with {:ok, prior} <-
+           store_read(SupportRun, :shadow_clarifications, %{}, %{session_id: session.id},
+             many: true,
+             limit: 2
+           ),
+         now = ChatwootAdapter.now(),
+         true <- DateTime.before?(now, run.lease_expires_at),
+         {:ok, decision} <- DecisionTemplates.decide(context, revision.locale, length(prior) < 2),
+         handoff? = decision.decision == "handoff",
+         {:ok, completed} <-
+           store_update(run, :complete_shadow, %{
+             typed_decision: decision,
+             shadow_disposition: if(handoff?, do: :local_handoff, else: :no_send),
+             finished_at: now
+           }) do
+      if handoff?,
+        do: Ownership.route_shadow_locked(config, session, observation, now),
+        else: {:ok, completed}
+    else
+      false -> finish(run, :fail, ChatwootAdapter.now(), :deadline)
+      error -> error
+    end
+  end
+
+  defp decide_shadow(config, session, run, _, now, observation, {:error, :history_changed}) do
+    with {:ok, _} <- finish(run, :fail, now, :history_changed) do
+      Ownership.route_shadow_locked(config, session, observation, now)
+    end
+  end
+
+  defp covered_receipts(session, run) do
+    with {:ok, inputs} when inputs != [] <- inputs(run.id) do
+      Enum.reduce_while(inputs, {:ok, []}, fn input, {:ok, ids} ->
+        case Ownership.get(InboundEvent, input.event_id, lock: true) do
+          {:ok, %InboundEvent{state: :dispatched, disposition: :covered, kind: :input} = event}
+          when event.session_id == session.id and event.contact_id == session.contact_id ->
+            if ChatwootAdapter.destination(event) == ChatwootAdapter.destination(session) do
+              {:cont, {:ok, [{event.id, event.message_id} | ids]}}
+            else
+              {:halt, {:error, :history_changed}}
+            end
+
+          {:ok, _} ->
+            {:halt, {:error, :history_changed}}
+
+          error ->
+            {:halt, error}
+        end
+      end)
+    else
+      {:ok, []} -> {:error, :history_changed}
+      error -> error
     end
   end
 
@@ -452,7 +610,10 @@ defmodule VoelgoedAi.Support.RunProcessing do
   defp decide(_, _, run, now, _, _), do: finish(run, :fail, now, :unavailable)
 
   defp complete_decision(config, session, run, now, policy) do
-    decision = if Ownership.write_enabled?(config), do: policy, else: :no_send
+    decision =
+      if policy in [:fixed_reply, :handoff] and Ownership.write_enabled?(config),
+        do: policy,
+        else: :no_send
 
     with {:ok, completed} <-
            store_update(run, :complete, %{

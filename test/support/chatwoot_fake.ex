@@ -3,7 +3,14 @@ defmodule VoelgoedAi.ChatwootFake do
 
   @behaviour VoelgoedAi.Support.ChatwootAdapter
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.ChatwootAdapter.{History, Message, Observation}
+
+  alias VoelgoedAi.Support.ChatwootAdapter.{
+    History,
+    Message,
+    Observation,
+    TextHistory,
+    TextMessage
+  }
 
   def child_spec(state), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [state]}}
 
@@ -71,6 +78,59 @@ defmodule VoelgoedAi.ChatwootFake do
     else
       response
     end
+  end
+
+  @impl true
+  def decision_history(agent, destination, limit, budget) do
+    false = Repo.in_transaction?()
+
+    {response, barrier} =
+      Agent.get_and_update(agent, fn state ->
+        {barrier, state} = Map.pop(state, :decision_history_barrier)
+
+        response =
+          with {:ok, observation} <- qualify(state.observation, destination) do
+            messages =
+              state.history
+              |> Enum.take(-limit)
+              |> Enum.map(&text_message(&1, observation.contact, state))
+
+            {:ok,
+             %TextHistory{
+               destination: Map.get(state, :text_destination, destination),
+               contact: Map.get(state, :text_contact, observation.contact),
+               messages: messages
+             }}
+          end
+
+        {{response, barrier}, Map.update(state, :decision_reads, 1, &(&1 + 1))}
+      end)
+
+    if barrier do
+      send(barrier, {:decision_history, self()})
+
+      receive do
+        :resume_decision_history -> response
+      after
+        budget -> {:error, :deadline}
+      end
+    else
+      response
+    end
+  end
+
+  defp text_message(message, contact, state) do
+    base = %TextMessage{
+      id: message.id,
+      sender: message.sender,
+      contact_id: if(message.sender == :contact, do: contact),
+      visibility: message.visibility,
+      edited?: false,
+      attachments?: false,
+      text: "Synthetic input"
+    }
+
+    struct!(base, get_in(state, [:decision_messages, message.id]) || %{})
   end
 
   @impl true

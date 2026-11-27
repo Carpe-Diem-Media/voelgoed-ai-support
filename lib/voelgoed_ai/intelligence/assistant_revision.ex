@@ -1,5 +1,5 @@
 defmodule VoelgoedAi.Intelligence.AssistantRevision do
-  @moduledoc "Versioned fixed workflow configuration. Only drafts can change content."
+  @moduledoc "Versioned support workflow configuration. Only drafts can change content."
 
   use Ash.Resource,
     domain: VoelgoedAi.Intelligence,
@@ -31,7 +31,7 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
     check_constraints do
       check_constraint(:status, "assistant_revisions_lifecycle",
         check: """
-        revision_number > 0 AND config_hash_version IN (1, 2) AND locale IN ('af', 'en') AND response_policy IN ('fixed_reply', 'handoff') AND
+        revision_number > 0 AND config_hash_version IN (1, 2) AND locale IN ('af', 'en') AND response_policy IN ('fixed_reply', 'handoff', 'shadow_decision') AND
         char_length(workflow_version) BETWEEN 1 AND 64 AND char_length(template_version) BETWEEN 1 AND 64 AND
         ((status IN ('draft', 'discarded') AND published_at IS NULL AND published_by_id IS NULL AND config_hash IS NULL) OR
          (status IN ('published', 'superseded') AND published_at IS NOT NULL AND published_by_id IS NOT NULL
@@ -58,7 +58,7 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
 
     attribute(:response_policy, :atom,
       allow_nil?: false,
-      constraints: [one_of: [:fixed_reply, :handoff]]
+      constraints: [one_of: [:fixed_reply, :handoff, :shadow_decision]]
     )
 
     attribute(:config_hash, :string, constraints: [match: ~r/\A[a-f0-9]{64}\z/])
@@ -95,7 +95,7 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
 
       argument(:response_policy, :atom,
         allow_nil?: false,
-        constraints: [one_of: [:fixed_reply, :handoff]]
+        constraints: [one_of: [:fixed_reply, :handoff, :shadow_decision]]
       )
 
       run(Configuration)
@@ -106,7 +106,11 @@ defmodule VoelgoedAi.Intelligence.AssistantRevision do
       argument(:workflow_version, :string, constraints: [max_length: 64])
       argument(:template_version, :string, constraints: [max_length: 64])
       argument(:locale, :atom, constraints: [one_of: [:af, :en]])
-      argument(:response_policy, :atom, constraints: [one_of: [:fixed_reply, :handoff]])
+
+      argument(:response_policy, :atom,
+        constraints: [one_of: [:fixed_reply, :handoff, :shadow_decision]]
+      )
+
       run(Configuration)
     end
 

@@ -52,6 +52,51 @@ defmodule VoelgoedAi.Support.SupportRun do
         (state IN ('completed', 'cancelled', 'superseded', 'failed')) = (finished_at IS NOT NULL)
         """
       )
+
+      check_constraint(:shadow_disposition, "support_runs_shadow_completion",
+        check: """
+        (shadow_disposition IS NULL AND typed_decision IS NULL) OR
+        (shadow_disposition IS NOT NULL AND typed_decision IS NOT NULL
+          AND state = 'completed' AND decision = 'no_send' AND claim_generation > 0
+          AND jsonb_typeof(typed_decision) = 'object'
+          AND typed_decision->>'decision' IS NOT NULL
+          AND (shadow_disposition = 'local_handoff' AND typed_decision->>'decision' = 'handoff'
+            OR shadow_disposition = 'no_send' AND typed_decision->>'decision' IN ('greeting', 'clarify', 'decline')))
+        """
+      )
+    end
+
+    custom_statements do
+      statement :guard_shadow_completion_function do
+        after_tables(["support_runs"])
+
+        up("""
+        CREATE FUNCTION guard_support_run_shadow_completion() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'shadow completion may only be written from a running claim'
+            USING ERRCODE = 'check_violation';
+        END
+        $$;
+        """)
+
+        down("DROP FUNCTION guard_support_run_shadow_completion()")
+      end
+
+      statement :guard_shadow_completion_trigger do
+        after_tables(["support_runs"])
+
+        up("""
+        CREATE TRIGGER support_runs_immutable_shadow_completion
+          BEFORE UPDATE OF typed_decision, shadow_disposition ON support_runs
+          FOR EACH ROW
+          WHEN (OLD.state <> 'running' AND
+            (OLD.typed_decision IS DISTINCT FROM NEW.typed_decision OR
+             OLD.shadow_disposition IS DISTINCT FROM NEW.shadow_disposition))
+          EXECUTE FUNCTION guard_support_run_shadow_completion();
+        """)
+
+        down("DROP TRIGGER support_runs_immutable_shadow_completion ON support_runs")
+      end
     end
   end
 
@@ -103,6 +148,10 @@ defmodule VoelgoedAi.Support.SupportRun do
       allow_nil?: true,
       constraints: [one_of: [:fixed_reply, :handoff, :no_send]]
     )
+
+    attribute(:typed_decision, VoelgoedAi.Support.SupportDecision, sensitive?: true)
+
+    attribute(:shadow_disposition, :atom, constraints: [one_of: [:no_send, :local_handoff]])
 
     attribute(:state, :atom,
       public?: true,
@@ -209,6 +258,28 @@ defmodule VoelgoedAi.Support.SupportRun do
       change(set_attribute(:lease_expires_at, nil))
     end
 
+    read :shadow_clarifications do
+      filter(
+        expr(
+          state == :completed and shadow_disposition == :no_send and
+            fragment("?->>'decision' = 'clarify'", typed_decision)
+        )
+      )
+    end
+
+    update :complete_shadow do
+      description("Complete a fenced shadow run and record its local disposition.")
+      transaction?(false)
+      require_atomic?(false)
+      accept([:typed_decision, :shadow_disposition, :finished_at])
+      require_attributes([:typed_decision, :shadow_disposition, :finished_at])
+
+      validate({VoelgoedAi.Support.FromState, states: [:running]})
+      change(set_attribute(:state, :completed))
+      change(set_attribute(:decision, :no_send))
+      change(set_attribute(:lease_expires_at, nil))
+    end
+
     update :cancel do
       transaction?(false)
       require_atomic?(false)
@@ -286,6 +357,8 @@ defmodule VoelgoedAi.Support.SupportRun do
              :extend_batch,
              :claim,
              :complete,
+             :complete_shadow,
+             :shadow_clarifications,
              :cancel,
              :supersede,
              :fail,

@@ -21,7 +21,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
       check_constraint(:status, "automation_controls_status",
         check: """
         security_epoch >= 0 AND ((status = 'disabled' AND mode = 'disabled') OR
-                                 (status = 'enabled' AND mode = 'fake'))
+                                 (status = 'enabled' AND mode IN ('fake', 'shadow_test')))
         """
       )
     end
@@ -53,7 +53,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
     attribute(:mode, :atom,
       allow_nil?: false,
       default: :disabled,
-      constraints: [one_of: [:disabled, :fake]]
+      constraints: [one_of: [:disabled, :fake, :shadow_test]]
     )
 
     attribute(:security_epoch, :integer, allow_nil?: false, default: 0, constraints: [min: 0])

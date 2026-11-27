@@ -53,6 +53,34 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
     @type t :: %__MODULE__{destination: Destination.t(), messages: [Message.t()]}
   end
 
+  defmodule TextMessage do
+    @moduledoc "Public text with verified sender and explicit edit and attachment facts."
+    @enforce_keys [:id, :sender, :contact_id, :visibility, :edited?, :attachments?, :text]
+    defstruct @enforce_keys
+
+    @type t :: %__MODULE__{
+            id: pos_integer(),
+            sender: :contact | :bot | :human,
+            contact_id: pos_integer() | nil,
+            visibility: :public | :private,
+            edited?: boolean(),
+            attachments?: boolean(),
+            text: String.t()
+          }
+  end
+
+  defmodule TextHistory do
+    @moduledoc "Ordered text qualified to one destination and its verified contact."
+    @enforce_keys [:destination, :contact, :messages]
+    defstruct @enforce_keys
+
+    @type t :: %__MODULE__{
+            destination: Destination.t(),
+            contact: pos_integer(),
+            messages: [TextMessage.t()]
+          }
+  end
+
   @doc false
   def in_scope?(row) do
     keys = [:installation_ref, :external_account_id, :external_inbox_id]
@@ -70,6 +98,9 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
               {:ok, Observation.t()} | {:error, read_failure()}
   @callback history(term(), Destination.t(), pos_integer(), pos_integer()) ::
               {:ok, History.t()} | {:error, read_failure()}
+  @callback decision_history(term(), Destination.t(), pos_integer(), pos_integer()) ::
+              {:ok, TextHistory.t()} | {:error, read_failure()}
+  @optional_callbacks decision_history: 4
   @callback reply(term(), Destination.t(), String.t(), String.t(), pos_integer()) ::
               {:ok, Destination.t(), pos_integer()} | {:error, write_failure()}
   @callback open_for_handoff(term(), Destination.t(), String.t(), pos_integer()) ::
@@ -144,6 +175,23 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
       end
     else
       {:error, :unavailable}
+    end
+  end
+
+  @doc false
+  def decision_context(session, ids, deadline) do
+    destination = destination(session)
+    contact = session.contact_id
+
+    with %{adapter: {module, _}, shadow_evaluation: true} <- fixture(),
+         true <- function_exported?(module, :decision_history, 4),
+         {:ok, %TextHistory{destination: ^destination, contact: ^contact, messages: messages}} <-
+           call(:decision_history, destination, [15], deadline) do
+      VoelgoedAi.Support.DecisionContext.project(messages, ids, contact)
+    else
+      {:ok, _} -> {:error, :scope_denied}
+      {:error, _} = error -> error
+      _ -> {:error, :unavailable}
     end
   end
 

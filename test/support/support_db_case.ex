@@ -21,6 +21,20 @@ defmodule VoelgoedAi.SupportDBCase do
     {staff, admin, operator} = Keyword.get_lazy(opts, :staff, &setup_staff/0)
 
     assistant = create(admin, staff.slug)
+    shadow = Keyword.get(opts, :shadow)
+
+    workflow =
+      if shadow do
+        %{
+          workflow_version: "shadow-v1",
+          template_version: "shadow-v1",
+          locale: shadow,
+          response_policy: :shadow_decision
+        }
+      else
+        %{}
+      end
+
     inbox_id = next_id()
     conversation_id = next_id()
     message_id = next_id()
@@ -57,32 +71,50 @@ defmodule VoelgoedAi.SupportDBCase do
       )
 
     fixture =
-      allow_fixture(assistant, %{
-        external_inbox_id: inbox_id,
-        external_account_id: account_id,
-        adapter: {ChatwootFake, fake},
-        signing_key: @signing_key,
-        clock: fn -> Agent.get(fake, & &1.now) end,
-        after_claim: fn -> pause_after_claim(fake) end,
-        after_authorization: fn ->
-          pause_delivery(
-            fake,
-            :authorization_barrier,
-            :delivery_authorized,
-            :resume_delivery_authorization
-          )
-        end,
-        batch_size: 5,
-        history_limit: 15,
-        inbox_limit: 100,
-        global_limit: 100,
-        # Keep the shared DevCore TEST allocation from combining unrelated
-        # scenarios into one global counter. Each scenario still shares it
-        # across all of its conversations and contacts.
-        global_scope: "synthetic:#{account_id}:fixture_global"
-      })
+      allow_fixture(
+        assistant,
+        Map.merge(workflow, %{
+          shadow_evaluation: not is_nil(shadow),
+          external_inbox_id: inbox_id,
+          external_account_id: account_id,
+          adapter: {ChatwootFake, fake},
+          signing_key: @signing_key,
+          clock: fn -> Agent.get(fake, & &1.now) end,
+          after_claim: fn -> pause_after_claim(fake) end,
+          after_authorization: fn ->
+            pause_delivery(
+              fake,
+              :authorization_barrier,
+              :delivery_authorized,
+              :resume_delivery_authorization
+            )
+          end,
+          batch_size: 5,
+          history_limit: 15,
+          inbox_limit: 100,
+          global_limit: 100,
+          # Keep the shared DevCore TEST allocation from combining unrelated
+          # scenarios into one global counter. Each scenario still shares it
+          # across all of its conversations and contacts.
+          global_scope: "synthetic:#{account_id}:fixture_global"
+        })
+      )
 
-    revision = draft(admin, assistant)
+    revision =
+      if shadow do
+        assert {:ok, revision} =
+                 invoke(
+                   AssistantRevision,
+                   :create_draft,
+                   Map.put(workflow, :assistant_id, assistant.id),
+                   admin
+                 )
+
+        revision
+      else
+        draft(admin, assistant)
+      end
+
     Keyword.get(opts, :before_publish, fn _, _ -> :ok end).(admin, revision)
 
     assert {:ok, _} =
@@ -106,16 +138,20 @@ defmodule VoelgoedAi.SupportDBCase do
 
     assert {:ok, _} = invoke(InboxBinding, :enable, %{id: binding.id}, admin)
 
-    assert {:ok, _} =
-             invoke(
-               InboxBinding,
-               :change_mode,
-               %{id: binding.id, operating_mode: :automatic},
-               admin
-             )
+    unless shadow do
+      assert {:ok, _} =
+               invoke(
+                 InboxBinding,
+                 :change_mode,
+                 %{id: binding.id, operating_mode: :automatic},
+                 admin
+               )
+    end
 
-    assert {:ok, _} =
-             invoke(AutomationControl, :enable_automation, %{binding_id: binding.id}, admin)
+    if Keyword.get(opts, :enable, true) do
+      assert {:ok, _} =
+               invoke(AutomationControl, :enable_automation, %{binding_id: binding.id}, admin)
+    end
 
     on_exit(fn ->
       clean(inbox_id, account_id)
