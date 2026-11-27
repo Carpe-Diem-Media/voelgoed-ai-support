@@ -695,6 +695,9 @@ defmodule VoelgoedAi.Knowledge.Editorial do
     )
   end
 
+  @doc false
+  def reviewer_scope?(id, staff), do: scoped?(id, staff, @reviewer)
+
   defp editorial_scope?(id, staff),
     do: scoped?(id, staff, @editor) or scoped?(id, staff, @reviewer)
 

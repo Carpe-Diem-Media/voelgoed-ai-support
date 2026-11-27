@@ -860,6 +860,14 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
                settlement
              ])
 
+    # Recent migrations can depend on the installed VGAS-20 audit shape.
+    # Rewind them only for the SQL-only predecessor phase of this proof.
+    newer = Ecto.Migrator.run(Repo, :down, to_exclusive: @finance_version)
+
+    on_exit(fn ->
+      Ecto.Migrator.run(Repo, :up, strict_version_order: true, all: true)
+    end)
+
     assert_raise Postgrex.Error, ~r/VGAS-20 rollback would remove financial evidence/, fn ->
       Ecto.Migrator.run(Repo, :down, step: 1)
     end
@@ -907,8 +915,8 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
 
       assert [[^settlement, "settlement", @ceiling, nil]] = ledger_identity(ctx)
     after
-      assert [@finance_version] =
-               Ecto.Migrator.run(Repo, :up, strict_version_order: true, all: true)
+      expected = [@finance_version | Enum.reverse(newer)]
+      assert ^expected = Ecto.Migrator.run(Repo, :up, strict_version_order: true, all: true)
     end
 
     assert [[true, nil]] = inhibit_state(:generation)

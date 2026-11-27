@@ -2,7 +2,11 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Components do
   @moduledoc false
   use Phoenix.Component
 
-  def root(assigns) do
+  def root(assigns), do: staff_root(assign(assigns, :gap_page, false))
+
+  def gap_root(assigns), do: staff_root(assign(assigns, :gap_page, true))
+
+  defp staff_root(assigns) do
     ~H"""
     <!DOCTYPE html>
     <html lang="en">
@@ -10,8 +14,10 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Components do
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="csrf-token" content={Plug.CSRFProtection.get_csrf_token()} />
-        <title>Knowledge · Voelgoed staff</title>
+        <title>{if @gap_page, do: "Knowledge gaps | Voelgoed staff", else: "Knowledge · Voelgoed staff"}</title>
+        <meta :if={@gap_page} name="staff-live-path" content="/staff/gap-live" />
         <link rel="stylesheet" href="/staff/assets/knowledge.css" />
+        <link :if={@gap_page} rel="stylesheet" href="/staff/assets/gaps.css" />
         <script defer src="/staff/assets/phoenix/phoenix.min.js"></script>
         <script defer src="/staff/assets/live_view/phoenix_live_view.min.js"></script>
         <script defer src="/staff/assets/knowledge.js"></script>
@@ -20,7 +26,8 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Components do
         <a class="skip-link" href="#main">Skip to content</a>
         <header class="masthead">
           <nav aria-label="Staff">
-            <a href="/staff/knowledge">Voelgoed Knowledge</a>
+            <a :if={@gap_page} href="/staff/gaps">Voelgoed staff</a>
+            <a :if={!@gap_page} href="/staff/knowledge">Voelgoed Knowledge</a>
           </nav>
         </header>
         <main id="main" tabindex="-1">{@inner_content}</main>

@@ -84,20 +84,21 @@ defmodule VoelgoedAi.KnowledgeFixtures do
     {collection, revision}
   end
 
-  def request_index(ctx, revision, action \\ :request_publish) do
+  def request_index(ctx, revision, action \\ :request_publish, expected \\ 2) do
     args = Map.put(snapshot(revision), :expected_current_revision_id, nil)
 
     assert {:ok, %{status: :publishing, publication_generation: generation}} =
              invoke(ArticleRevision, action, args, ctx.reviewer)
 
-    assert %{rows: [[first], [second]]} =
+    assert %{rows: rows} =
              SQL.query!(
                Repo,
                "SELECT id::text FROM article_embeddings WHERE revision_id = $1 AND generation = $2 ORDER BY locale",
                [Ecto.UUID.dump!(revision.id), generation]
              )
 
-    [first, second]
+    assert length(rows) == expected
+    List.flatten(rows)
   end
 
   def reservation_rows(id) do

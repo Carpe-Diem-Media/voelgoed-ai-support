@@ -1457,10 +1457,11 @@ defmodule VoelgoedAi.Knowledge.RetrievalTest do
         assert {:error, _} = close.()
         assert [["succeeded", true, "settled", 18]] = query_rows(ctx)
       else
-        assert [
-                 ["abandoned", true, "conservatively_settled", 81_920],
-                 ["abandoned", true, "conservatively_settled", -81_902]
-               ] = query_rows(ctx)
+        # The join has no ORDER BY. The barriers above establish operation order.
+        assert Enum.sort(query_rows(ctx)) == [
+                 ["abandoned", true, "conservatively_settled", -81_902],
+                 ["abandoned", true, "conservatively_settled", 81_920]
+               ]
       end
 
       assert %{rows: [[18, count]]} =

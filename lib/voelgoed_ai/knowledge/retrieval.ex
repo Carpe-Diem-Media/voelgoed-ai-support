@@ -58,7 +58,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
   """
   if Mix.env() == :test do
     alias VoelgoedAi.Intelligence.Embedding
-    alias VoelgoedAi.Knowledge.ArticleRevision
+    alias VoelgoedAi.Knowledge.{ArticleRevision, GapEvidence}
     alias VoelgoedAi.Knowledge.Retrieval.Scope
     alias VoelgoedAi.Support.{Ownership, RunProcessing}
 
@@ -66,6 +66,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     @authority_key {__MODULE__, :authority}
     @inbox_keys [:installation_ref, :external_account_id, :external_inbox_id]
     @manifest_key {__MODULE__, :manifest}
+    @gap_key {__MODULE__, :gap_lookup}
     @query_key {__MODULE__, :query}
     @rank_measurement_key {__MODULE__, :rank_measurement}
 
@@ -216,6 +217,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
         try do
           operation.(search, validate)
         after
+          Process.delete(@gap_key)
           Process.delete(@manifest_key)
           Process.delete(@authority_key)
         end
@@ -286,8 +288,59 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       end
     end
 
+    @doc false
+    def gap_candidate(owner, decision_context) do
+      with true <- worker_owner?(owner) and GapEvidence.fixture() != nil,
+           %{shadow_query: _, locale: locale} = context <- authority(),
+           true <- GapEvidence.qualified?(decision_context, locale),
+           {:ok, finding} <-
+             qualified(context, fn config, run, _, now, _ ->
+               GapEvidence.find(config, run, locale, now)
+             end) do
+        finding
+      else
+        _ -> nil
+      end
+    end
+
+    @doc false
+    def gap_result(owner, %{cause: cause} = finding, {:ok, %{status: status}}) do
+      if worker_owner?(owner) and Process.get(@gap_key) == status and
+           ((cause in [:missing, :insufficient] and status == :no_evidence) or
+              (cause == :conflicting and status == :denied)),
+         do: finding
+    end
+
+    def gap_result(_, _, _), do: nil
+
+    @doc false
+    def gap_at_decision(owner, config, run, revision, context, commitment, candidate) do
+      with %{locale: locale, cause: cause} <- candidate,
+           true <- Repo.in_transaction?() and worker_owner?(owner),
+           %{locale: ^locale, pin_hash: hash, run_id: id, claim_generation: claim} = search <-
+             authority(),
+           true <- id == run.id and claim == run.claim_generation and hash == revision.config_hash,
+           true <- context.commitment == commitment and GapEvidence.qualified?(context, locale),
+           now = ChatwootAdapter.now(),
+           true <- gap_coverage_current?(cause, search, params(search, config, run, now)),
+           {:ok, ^candidate} <- GapEvidence.find(config, run, locale, now) do
+        candidate
+      else
+        _ -> nil
+      end
+    end
+
+    defp gap_coverage_current?(cause, context, bindings) do
+      case {cause, coverage(context, bindings, &GapEvidence.proof_query/2)} do
+        {cause, {:ok, []}} when cause in [:missing, :insufficient] -> true
+        {:conflicting, {:ok, [{_, false, _}, {_, false, _}]}} -> true
+        _ -> false
+      end
+    end
+
     defp execute(:search_published, %{query: query}, context) do
       Process.delete(@manifest_key)
+      Process.delete(@gap_key)
 
       case minimize(query) do
         {:ok, query} ->
@@ -320,7 +373,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
                bindings = params(context, config, run, now)
 
                with :ok <- check_shadow_lexemes(context),
-                    :ok <- has_eligible(bindings),
+                    :ok <- has_eligible(bindings, :gap_lookup),
                     {:ok, coverage} <- coverage(context, bindings),
                     {:ok, query} when is_binary(query) <- rank_query(context, query, coverage),
                     {:ok, %{rows: [[lexemes]]}} <-
@@ -338,8 +391,15 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
         Process.put(@manifest_key, Map.new(evidence, &{&1.citation_id, &1}))
         outcome(if(evidence == [], do: :no_evidence, else: :evidence), evidence)
       else
-        {:ok, status} when status in [:no_evidence, :denied] -> outcome(status)
-        _ -> outcome(:unavailable)
+        {:ok, {:gap_lookup, status}} ->
+          Process.put(@gap_key, status)
+          outcome(status)
+
+        {:ok, status} when status in [:no_evidence, :denied] ->
+          outcome(status)
+
+        _ ->
+          outcome(:unavailable)
       end
     end
 
@@ -436,8 +496,12 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       {:ok, Enum.filter(shortlist, fn {id, _, _} -> id == covered end)}
     end
 
-    defp select_ranked(%{coverage: []}, _), do: {:ok, :no_evidence}
+    defp select_ranked(%{coverage: []}, _), do: {:ok, {:gap_lookup, :no_evidence}}
     defp select_ranked(%{coverage: :fixture}, ranked), do: {:ok, ranked}
+
+    defp select_ranked(%{coverage: [{_, false, _}, {_, false, _}]}, _),
+      do: {:ok, {:gap_lookup, :denied}}
+
     defp select_ranked(_, _), do: {:ok, :denied}
 
     @doc false
@@ -594,20 +658,32 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     # alternative. Only an explicit, topically linked continuation can use
     # prior contact terms to fill a missing part. Inspect at most two subjects
     # so a conflicting variant outside the rank limits still forces triage.
-    defp coverage(%{shadow_query: query, prior_query: prior, locale: locale}, bindings) do
+    defp coverage(context, bindings, query_sql \\ &sql/2)
+
+    defp coverage(%{shadow_query: query, prior_query: prior, locale: locale}, bindings, query_sql) do
       with {:ok, %{rows: rows}} <-
-             sql(@eligible <> @coverage, bindings ++ [query, prior, @function_words[locale]]) do
+             query_sql.(
+               @eligible <> @coverage,
+               bindings ++ [query, prior, @function_words[locale]]
+             ) do
         {:ok, Enum.map(rows, &List.to_tuple/1)}
       end
     end
 
-    defp coverage(_, _), do: {:ok, :fixture}
+    defp coverage(_, _, _), do: {:ok, :fixture}
 
-    defp has_eligible(params) do
+    defp has_eligible(params, absence \\ :no_evidence) do
       case sql(@eligible <> "SELECT EXISTS (SELECT 1 FROM eligible)", params) do
-        {:ok, %{rows: [[true]]}} -> :ok
-        {:ok, %{rows: [[false]]}} -> {:ok, :no_evidence}
-        error -> error
+        {:ok, %{rows: [[true]]}} ->
+          :ok
+
+        {:ok, %{rows: [[false]]}} ->
+          if absence == :gap_lookup,
+            do: {:ok, {:gap_lookup, :no_evidence}},
+            else: {:ok, :no_evidence}
+
+        error ->
+          error
       end
     end
 

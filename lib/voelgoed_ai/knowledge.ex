@@ -10,6 +10,7 @@ defmodule VoelgoedAi.Knowledge do
     resource(VoelgoedAi.Knowledge.ArticleEmbedding)
     resource(VoelgoedAi.Knowledge.KnowledgeCollection)
     resource(VoelgoedAi.Knowledge.Article)
+    resource(VoelgoedAi.Knowledge.KnowledgeGap)
 
     resource VoelgoedAi.Knowledge.ArticleRevision do
       define(:search_published, args: [:query])

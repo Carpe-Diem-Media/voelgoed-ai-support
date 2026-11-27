@@ -15,6 +15,19 @@ defmodule VoelgoedAiWeb.Endpoint do
     longpoll: false
   )
 
+  if Mix.env() == :test do
+    socket("/staff/gap-live", VoelgoedAiWeb.GapLiveSocket,
+      websocket: [
+        check_origin: :conn,
+        check_csrf: true,
+        transport_log: false,
+        log: false,
+        connect_info: [:uri, session: {VoelgoedAiWeb.StaffSession, :options, []}]
+      ],
+      longpoll: false
+    )
+  end
+
   plug(:staff_asset_gate)
 
   plug(Plug.Static,
@@ -34,7 +47,7 @@ defmodule VoelgoedAiWeb.Endpoint do
   plug(Plug.Static,
     at: "/staff/assets",
     from: {:voelgoed_ai, "priv/static/staff"},
-    only: ~w(knowledge.js knowledge.css),
+    only: ~w(knowledge.js knowledge.css gaps.css),
     headers: [{"x-content-type-options", "nosniff"}]
   )
 
@@ -55,7 +68,7 @@ defmodule VoelgoedAiWeb.Endpoint do
       # Phoenix dispatches sockets before the application's plugs. Reject an
       # unavailable origin before it can reach cookie decryption.
       case conn do
-        %{path_info: ["staff", "live" | _]} ->
+        %{path_info: ["staff", path | _]} when path in ["live", "gap-live"] ->
           conn = VoelgoedAiWeb.StaffSession.knowledge_headers(conn, opts)
 
           if VoelgoedAiWeb.StaffSession.knowledge_origin?(conn),

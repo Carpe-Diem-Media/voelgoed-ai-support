@@ -70,6 +70,7 @@ defmodule VoelgoedAi.Accounts.StaffLifecycleTest do
              [
                :append,
                :append_financial,
+               :append_gap_review,
                :append_inhibit_trip,
                :append_knowledge,
                :append_operational,

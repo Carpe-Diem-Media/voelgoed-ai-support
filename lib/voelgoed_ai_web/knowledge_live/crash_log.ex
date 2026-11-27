@@ -1,10 +1,11 @@
 defmodule VoelgoedAiWeb.KnowledgeLive.CrashLog do
   @moduledoc false
 
-  alias VoelgoedAiWeb.{Endpoint, StaffLiveSocket}
+  alias VoelgoedAiWeb.{Endpoint, GapLive, GapLiveSocket, StaffLiveSocket}
 
   @filter :vgas_staff_knowledge_crash_log
-  @staff_pool Module.concat(Endpoint, StaffLiveSocket)
+  @staff_sockets [StaffLiveSocket, GapLiveSocket]
+  @staff_pools Enum.map(@staff_sockets, &Module.concat(Endpoint, &1))
   @view_prefix "Elixir.VoelgoedAiWeb.KnowledgeLive."
   @staff_http {__MODULE__, :staff_http}
 
@@ -71,7 +72,7 @@ defmodule VoelgoedAiWeb.KnowledgeLive.CrashLog do
     # A crash during join can also be formatted by Phoenix in the transport
     # process. Phoenix.Socket.__init__/1 labels that process before joins.
     case :proc_lib.get_label(self()) do
-      {Phoenix.Socket, StaffLiveSocket, _} ->
+      {Phoenix.Socket, socket, _} when socket in @staff_sockets ->
         replace(event, "Staff knowledge channel join crashed")
 
       _ ->
@@ -90,8 +91,9 @@ defmodule VoelgoedAiWeb.KnowledgeLive.CrashLog do
     end
   end
 
-  defp redact_process_report(event, {Phoenix.Socket, StaffLiveSocket, _}, _ancestors),
-    do: replace(event, "Staff knowledge socket crashed")
+  defp redact_process_report(event, {Phoenix.Socket, socket, _}, _ancestors)
+       when socket in @staff_sockets,
+       do: replace(event, "Staff knowledge socket crashed")
 
   defp redact_process_report(event, _label, ancestors), do: redact_pool_report(event, ancestors)
 
@@ -109,15 +111,16 @@ defmodule VoelgoedAiWeb.KnowledgeLive.CrashLog do
   defp staff_process? do
     Process.get(@staff_http, false) or staff_pool?(Process.get(:"$ancestors", [])) or
       case :proc_lib.get_label(self()) do
-        {Phoenix.Socket, StaffLiveSocket, _} -> true
+        {Phoenix.Socket, socket, _} when socket in @staff_sockets -> true
         {Phoenix.LiveView, view, _} when is_atom(view) -> staff_view?(view)
         _ -> false
       end
   end
 
+  defp staff_view?(GapLive), do: true
   defp staff_view?(view), do: String.starts_with?(Atom.to_string(view), @view_prefix)
 
-  defp staff_pool?([@staff_pool | _]), do: true
+  defp staff_pool?([pool | _]) when pool in @staff_pools, do: true
   defp staff_pool?([_ | ancestors]), do: staff_pool?(ancestors)
   defp staff_pool?(_), do: false
 

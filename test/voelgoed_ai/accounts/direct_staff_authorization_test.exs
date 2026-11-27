@@ -23,6 +23,7 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
   @audit_actions [
     append: :create,
     append_financial: :create,
+    append_gap_review: :create,
     append_inhibit_trip: :create,
     inhibit_trip: :read,
     financial_closure: :read,
@@ -87,6 +88,7 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
               ref: make_ref(),
               owner: VoelgoedAi.Governance.FinancialControl
             },
+            %VoelgoedAi.Knowledge.Storage{ref: make_ref(), owner: VoelgoedAi.Knowledge.GapReview},
             %VoelgoedAi.Support.WorkStore{ref: make_ref()},
             %Scope{action: wrong_action, target: context.target.id},
             %Scope{action: action, target: Ash.UUIDv7.generate()}
@@ -192,6 +194,20 @@ defmodule VoelgoedAi.Accounts.DirectStaffAuthorizationTest do
       reason_code: :local_admin,
       operational_before: %{status: :unknown},
       operational_after: %{status: :abandoned},
+      correlation_id: Ash.UUIDv7.generate()
+    }
+  end
+
+  defp arguments(:append_gap_review, %{session: session}) do
+    %{
+      actor_kind: :staff,
+      actor_staff_id: session.id,
+      target_kind: :knowledge_gap,
+      knowledge_gap_target_id: Ash.UUIDv7.generate(),
+      event: :gap_reviewed,
+      reason_code: :local_admin,
+      operational_before: %{status: :open, version: 1},
+      operational_after: %{status: :in_review, version: 2},
       correlation_id: Ash.UUIDv7.generate()
     }
   end

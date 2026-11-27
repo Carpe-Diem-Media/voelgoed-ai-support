@@ -485,6 +485,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
     end
 
     defp evaluate_shadow(search, run, session, receipts, original, {query, _}, locale, verified) do
+      candidate = Retrieval.gap_candidate(&evidence_owner/0, original)
+
       found =
         ArticleRevision
         |> Ash.ActionInput.for_action(:search_published, %{query: query}, actor: search)
@@ -493,19 +495,21 @@ defmodule VoelgoedAi.Support.RunProcessing do
       observation = ChatwootAdapter.observe(session, run.lease_expires_at)
 
       if observation == {:ok, verified} do
-        propose_shadow(found, run, session, receipts, original, locale, observation)
+        finding = Retrieval.gap_result(&evidence_owner/0, candidate, found)
+
+        propose_shadow(found, run, session, receipts, original, locale, observation, finding)
       else
         # An outage on a later read must never hide a definite scope loss.
         complete_claim(run, {:shadow, receipts, observation, {:error, :history_changed}})
       end
     end
 
-    defp propose_shadow(found, run, session, receipts, original, locale, observation) do
+    defp propose_shadow(found, run, session, receipts, original, locale, verified, finding) do
       cutoff = run.lease_expires_at
-      context = compare_context(session, receipts, cutoff, {:ok, original}, observation)
+      context = compare_context(session, receipts, cutoff, {:ok, original}, verified)
 
       proposal =
-        case {found, context, observation} do
+        case {found, context, verified} do
           {{:ok, %{status: :evidence, evidence: [%{mode: :exact} = item]}}, {:ok, _}, {:ok, _}} ->
             {DecisionTemplates.build(locale, "answer_exact", "supported", [item.revision_id]),
              [item]}
@@ -529,9 +533,19 @@ defmodule VoelgoedAi.Support.RunProcessing do
       observation = ChatwootAdapter.observe(session, cutoff)
       context = compare_context(session, receipts, cutoff, context, observation)
 
+      finding = if observation == verified, do: finding
+
       complete_claim(
         run,
-        shadow_result(proposal, receipts, observation, context, original.commitment, locale)
+        shadow_result(
+          proposal,
+          receipts,
+          observation,
+          context,
+          original.commitment,
+          locale,
+          finding
+        )
       )
     end
 
@@ -541,7 +555,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
            {:ok, _} = observation,
            {:ok, _} = context,
            commitment,
-           _locale
+           _locale,
+           _finding
          )
          when kind in ["answer_exact", "answer_grounded"] do
       by_revision = Map.new(items, &{&1.revision_id, &1.citation_id})
@@ -549,7 +564,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
       {:evidenced, :shadow, receipts, observation, context, commitment, decision, citations}
     end
 
-    defp shadow_result({proposal, _}, receipts, observation, context, _commitment, locale) do
+    defp shadow_result({proposal, _}, receipts, observation, context, commitment, locale, finding) do
       decision =
         case proposal do
           {:ok, %{decision: "clarify"}} ->
@@ -562,7 +577,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
             DecisionTemplates.build(locale, "handoff", "unavailable")
         end
 
-      {:shadow, receipts, observation, context, decision}
+      {:shadow, receipts, observation, context, {decision, finding, commitment}}
     end
   end
 
@@ -667,7 +682,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   if Mix.env() == :test do
-    alias VoelgoedAi.Knowledge.Retrieval
+    alias VoelgoedAi.Knowledge.{GapReview, Retrieval}
     alias VoelgoedAi.Knowledge.Retrieval.Reference
     alias VoelgoedAi.Support.{DecisionTemplates, EvidenceReply, SupportDecision}
 
@@ -874,6 +889,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
            {:ok, context},
            proposed
          ) do
+      {proposed, candidate, commitment} = proposed || {nil, nil, nil}
+
       # Treat the same session as unresolved until a verified close creates a
       # new generation. A new phrase alone cannot reset the clarification cap.
       with {:ok, prior} <-
@@ -881,8 +898,20 @@ defmodule VoelgoedAi.Support.RunProcessing do
                many: true,
                limit: 2
              ),
+           finding =
+             Retrieval.gap_at_decision(
+               &evidence_owner/0,
+               config,
+               run,
+               revision,
+               context,
+               commitment,
+               candidate
+             ),
            now = ChatwootAdapter.now(),
-           true <- DateTime.before?(now, run.lease_expires_at),
+           true <-
+             DateTime.before?(now, run.lease_expires_at) and
+               DateTime.before?(now, run.deadline_at),
            {:ok, decision} <-
              shadow_decision(proposed, context, revision.locale, length(prior) < 2),
            handoff? = decision.decision == "handoff",
@@ -891,7 +920,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
                typed_decision: decision,
                shadow_disposition: if(handoff?, do: :local_handoff, else: :no_send),
                finished_at: now
-             }) do
+             }),
+           :ok <- register_gap(completed, finding) do
         if handoff?,
           do: Ownership.route_shadow_locked(config, session, observation, now),
           else: {:ok, completed}
@@ -906,6 +936,12 @@ defmodule VoelgoedAi.Support.RunProcessing do
       with {:ok, _} <- finish(run, :fail, now, reason) do
         Ownership.route_shadow_locked(config, session, observation, now)
       end
+    end
+
+    defp register_gap(_completed, nil), do: :ok
+
+    defp register_gap(completed, finding) do
+      with {:ok, _} <- GapReview.register(&evidence_owner/0, completed, finding), do: :ok
     end
 
     defp shadow_decision(nil, context, locale, available?),

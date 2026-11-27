@@ -79,6 +79,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     :withdrawn_by_staff,
     :obsolete
   ]
+  @gap_events [:gap_reviewed, :gap_deferred, :gap_dismissed, :gap_addressed]
+  @gap_reasons [:duplicate_issue, :out_of_scope, :no_change_needed]
   @support_events [:request_handoff, :return_to_bot, :close_session, :abandon_delivery]
   @system_events [:delivery_unknown, :missed_deadline, :handoff_failed]
   @system_target_kinds [:inbound_event, :support_run, :outbound_delivery]
@@ -119,7 +121,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           :publish_failed,
           :withdrawn,
           :revoked,
-          :expired
+          :expired,
+          :open,
+          :addressed,
+          :dismissed
         ]
       ]
     ],
@@ -147,6 +152,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     collection_epoch: [type: :integer, constraints: [min: 0]],
     deadline_us: [type: :integer, constraints: [min: 1]],
     content_profile_id: [type: :string, constraints: [max_length: 128]],
+    version: [type: :integer, constraints: [min: 1]],
     edit_version: [type: :integer, constraints: [min: 1]],
     installation_ref: [type: :string, constraints: [max_length: 64]],
     external_account_id: [type: :integer, constraints: [min: 1]],
@@ -178,6 +184,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
       reference(:inhibit_attempt, on_delete: :restrict, on_update: :restrict)
       reference(:settlement_target, on_delete: :restrict, on_update: :restrict)
       reference(:target, on_delete: :restrict, on_update: :restrict)
+      reference(:knowledge_gap_target, on_delete: :restrict, on_update: :restrict)
       reference(:actor_staff, on_delete: :restrict, on_update: :restrict)
       reference(:assistant_target, on_delete: :restrict, on_update: :restrict)
       reference(:revision_target, on_delete: :restrict, on_update: :restrict)
@@ -221,7 +228,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
 
       check_constraint(:target_kind, "audit_events_exact_target",
         check: """
-          num_nonnulls(settlement_target_id, target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id, session_target_id, delivery_target_id, event_target_id, run_target_id, knowledge_collection_target_id, article_target_id, article_revision_target_id) = 1
+          num_nonnulls(settlement_target_id, target_id, assistant_target_id, revision_target_id, binding_target_id, control_target_id, session_target_id, delivery_target_id, event_target_id, run_target_id, knowledge_collection_target_id, article_target_id, article_revision_target_id, knowledge_gap_target_id) = 1
           AND (
             (target_kind = 'staff_user' AND target_id IS NOT NULL
               AND event IN ('provisioned','activated','signed_in','roles_changed','disabled','reactivated','retired')
@@ -254,6 +261,9 @@ defmodule VoelgoedAi.Governance.AuditEvent do
                 OR (event = 'expire' AND reason_code = 'deadline')
                 OR (event = 'rollback_index' AND reason_code = 'evaluated')
                 OR (event = 'archive' AND reason_code = 'obsolete')))
+            OR (target_kind = 'knowledge_gap' AND knowledge_gap_target_id IS NOT NULL
+              AND ((event = 'gap_dismissed' AND reason_code IN ('duplicate_issue','out_of_scope','no_change_needed'))
+                OR (event IN ('gap_reviewed','gap_deferred','gap_addressed') AND reason_code = 'local_admin')))
             OR (target_kind = 'support_session' AND session_target_id IS NOT NULL
               AND event IN ('request_handoff','return_to_bot','close_session'))
             OR (target_kind = 'outbound_delivery' AND delivery_target_id IS NOT NULL
@@ -269,11 +279,19 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           (target_kind = 'staff_user' AND actor_kind IN ('staff','bootstrap') AND after_state IS NOT NULL
             AND operational_before IS NULL AND operational_after IS NULL)
           OR (actor_kind = 'staff' AND before_state IS NULL AND after_state IS NULL AND operational_after IS NOT NULL
-            AND event NOT IN ('delivery_unknown','missed_deadline','handoff_failed','fail_publication','fail_reindex','expire','switch_index','rollback_index','trip_generation_inhibit','trip_embedding_inhibit')
+            AND event NOT IN ('gap_reviewed','gap_deferred','gap_dismissed','gap_addressed','delivery_unknown','missed_deadline','handoff_failed','fail_publication','fail_reindex','expire','switch_index','rollback_index','trip_generation_inhibit','trip_embedding_inhibit')
             AND (target_kind <> 'knowledge_revision' OR event NOT IN ('activate','supersede'))
             AND ((target_kind IN ('support_session', 'outbound_delivery') AND reason_code = 'local_operator')
               OR (target_kind IN ('knowledge_collection','knowledge_article','knowledge_revision'))
               OR (target_kind NOT IN ('staff_user','support_session','outbound_delivery','knowledge_collection','knowledge_article','knowledge_revision') AND reason_code = 'local_admin')))
+          OR (actor_kind = 'staff' AND target_kind = 'knowledge_gap'
+            AND before_state IS NULL AND after_state IS NULL
+            AND (CASE event
+              WHEN 'gap_reviewed' THEN operational_before->>'status' = 'open' AND operational_after->>'status' = 'in_review'
+              WHEN 'gap_deferred' THEN operational_before->>'status' = 'in_review' AND operational_after->>'status' = 'open'
+              WHEN 'gap_dismissed' THEN operational_before->>'status' = 'in_review' AND operational_after->>'status' = 'dismissed'
+              WHEN 'gap_addressed' THEN operational_before->>'status' = 'in_review' AND operational_after->>'status' = 'addressed'
+              ELSE false END) IS TRUE)
           OR (actor_kind = 'embedding_worker' AND target_kind = 'knowledge_revision'
             AND event IN ('fail_publication','fail_reindex') AND before_state IS NULL AND after_state IS NULL
             AND operational_before IS NOT NULL AND operational_after IS NOT NULL)
@@ -322,7 +340,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
         one_of: [
           :staff_user,
           :usage_settlement,
-          :support_session | @system_target_kinds ++ @target_kinds ++ @knowledge_targets
+          :support_session,
+          :knowledge_gap | @system_target_kinds ++ @target_kinds ++ @knowledge_targets
         ]
       ]
     )
@@ -336,7 +355,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
               @staff_events ++
               @operational_events ++
               @support_events ++
-              @system_events ++ @knowledge_events ++ @financial_events ++ @inhibit_events
+              @system_events ++
+              @knowledge_events ++ @financial_events ++ @inhibit_events ++ @gap_events
         ]
       ]
     )
@@ -354,6 +374,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
           ] ++
             ReasonCode.values() ++
             @knowledge_reasons ++
+            @gap_reasons ++
             @publication_reasons ++
             [
               :stale_request,
@@ -392,6 +413,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     belongs_to(:knowledge_collection_target, KnowledgeCollection)
     belongs_to(:article_target, Article)
     belongs_to(:article_revision_target, ArticleRevision)
+    belongs_to(:knowledge_gap_target, VoelgoedAi.Knowledge.KnowledgeGap)
     belongs_to(:actor_staff, StaffUser)
   end
 
@@ -400,6 +422,27 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   end
 
   actions do
+    create :append_gap_review do
+      description("Append the scoped staff decision in the gap review transaction.")
+      transaction?(false)
+
+      accept([
+        :actor_kind,
+        :actor_staff_id,
+        :target_kind,
+        :knowledge_gap_target_id,
+        :event,
+        :reason_code,
+        :operational_before,
+        :operational_after,
+        :correlation_id
+      ])
+
+      validate(attribute_equals(:actor_kind, :staff))
+      validate(attribute_equals(:target_kind, :knowledge_gap))
+      validate(attribute_in(:event, @gap_events))
+    end
+
     create :append_inhibit_trip do
       description("Record the attempt and its admitted quote for one inhibit occurrence.")
       transaction?(false)
@@ -725,6 +768,10 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   end
 
   policies do
+    policy action(:append_gap_review) do
+      authorize_if(Storage)
+    end
+
     policy action([:append_financial, :financial_closure, :append_inhibit_trip, :inhibit_trip]) do
       authorize_if(Storage)
     end
