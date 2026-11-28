@@ -5,6 +5,10 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
   worker invokes write callbacks.
   """
 
+  alias VoelgoedAi.Governance.EmergencyOverride
+  alias VoelgoedAi.Repo
+  alias VoelgoedAi.Support.{Configuration, OutboundDelivery}
+
   defmodule Destination do
     @moduledoc "Server-derived qualification for one Chatwoot conversation."
     @enforce_keys [:installation, :account, :inbox, :conversation]
@@ -130,16 +134,38 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
   end
 
   @doc false
-  def call(operation, destination, args, deadline) do
+  def write(operation, destination, args, deadline, %OutboundDelivery{} = claim)
+      when operation in [:reply, :open_for_handoff] do
+    with false <- Repo.in_transaction?(),
+         %{adapter: {module, context}} <- configured_adapter(),
+         false <- EmergencyOverride.asserted?(),
+         true <- Configuration.write_claim_current?(claim, now()),
+         false <- EmergencyOverride.asserted?() do
+      budget = min(500, DateTime.diff(deadline, now(), :millisecond))
+
+      if budget > 0,
+        do: apply(module, operation, [context, destination] ++ args ++ [budget]),
+        else: {:error, {:not_issued, :deadline}}
+    else
+      _ -> {:error, {:not_issued, :disabled}}
+    end
+  end
+
+  @doc false
+  def call(operation, destination, args, deadline)
+      when operation in [:conversation, :history, :decision_history] do
     budget = min(500, DateTime.diff(deadline, now(), :millisecond))
 
-    with true <- budget > 0 and not VoelgoedAi.Repo.in_transaction?(),
-         %{adapter: {module, context}} <- Enum.find(fixtures(), &match?(%{adapter: {_, _}}, &1)) do
+    with true <- budget > 0 and not Repo.in_transaction?(),
+         %{adapter: {module, context}} <- configured_adapter() do
       apply(module, operation, [context, destination] ++ args ++ [budget])
     else
       _ -> {:error, :unavailable}
     end
   end
+
+  defp configured_adapter,
+    do: Enum.find(fixtures(), &match?(%{adapter: {_, _}}, &1))
 
   @doc false
   def observe(session, deadline) do

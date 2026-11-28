@@ -2,9 +2,11 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Components do
   @moduledoc false
   use Phoenix.Component
 
-  def root(assigns), do: staff_root(assign(assigns, :gap_page, false))
+  def root(assigns), do: staff_root(assign(assigns, :staff_page, :knowledge))
 
-  def gap_root(assigns), do: staff_root(assign(assigns, :gap_page, true))
+  def gap_root(assigns), do: staff_root(assign(assigns, :staff_page, :gaps))
+
+  def operations_root(assigns), do: staff_root(assign(assigns, :staff_page, :operations))
 
   defp staff_root(assigns) do
     ~H"""
@@ -14,10 +16,11 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Components do
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="csrf-token" content={Plug.CSRFProtection.get_csrf_token()} />
-        <title>{if @gap_page, do: "Knowledge gaps | Voelgoed staff", else: "Knowledge · Voelgoed staff"}</title>
-        <meta :if={@gap_page} name="staff-live-path" content="/staff/gap-live" />
+        <title>{page_title(@staff_page)}</title>
+        <meta :if={@staff_page != :knowledge} name="staff-live-path" content={socket_path(@staff_page)} />
         <link rel="stylesheet" href="/staff/assets/knowledge.css" />
-        <link :if={@gap_page} rel="stylesheet" href="/staff/assets/gaps.css" />
+        <link :if={@staff_page == :gaps} rel="stylesheet" href="/staff/assets/gaps.css" />
+        <link :if={@staff_page == :operations} rel="stylesheet" href="/staff/assets/operations.css" />
         <script defer src="/staff/assets/phoenix/phoenix.min.js"></script>
         <script defer src="/staff/assets/live_view/phoenix_live_view.min.js"></script>
         <script defer src="/staff/assets/knowledge.js"></script>
@@ -26,8 +29,9 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Components do
         <a class="skip-link" href="#main">Skip to content</a>
         <header class="masthead">
           <nav aria-label="Staff">
-            <a :if={@gap_page} href="/staff/gaps">Voelgoed staff</a>
-            <a :if={!@gap_page} href="/staff/knowledge">Voelgoed Knowledge</a>
+            <a :if={@staff_page == :operations} href="/staff/operations">Voelgoed staff</a>
+            <a :if={@staff_page == :gaps} href="/staff/gaps">Voelgoed staff</a>
+            <a :if={@staff_page == :knowledge} href="/staff/knowledge">Voelgoed Knowledge</a>
           </nav>
         </header>
         <main id="main" tabindex="-1">{@inner_content}</main>
@@ -35,6 +39,13 @@ defmodule VoelgoedAiWeb.KnowledgeLive.Components do
     </html>
     """
   end
+
+  defp page_title(:knowledge), do: "Knowledge · Voelgoed staff"
+  defp page_title(:gaps), do: "Knowledge gaps | Voelgoed staff"
+  defp page_title(:operations), do: "Support operations | Voelgoed staff"
+
+  defp socket_path(:gaps), do: "/staff/gap-live"
+  defp socket_path(:operations), do: "/staff/operations-live"
 
   attr(:title, :string, required: true)
   attr(:back, :string, default: nil)

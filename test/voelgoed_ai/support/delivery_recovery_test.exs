@@ -2,12 +2,15 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
   use ExUnit.Case, async: false
 
   alias Ecto.Adapters.SQL
-  alias VoelgoedAi.{Repo, Support, SupportDBCase}
+  alias VoelgoedAi.{Repo, Support, SupportDBCase, SupportFixtures}
   alias VoelgoedAi.Governance.AuditEvent
+  alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
 
   alias VoelgoedAi.Support.{
     ActionScope,
+    ChatwootAdapter,
     Delivery,
+    InboxBinding,
     Ingress,
     OutboundDelivery,
     Recovery,
@@ -196,49 +199,105 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
              )
   end
 
-  test "a binding auth failure inhibits writes until a successful read-only probe", ctx do
+  test "an old delivery result cannot inhibit a revalidated binding", ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :forbidden)
+    parent = self()
+    Agent.update(ctx.fake, &Map.put(&1, :write_barrier, parent))
+
+    task = Task.async(fn -> Delivery.deliver(id) end)
+    assert_receive {:chatwoot_write, worker}, 1_000
+
+    for action <- [:disable, :enable] do
+      assert {:ok, _} =
+               VoelgoedAi.SupportFixtures.invoke(
+                 VoelgoedAi.Support.InboxBinding,
+                 action,
+                 %{id: ctx.binding_id},
+                 ctx.admin
+               )
+    end
+
+    send(worker, :resume_chatwoot_write)
+    assert :ok = Task.await(task)
+    assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+
+    assert %{rows: [[false]]} =
+             SQL.query!(
+               Repo,
+               "SELECT EXISTS (SELECT FROM support_binding_circuits WHERE binding_id = $1 AND permanent_epoch IS NOT NULL)",
+               [Ecto.UUID.dump!(ctx.binding_id)]
+             )
+
+    assert [_] = SupportDBCase.writes(ctx)
+  end
+
+  test "an auth failure requires revalidated configuration and one explicit admin probe", ctx do
     id = SupportDBCase.prepare_reply(ctx)
     SupportDBCase.write_mode(ctx, :forbidden)
     assert :ok = Delivery.deliver(id)
     assert %{rows: [["unknown", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
 
+    SupportDBCase.advance_clock(ctx, 61)
     another = SupportDBCase.next_conversation(ctx, 1)
     another_id = SupportDBCase.prepare_reply(another)
+    session = SupportDBCase.session_id(another)
     SupportDBCase.write_mode(ctx, :accepted)
-    assert :ok = Delivery.deliver(another_id)
-
-    assert %{rows: [["cancelled", 0]]} =
-             SupportDBCase.delivery_rows(another, "state, attempt_count")
-
-    assert [_] = SupportDBCase.writes(ctx)
-
-    SupportDBCase.advance_clock(ctx, 61)
-    probe = SupportDBCase.next_conversation(ctx, 2)
-    probe_id = SupportDBCase.prepare_reply(probe)
-    competing = SupportDBCase.next_conversation(ctx, 3)
-    competing_id = SupportDBCase.prepare_reply(competing)
-    SupportDBCase.next_conversation(ctx, 2)
-
-    SupportDBCase.block_next_conversation(ctx, self())
-    task = Task.async(fn -> Delivery.deliver(probe_id) end)
-    assert_receive {:chatwoot_read, worker}, 1_000
-
     reads = read_count(ctx)
-    assert :ok = Delivery.deliver(competing_id)
+
+    assert :ok = Delivery.deliver(another_id)
     assert read_count(ctx) == reads
 
-    assert %{rows: [["cancelled", 0]]} =
-             SupportDBCase.delivery_rows(competing, "state, attempt_count")
+    assert {:error, :unavailable} =
+             VoelgoedAi.Support.Configuration.recover_circuit(ctx.admin, session)
 
-    send(worker, :resume_chatwoot_read)
-    assert :ok = Task.await(task)
-
-    assert %{rows: [["cancelled", 0]]} =
-             SupportDBCase.delivery_rows(probe, "state, attempt_count")
+    assert {:error, :denied} =
+             VoelgoedAi.Support.Configuration.recover_circuit(ctx.operator, session)
 
     assert [_] = SupportDBCase.writes(ctx)
 
-    fresh = SupportDBCase.next_conversation(ctx, 4)
+    for action <- [:disable, :enable] do
+      assert {:ok, _} =
+               VoelgoedAi.SupportFixtures.invoke(
+                 VoelgoedAi.Support.InboxBinding,
+                 action,
+                 %{id: ctx.binding_id},
+                 ctx.admin
+               )
+    end
+
+    SupportDBCase.block_next_conversation(ctx, self())
+
+    task =
+      Task.async(fn -> VoelgoedAi.Support.Configuration.recover_circuit(ctx.admin, session) end)
+
+    assert_receive {:chatwoot_read, worker}, 1_000
+
+    assert {:error, :unavailable} =
+             VoelgoedAi.Support.Configuration.recover_circuit(ctx.admin, session)
+
+    send(worker, :resume_chatwoot_read)
+    assert {:ok, :closed} = Task.await(task)
+    assert [_] = SupportDBCase.writes(ctx)
+
+    assert :ok = Recovery.sweep()
+
+    assert %{rows: [[1]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT count(*) FROM support_alert_episodes WHERE binding_id = $1 AND kind = 'circuit_open'
+               """,
+               [Ecto.UUID.dump!(ctx.binding_id)]
+             )
+
+    assert [[_, _, "recover_circuit", _]] =
+             Enum.filter(
+               SupportDBCase.audit_rows(:binding_target_id, ctx.binding_id),
+               &(Enum.at(&1, 2) == "recover_circuit")
+             )
+
+    fresh = SupportDBCase.next_conversation(ctx, 2)
     fresh_id = SupportDBCase.prepare_reply(fresh)
     assert :ok = Delivery.deliver(fresh_id)
     assert %{rows: [["sent", 1]]} = SupportDBCase.delivery_rows(fresh, "state, attempt_count")
@@ -509,6 +568,27 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
 
       assert [_] = SupportDBCase.writes(ctx)
     end
+  end
+
+  test "a current operator can confirm qualified read-back under disable without another write",
+       ctx do
+    id = SupportDBCase.prepare_reply(ctx)
+    SupportDBCase.write_mode(ctx, :commit_then_timeout)
+    assert :ok = Delivery.deliver(id)
+    SupportDBCase.disable_automation(ctx)
+
+    assert {:error, :unavailable} = Support.request_readback(ctx.admin, id)
+    assert {:ok, %{state: :sent}} = Support.request_readback(ctx.operator, id)
+    assert {:error, :unavailable} = Support.request_readback(ctx.operator, id)
+    assert :ok = Recovery.reconcile(id)
+    assert :ok = Delivery.deliver(id)
+    assert [_] = SupportDBCase.writes(ctx)
+
+    assert [[_, _, "request_readback", "local_operator"]] =
+             Enum.filter(
+               SupportDBCase.audit_rows(:delivery_target_id, id),
+               &(Enum.at(&1, 2) == "request_readback")
+             )
   end
 
   test "abandonment wins over an in-flight successful read-back", ctx do
@@ -1144,6 +1224,139 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     send(worker, :resume_delivery_authorization)
     assert :ok = Task.await(task)
     assert [] = SupportDBCase.writes(ctx)
+  end
+
+  for revocation <- [
+        :local_handoff,
+        :signed_takeover,
+        :binding_disable,
+        :binding_rebind,
+        :assistant_disable
+      ] do
+    test "#{revocation} committed at before_wire prevents the public reply", ctx do
+      id = SupportDBCase.prepare_reply(ctx)
+      owner = self()
+
+      fixture =
+        Map.put(ChatwootAdapter.fixture(), :before_wire, fn ->
+          send(owner, {:before_wire, self()})
+
+          receive do
+            :continue -> :ok
+          after
+            4_000 -> :timeout
+          end
+        end)
+
+      Application.put_env(:voelgoed_ai, :support_fixture, fixture)
+      task = Task.async(fn -> Delivery.deliver(id) end)
+      assert_receive {:before_wire, worker}, 2_000
+
+      try do
+        assert [["sending", %NaiveDateTime{}, 1]] =
+                 dispatch_row(id, "state, dispatch_authorized_at, attempt_count")
+
+        assert %{rows: [[epoch]]} =
+                 SQL.query!(
+                   Repo,
+                   "SELECT security_epoch FROM automation_controls WHERE singleton"
+                 )
+
+        expected = revoke_before_wire(ctx, unquote(revocation))
+
+        assert %{rows: [["enabled", ^epoch]]} =
+                 SQL.query!(
+                   Repo,
+                   "SELECT status, security_epoch FROM automation_controls WHERE singleton"
+                 )
+
+        send(worker, :continue)
+        assert :ok = Task.await(task)
+        assert [] = SupportDBCase.writes(ctx)
+        assert [[^expected, 1]] = dispatch_row(id, "state, attempt_count")
+
+        assert :ok = Delivery.deliver(id)
+        assert [] = SupportDBCase.writes(ctx)
+      after
+        Task.shutdown(task, :brutal_kill)
+      end
+    end
+  end
+
+  defp revoke_before_wire(ctx, :local_handoff) do
+    assert {:ok, %{state: :handoff_pending}} =
+             Support.route_locally(ctx.operator, SupportDBCase.session_id(ctx))
+
+    "unknown"
+  end
+
+  defp revoke_before_wire(ctx, :signed_takeover) do
+    assert signed_takeover(ctx) == 204
+    assert %{rows: [["human_active", true]]} = session_state(ctx, "state, human_inhibit")
+    "unknown"
+  end
+
+  defp revoke_before_wire(ctx, :binding_disable) do
+    assert {:ok, %{status: :disabled}} =
+             SupportFixtures.invoke(InboxBinding, :disable, %{id: ctx.binding_id}, ctx.admin)
+
+    "cancelled"
+  end
+
+  defp revoke_before_wire(ctx, :binding_rebind) do
+    revoke_before_wire(ctx, :binding_disable)
+    original = ChatwootAdapter.fixture()
+    replacement = SupportFixtures.create(ctx.admin, ctx.assistant.slug <> "-other")
+    :ok = configure_replacement(ctx, original, replacement)
+
+    # Keep the adapter and paused worker's original fixture available so the
+    # test proves the persisted rebind is what stops the write.
+    Application.put_env(:voelgoed_ai, :support_fixture, original)
+    "cancelled"
+  end
+
+  defp revoke_before_wire(ctx, :assistant_disable) do
+    assert {:ok, %{status: :disabled}} =
+             SupportFixtures.invoke(Assistant, :disable, %{id: ctx.assistant.id}, ctx.admin)
+
+    "cancelled"
+  end
+
+  defp configure_replacement(ctx, original, replacement) do
+    SupportFixtures.allow_fixture(replacement, Map.delete(original, :assistant_id))
+    revision = SupportFixtures.draft(ctx.admin, replacement)
+
+    assert {:ok, _} =
+             SupportFixtures.invoke(
+               AssistantRevision,
+               :publish,
+               %{id: revision.id, expected_active_revision_id: nil},
+               ctx.admin
+             )
+
+    assert {:ok, _} =
+             SupportFixtures.invoke(Assistant, :activate, %{id: replacement.id}, ctx.admin)
+
+    assert {:ok, %{assistant_id: assistant_id}} =
+             SupportFixtures.invoke(
+               InboxBinding,
+               :rebind,
+               %{id: ctx.binding_id, assistant_id: replacement.id},
+               ctx.admin
+             )
+
+    assert assistant_id == replacement.id
+
+    assert {:ok, %{status: :enabled}} =
+             SupportFixtures.invoke(InboxBinding, :enable, %{id: ctx.binding_id}, ctx.admin)
+
+    :ok
+  end
+
+  defp dispatch_row(id, columns) do
+    SQL.query!(Repo, "SELECT #{columns} FROM outbound_deliveries WHERE id = $1", [
+      Ecto.UUID.dump!(id)
+    ]).rows
   end
 
   for phase <- [:pending, :claimed, :authorized] do

@@ -307,6 +307,14 @@ defmodule VoelgoedAi.Support.RunProcessing do
   end
 
   defp admit(config, session, input, now) do
+    if VoelgoedAi.Governance.EmergencyOverride.blocked?(config.control) do
+      disposition(input.event, session, :triage, :disabled, now)
+    else
+      admit_enabled(config, session, input, now)
+    end
+  end
+
+  defp admit_enabled(config, session, input, now) do
     %{event: event, batch: batch, delivery: delivery, deadline: deadline, position: position} =
       input
 
@@ -901,6 +909,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
 
+    alias VoelgoedAi.Accounts.StaffAccess
     alias VoelgoedAi.Knowledge.{GapReview, Retrieval}
     alias VoelgoedAi.Knowledge.Retrieval.Reference
     alias VoelgoedAi.Support.{DecisionTemplates, EvidenceReply, SupportDecision}
@@ -934,6 +943,62 @@ defmodule VoelgoedAi.Support.RunProcessing do
         end)
       end
     end
+
+    @doc "Project a current, qualified assisted draft for a support operator."
+    def review_draft(staff, id) do
+      with {:ok, {session, receipts, deadline, digest}} <-
+             staff_draft(staff, id, fn _, session, run, receipts ->
+               {:ok, {session, receipts, run.deadline_at, run.context_digest}}
+             end),
+           {:ok, %{commitment: commitment}} <- read_evidence_context(session, receipts, deadline),
+           true <- Base.encode16(commitment, case: :lower) == digest,
+           {:ok, observation} <- ChatwootAdapter.observe(session, deadline) do
+        staff_draft(staff, id, fn config, current, run, current_receipts ->
+          with true <- receipts == current_receipts and digest == run.context_digest,
+               true <- Ownership.eligible_bot?(config, current, observation),
+               {:ok, refs} <- Retrieval.at_review(&evidence_owner/0, config, run),
+               {:ok, text} <- EvidenceReply.render(run.typed_decision, refs) do
+            {:ok,
+             %{
+               id: run.id,
+               text: text,
+               locale: run.typed_decision.locale,
+               evidence: Enum.map(refs, & &1.revision_id),
+               expires_at: run.deadline_at
+             }}
+          end
+        end)
+        |> draft_result()
+      else
+        _ -> {:error, :unavailable}
+      end
+    end
+
+    defp staff_draft(staff, id, operation) do
+      StaffAccess.with_current(staff, :support_operator, fn _ ->
+        with_run(id, fn config, session, run, now ->
+          with true <- run.assisted_draft and run.state == :completed and run.decision == :no_send,
+               true <- run.retention_state not in [:held, :purged],
+               true <- config.binding.operating_mode == :assisted,
+               true <- Ownership.shadow_evaluation_enabled?(config),
+               true <- session.state == :bot_active and not session.human_inhibit,
+               true <- Ownership.current?(config, session, run),
+               true <- DateTime.before?(now, run.deadline_at),
+               {:ok, false} <- Ownership.pending_input?(session),
+               {:ok, receipts} <- covered_receipts(session, run) do
+            case operation.(config, session, run, receipts) do
+              {:ok, _} = result -> result
+              _ -> {:error, :unavailable}
+            end
+          else
+            _ -> {:error, :unavailable}
+          end
+        end)
+      end)
+    end
+
+    defp draft_result({:ok, %{text: _} = draft}), do: {:ok, draft}
+    defp draft_result(_), do: {:error, :unavailable}
 
     defp read_evidence_context(session, receipts, deadline) do
       ChatwootAdapter.decision_context(session, Enum.map(receipts, &elem(&1, 1)), deadline)
@@ -981,6 +1046,7 @@ defmodule VoelgoedAi.Support.RunProcessing do
                    typed_decision: decision,
                    evidence_refs: Enum.map(items, &Reference.from_evidence/1),
                    context_digest: Base.encode16(commitment, case: :lower),
+                   assisted_draft: shadow? and config.binding.operating_mode == :assisted,
                    shadow_disposition: if(shadow?, do: :no_send),
                    finished_at: finished_at
                  }) do
@@ -1207,6 +1273,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
       end
     end
   else
+    def review_draft(_, _), do: {:error, :unavailable}
+
     defp complete_current(config, session, run, now, {:fixed, observation, history}),
       do: decide(config, session, run, now, observation, history)
   end
@@ -1324,7 +1392,8 @@ defmodule VoelgoedAi.Support.RunProcessing do
 
   @doc false
   def valid_run?(config, session, run) do
-    session.state == :bot_active and not session.human_inhibit and
+    not VoelgoedAi.Governance.EmergencyOverride.blocked?(config.control) and
+      session.state == :bot_active and not session.human_inhibit and
       Ownership.permitted?(config) and Ownership.current?(config, session, run) and
       config.assistant.active_revision_id == run.assistant_revision_id
   end

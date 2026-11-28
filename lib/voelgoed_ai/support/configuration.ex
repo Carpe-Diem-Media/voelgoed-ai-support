@@ -12,11 +12,11 @@ defmodule VoelgoedAi.Support.Configuration do
 
   alias VoelgoedAi.Accounts.StaffAccess
   alias VoelgoedAi.Accounts.StaffAccess.Session
-  alias VoelgoedAi.Governance.{AuditEvent, AutomationControl}
+  alias VoelgoedAi.Governance.{AuditEvent, AutomationControl, EmergencyOverride}
   alias VoelgoedAi.Intelligence.{Assistant, AssistantKnowledgeGrant, AssistantRevision}
   alias VoelgoedAi.Knowledge.KnowledgeCollection
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ActionScope, InboxBinding}
+  alias VoelgoedAi.Support.{ActionScope, InboxBinding, OutboundDelivery, Readiness}
   alias VoelgoedAi.Support.ActionScope.Storage
 
   @revision_fields [:workflow_version, :template_version, :locale, :response_policy]
@@ -25,12 +25,49 @@ defmodule VoelgoedAi.Support.Configuration do
   @grant_actions [:grant_collection, :remove_collection]
   @routing_fields [:credential_ref, :handoff_team_id]
 
+  @doc "Run one bounded, qualified TEST circuit read under current admin authority."
+  def recover_circuit(staff, session_id) do
+    alias VoelgoedAi.Support.{BindingCircuit, ChatwootAdapter, Ownership}
+
+    with {:ok, {session, snapshot, generation, deadline}} <-
+           StaffAccess.with_current(staff, :admin, fn admin ->
+             Ownership.locked_session(session_id, fn config, session, now ->
+               with :ok <- eligible_binding(config.binding),
+                    {:probe, generation} <- BindingCircuit.reserve_for_admin(config.binding, now),
+                    {:ok, _} <- audit(config.binding, config.binding, :recover_circuit, admin.id) do
+                 {:ok,
+                  {session, Ownership.epoch_snapshot(config, session), generation,
+                   DateTime.add(now, 2)}}
+               else
+                 _ -> {:error, :unavailable}
+               end
+             end)
+           end) do
+      result = ChatwootAdapter.observe(session, deadline)
+
+      StaffAccess.with_current(staff, :admin, fn _ ->
+        Ownership.locked_session(session_id, fn config, current, now ->
+          if Ownership.current?(config, current, snapshot) do
+            :ok = BindingCircuit.finish_probe(config.binding, generation, now, result)
+            {:ok, BindingCircuit.label(config.binding)}
+          else
+            {:error, :stale}
+          end
+        end)
+      end)
+    end
+  end
+
   @impl true
   def run(input, _opts, %{actor: %Session{} = session}) do
-    StaffAccess.with_current(session, :admin, fn admin ->
-      execute(input.resource, input.action.name, input.arguments, admin.id)
-    end)
-    |> result()
+    result =
+      with :ok <- check_action_readiness(input) do
+        StaffAccess.with_current(session, :admin, fn admin ->
+          execute(input.resource, input.action.name, input.arguments, admin.id)
+        end)
+      end
+
+    result(result)
   end
 
   def run(input, _opts, %{actor: scope}) do
@@ -41,6 +78,16 @@ defmodule VoelgoedAi.Support.Configuration do
       {:error, "configuration access denied"}
     end
   end
+
+  # Readiness includes a storage probe. Do it before taking the locks
+  # shared with Disable and recheck the supervisor inside the transition.
+  defp check_action_readiness(%{
+         resource: AutomationControl,
+         action: %{name: :enable_automation}
+       }),
+       do: Readiness.check()
+
+  defp check_action_readiness(_), do: :ok
 
   defp execute(Assistant, :create, args, admin) do
     insert(Assistant, Map.put(args, :disabled_at, DateTime.utc_now()), :create, admin)
@@ -247,6 +294,70 @@ defmodule VoelgoedAi.Support.Configuration do
   @doc false
   def lock_control, do: get(AutomationControl, :global, :for_update)
 
+  @doc false
+  def write_claim_current?(
+        %OutboundDelivery{dispatch_authorized_at: %DateTime{} = authorized_at} = claim,
+        now
+      ) do
+    # One unlocked snapshot sees revocations committed before this read.
+    # A checkout failure denies this attempt without a second authorization read.
+    with {:ok, id} <- Ecto.UUID.dump(claim.id),
+         {:ok, %{rows: [[1]]}} <-
+           Ecto.Adapters.SQL.query(
+             Repo,
+             """
+             SELECT 1
+             FROM outbound_deliveries d
+             JOIN support_sessions s ON s.id = d.session_id
+             JOIN inbox_bindings b ON b.id = s.binding_id
+               AND b.installation_ref = s.installation_ref
+               AND b.external_account_id = s.external_account_id
+               AND b.external_inbox_id = s.external_inbox_id
+             JOIN assistants a ON a.id = b.assistant_id
+             CROSS JOIN automation_controls c
+             LEFT JOIN support_runs r ON r.id = d.run_id AND r.session_id = s.id
+             WHERE d.id = $1 AND d.state = 'sending'
+               AND d.claim_generation = $2 AND d.read_sequence = $3
+               AND d.dispatch_authorized_at = $4
+               AND d.lease_expires_at > $5 AND d.deadline_at > $5
+               AND c.singleton AND c.status = 'enabled' AND c.mode = 'fake'
+               AND NOT c.emergency_latched AND c.security_epoch = d.control_epoch
+               AND b.status = 'enabled' AND b.operating_mode = 'automatic'
+               AND b.security_epoch = d.binding_epoch
+               AND a.status = 'active' AND a.audience = 'public'
+               AND a.security_epoch = d.assistant_epoch AND s.ownership_epoch = d.ownership_epoch
+               AND (
+                 (d.purpose = 'handoff_status' AND s.state = 'handoff_pending')
+                 OR (
+                   d.purpose = 'public_reply' AND s.state = 'bot_active' AND NOT s.human_inhibit
+                   AND r.state = 'completed' AND r.assistant_revision_id = a.active_revision_id
+                   AND (r.ownership_epoch, r.assistant_epoch, r.binding_epoch, r.control_epoch) =
+                       (d.ownership_epoch, d.assistant_epoch, d.binding_epoch, d.control_epoch)
+                 )
+               )
+             """,
+             [
+               id,
+               claim.claim_generation,
+               claim.read_sequence,
+               DateTime.to_naive(authorized_at),
+               DateTime.to_naive(now)
+             ],
+             timeout: 250,
+             checkout_retries: 0,
+             log: false,
+             telemetry_event: nil
+           ) do
+      true
+    else
+      _ -> false
+    end
+  rescue
+    DBConnection.ConnectionError -> false
+  end
+
+  def write_claim_current?(_, _), do: false
+
   defp change_grant(:grant_collection, assistant, revision, collection, grants) do
     with :ok <- eligible_grant(assistant, collection) do
       cond do
@@ -284,10 +395,11 @@ defmodule VoelgoedAi.Support.Configuration do
 
   defp collection(id, lock), do: read(KnowledgeCollection, :storage_row, %{id: id}, lock)
 
-  defp grants(id) do
+  defp grants(id, timeout \\ nil) do
     storage(AssistantKnowledgeGrant, :for_revision, fn actor ->
       AssistantKnowledgeGrant
       |> Ash.Query.for_read(:for_revision, %{id: id}, actor: actor)
+      |> Ash.Query.timeout(timeout)
       |> Ash.read()
     end)
   end
@@ -370,20 +482,40 @@ defmodule VoelgoedAi.Support.Configuration do
   defp binding_transition(_, _, _), do: {:error, :invalid_transition}
 
   defp control_transition(_control, :disable_automation, _args),
-    do: {:ok, %{status: :disabled, mode: :disabled}}
+    do: {:ok, %{status: :disabled, mode: :disabled, emergency_latched: false}}
 
-  defp control_transition(%{status: :disabled}, :enable_automation, %{binding_id: id}) do
-    with {:ok, %{status: :enabled} = binding} <- lock_binding(id),
+  defp control_transition(%{status: :disabled} = control, :enable_automation, %{binding_id: id}) do
+    with false <- EmergencyOverride.blocked?(control),
+         {:ok, %{status: :enabled} = binding} <- lock_binding(id),
          :ok <- eligible_binding(binding),
-         {:ok, mode} <- control_mode(binding) do
+         {:ok, mode} <- control_mode(binding),
+         :ok <- enable_budget(control, mode),
+         :ok <- Readiness.check_job_supervisor() do
       {:ok, %{status: :enabled, mode: mode}}
     else
+      true -> {:error, :disabled}
       {:ok, _} -> {:error, :invalid_transition}
       error -> error
     end
   end
 
   defp control_transition(_, _, _), do: {:error, :invalid_transition}
+
+  defp enable_budget(_, :fake), do: :ok
+
+  if Mix.env() == :test do
+    defp enable_budget(control, :shadow_test) do
+      case fixture() do
+        # RunProcessing only enters the retrieval/inference path when this
+        # fixture section is present. Deterministic shadow is non-inference.
+        %{shadow_inference: %{} = settings} ->
+          VoelgoedAi.Governance.EmbeddingAccounting.check_enable_budget(control, settings)
+
+        _ ->
+          :ok
+      end
+    end
+  end
 
   if Mix.env() == :test do
     defp control_mode(%{operating_mode: :automatic}) do
@@ -392,7 +524,7 @@ defmodule VoelgoedAi.Support.Configuration do
         else: {:ok, :fake}
     end
 
-    defp control_mode(%{operating_mode: :shadow} = binding) do
+    defp control_mode(%{operating_mode: mode} = binding) when mode in [:shadow, :assisted] do
       with true <- VoelgoedAi.Support.Ownership.shadow_fixture?(binding),
            {:ok, assistant} <- get(Assistant, binding.assistant_id),
            {:ok, %{response_policy: :shadow_decision}} <- current_revision(assistant) do
@@ -449,17 +581,21 @@ defmodule VoelgoedAi.Support.Configuration do
   end
 
   @doc false
-  def current_revision(%Assistant{active_revision_id: id}) when is_binary(id) do
-    with {:ok, %{status: :published} = revision} <- get(AssistantRevision, id),
-         {:ok, hash} <- published_hash(revision),
+  def current_revision(%Assistant{active_revision_id: id}) when is_binary(id),
+    do: qualified_revision(id)
+
+  def current_revision(_), do: {:error, :stale_policy}
+
+  @doc false
+  def qualified_revision(id, timeout \\ nil) do
+    with {:ok, %{status: :published} = revision} <- get(AssistantRevision, id, nil, timeout),
+         {:ok, hash} <- published_hash(revision, timeout),
          true <- hash == revision.config_hash do
       {:ok, revision}
     else
       _ -> {:error, :stale_policy}
     end
   end
-
-  def current_revision(_), do: {:error, :stale_policy}
 
   @doc false
   def render_fixed_reply(assistant, run, delivery) do
@@ -522,10 +658,12 @@ defmodule VoelgoedAi.Support.Configuration do
     end)
   end
 
-  defp published_hash(%{config_hash_version: 1} = revision), do: fixture_hash(revision, [])
+  defp published_hash(revision, timeout \\ nil)
 
-  defp published_hash(%{config_hash_version: 2} = revision) do
-    with {:ok, grants} <- grants(revision.id),
+  defp published_hash(%{config_hash_version: 1} = revision, _), do: fixture_hash(revision, [])
+
+  defp published_hash(%{config_hash_version: 2} = revision, timeout) do
+    with {:ok, grants} <- grants(revision.id, timeout),
          true <- length(grants) <= @grant_limit do
       fixture_hash(revision, Enum.map(grants, & &1.collection_id))
     else
@@ -688,20 +826,20 @@ defmodule VoelgoedAi.Support.Configuration do
   defp project({:ok, row}), do: {:ok, projection(row)}
   defp project(error), do: error
 
-  defp get(resource, id, lock \\ nil) do
+  defp get(resource, id, lock \\ nil, timeout \\ nil) do
     args = if id == :global, do: %{}, else: %{id: id}
 
-    case read(resource, :configuration_row, args, lock) do
+    case read(resource, :configuration_row, args, lock, timeout) do
       {:ok, nil} -> {:error, :not_found}
       result -> result
     end
   end
 
-  defp read(resource, action, args, lock \\ nil) do
+  defp read(resource, action, args, lock \\ nil, timeout \\ nil) do
     storage(resource, action, fn actor ->
       query = Ash.Query.for_read(resource, action, args, actor: actor)
       query = if lock, do: Ash.Query.lock(query, lock), else: query
-      Ash.read_one(query)
+      query |> Ash.Query.timeout(timeout) |> Ash.read_one()
     end)
   end
 

@@ -65,11 +65,20 @@ reset_input =
 nil = ChatwootAdapter.fixture()
 false = ChatwootAdapter.in_scope?(%{})
 
-{:error, :unavailable} =
-  ChatwootAdapter.call(:reply, nil, [], DateTime.add(DateTime.utc_now(), 1))
+for operation <- [:reply, :open_for_handoff] do
+  {:error, {:not_issued, :disabled}} =
+    ChatwootAdapter.write(
+      operation,
+      nil,
+      [],
+      DateTime.add(DateTime.utc_now(), 1),
+      %VoelgoedAi.Support.OutboundDelivery{control_epoch: 0}
+    )
+end
 
 {:error, :scope_denied} = Ingress.accept(%{})
 :ok = Recovery.sweep()
+{:error, :unavailable} = RunProcessing.review_draft(nil, Ash.UUIDv7.generate())
 {:error, :disabled} = Embedding.publication_deadline(%{})
 
 # Neither fabricated authority nor an invalid envelope can reach a wire adapter.

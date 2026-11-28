@@ -860,8 +860,9 @@ defmodule VoelgoedAi.Intelligence.GenerationTest do
                settlement
              ])
 
-    # Recent migrations can depend on the installed VGAS-20 audit shape.
-    # Rewind them only for the SQL-only predecessor phase of this proof.
+    # Stop automation before rewinding operational safety migrations for
+    # the SQL-only predecessor phase. Preserve the financial hold and proof.
+    SupportDBCase.disable_automation(ctx.support)
     newer = Ecto.Migrator.run(Repo, :down, to_exclusive: @finance_version)
 
     on_exit(fn ->

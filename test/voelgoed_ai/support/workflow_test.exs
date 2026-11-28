@@ -1139,4 +1139,63 @@ defmodule VoelgoedAi.Support.WorkflowTest do
 
     assert [{:handoff, _, _}] = SupportDBCase.writes(ctx)
   end
+
+  test "an overdue queue episode deduplicates scans and re-arms after the backlog clears", ctx do
+    assert {:ok, receipt} = Ingress.accept(ctx.event)
+    SupportDBCase.advance_clock(ctx, 46)
+    assert :ok = Recovery.sweep()
+    assert :ok = Recovery.sweep()
+
+    assert %{rows: [[1, 1]]} = queue_alerts(ctx)
+
+    assert :ok = RunProcessing.process_event(receipt)
+    assert :ok = Recovery.sweep()
+    assert %{rows: [[1, 0]]} = queue_alerts(ctx)
+
+    next = SupportDBCase.next_conversation(ctx, 1)
+    assert {:ok, _} = Ingress.accept(next.event)
+    SupportDBCase.advance_clock(ctx, 46)
+    assert :ok = Recovery.sweep()
+    assert %{rows: [[2, 1]]} = queue_alerts(ctx)
+    assert [] = SupportDBCase.writes(ctx)
+  end
+
+  defp queue_alerts(ctx) do
+    SQL.query!(
+      Repo,
+      """
+      SELECT count(*), count(*) FILTER (WHERE closed_at IS NULL)
+      FROM support_alert_episodes WHERE binding_id = $1 AND kind = 'queue_overdue'
+      """,
+      [Ecto.UUID.dump!(ctx.binding_id)]
+    )
+  end
+
+  test "an operator can route under disable with a terminal intent that cannot replay", ctx do
+    assert {:ok, event_id} = Ingress.accept(ctx.event)
+    assert :ok = RunProcessing.process_event(event_id)
+    session_id = SupportDBCase.session_id(ctx)
+    SupportDBCase.disable_automation(ctx)
+
+    assert {:ok, %{state: :handoff_pending}} = Support.request_handoff(ctx.operator, session_id)
+    assert {:error, :invalid_transition} = Support.request_handoff(ctx.operator, session_id)
+
+    assert %{rows: [[delivery_id, "cancelled", 0]]} =
+             SupportDBCase.delivery_rows(ctx, "id::text, state, attempt_count")
+
+    SupportDBCase.enable_automation(ctx)
+    assert :ok = Delivery.deliver(delivery_id)
+    assert :ok = Recovery.reconcile(delivery_id)
+    assert [] = SupportDBCase.writes(ctx)
+
+    assert %{rows: [[1]]} =
+             SQL.query!(
+               Repo,
+               """
+               SELECT count(*) FROM audit_events
+               WHERE session_target_id = $1 AND event = 'request_handoff'
+               """,
+               [Ecto.UUID.dump!(session_id)]
+             )
+  end
 end

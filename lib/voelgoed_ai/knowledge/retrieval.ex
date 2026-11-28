@@ -19,7 +19,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
   alias VoelgoedAi.Knowledge.Content
   alias VoelgoedAi.Knowledge.Retrieval.Reference
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, Delivery}
+  alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, Delivery, RunProcessing}
 
   # All entry points use this CTE. Control is locked before it runs, and
   # editorial and grant changes take the same lock before writing.
@@ -60,7 +60,7 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
     alias VoelgoedAi.Intelligence.Embedding
     alias VoelgoedAi.Knowledge.{ArticleRevision, GapEvidence}
     alias VoelgoedAi.Knowledge.Retrieval.Scope
-    alias VoelgoedAi.Support.{Ownership, RunProcessing}
+    alias VoelgoedAi.Support.Ownership
 
     @scope_keys [:brand, :product, :event, :service]
     @authority_key {__MODULE__, :authority}
@@ -712,8 +712,24 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
   @doc false
   def at_dispatch(owner, config, %{state: :completed, claim_generation: claim} = run)
       when claim > 0 do
-    with true <- stage_owner?(owner, Delivery),
-         refs when is_list(refs) and length(refs) in 1..4 <- run.evidence_refs,
+    if stage_owner?(owner, Delivery),
+      do: completed_evidence(config, run),
+      else: {:error, :stale_evidence}
+  end
+
+  def at_dispatch(_, _, _), do: {:error, :stale_evidence}
+
+  @doc false
+  def at_review(owner, config, %{state: :completed, assisted_draft: true} = run) do
+    if stage_owner?(owner, RunProcessing),
+      do: completed_evidence(config, run),
+      else: {:error, :stale_evidence}
+  end
+
+  def at_review(_, _, _), do: {:error, :stale_evidence}
+
+  defp completed_evidence(config, run) do
+    with refs when is_list(refs) and length(refs) in 1..4 <- run.evidence_refs,
          {:ok, revision} <- Configuration.current_revision(config.assistant),
          true <- revision.id == run.assistant_revision_id,
          {:ok, current} <- reproject(config, run, revision, refs, ChatwootAdapter.now()),
@@ -724,8 +740,6 @@ defmodule VoelgoedAi.Knowledge.Retrieval do
       _ -> {:error, :stale_evidence}
     end
   end
-
-  def at_dispatch(_, _, _), do: {:error, :stale_evidence}
 
   defp stage_owner?(owner, module) when is_function(owner, 0) do
     info = Function.info(owner)

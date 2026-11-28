@@ -30,6 +30,7 @@ defmodule VoelgoedAi.ShadowWorkflowFixture do
       SupportDBCase.setup(
         staff: {staff, staff.admin, nil},
         shadow: locale,
+        assisted: Keyword.get(opts, :assisted, false),
         enable: Keyword.get(opts, :enable, true),
         before_publish: fn admin, revision ->
           assert {:ok, _} =

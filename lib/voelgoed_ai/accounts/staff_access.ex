@@ -8,6 +8,13 @@ defmodule VoelgoedAi.Accounts.StaffAccess do
     @moduledoc false
     @enforce_keys [:id, :generation, :expiry, :binding]
     defstruct @enforce_keys
+
+    @type t :: %__MODULE__{
+            id: String.t(),
+            generation: non_neg_integer(),
+            expiry: integer(),
+            binding: binary()
+          }
   end
 
   defmodule Scope do
@@ -124,11 +131,29 @@ defmodule VoelgoedAi.Accounts.StaffAccess do
       staff.identity_issuer == issuer and staff.tenant_id == tenant and
         staff.identity_client_id == client
 
-  def locked_staff(id) do
-    StaffUser
-    |> Ash.Query.for_read(:resolve_staff, %{id: id},
+  @doc "Read current grants for a dashboard projection without locking the staff row."
+  @spec current_roles(Session.t() | nil) :: {:ok, [atom()]} | {:error, :denied}
+  def current_roles(%Session{id: id} = session) when is_binary(id) do
+    with {:ok, %StaffUser{} = staff} <-
+           id |> resolve_staff_query() |> Ash.Query.timeout(750) |> Ash.read_one(),
+         true <- allowed?(staff, session, nil) do
+      {:ok, staff.roles}
+    else
+      _ -> {:error, :denied}
+    end
+  end
+
+  def current_roles(_), do: {:error, :denied}
+
+  defp resolve_staff_query(id) do
+    Ash.Query.for_read(StaffUser, :resolve_staff, %{id: id},
       actor: %Scope{action: :resolve_staff, target: id}
     )
+  end
+
+  def locked_staff(id) do
+    id
+    |> resolve_staff_query()
     |> Ash.Query.lock(:for_update)
     |> Ash.read_one()
     |> case do

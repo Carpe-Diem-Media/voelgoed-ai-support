@@ -26,6 +26,7 @@ defmodule VoelgoedAiWeb.Router do
   end
 
   get("/health", VoelgoedAiWeb.HealthController, :show)
+  get("/ready", VoelgoedAiWeb.HealthController, :ready, log: false)
 
   scope "/staff", VoelgoedAiWeb do
     pipe_through(:staff_session)
@@ -50,6 +51,16 @@ defmodule VoelgoedAiWeb.Router do
         root_layout: {VoelgoedAiWeb.KnowledgeLive.Components, :gap_root} do
         live("/gaps", GapLive, :index)
       end
+    end
+  end
+
+  scope "/staff", VoelgoedAiWeb, log: false do
+    pipe_through([:staff_knowledge, :staff_session])
+
+    live_session :staff_operations,
+      root_layout: {VoelgoedAiWeb.KnowledgeLive.Components, :operations_root} do
+      live("/operations", OperationsLive, :index)
+      live("/operations/:id", OperationsLive, :detail)
     end
   end
 

@@ -1,10 +1,17 @@
 defmodule VoelgoedAiWeb.KnowledgeLive.CrashLog do
   @moduledoc false
 
-  alias VoelgoedAiWeb.{Endpoint, GapLive, GapLiveSocket, StaffLiveSocket}
+  alias VoelgoedAiWeb.{
+    Endpoint,
+    GapLive,
+    GapLiveSocket,
+    OperationsLive,
+    OperationsLiveSocket,
+    StaffLiveSocket
+  }
 
   @filter :vgas_staff_knowledge_crash_log
-  @staff_sockets [StaffLiveSocket, GapLiveSocket]
+  @staff_sockets [StaffLiveSocket, GapLiveSocket, OperationsLiveSocket]
   @staff_pools Enum.map(@staff_sockets, &Module.concat(Endpoint, &1))
   @view_prefix "Elixir.VoelgoedAiWeb.KnowledgeLive."
   @staff_http {__MODULE__, :staff_http}
@@ -117,7 +124,7 @@ defmodule VoelgoedAiWeb.KnowledgeLive.CrashLog do
       end
   end
 
-  defp staff_view?(GapLive), do: true
+  defp staff_view?(view) when view in [GapLive, OperationsLive], do: true
   defp staff_view?(view), do: String.starts_with?(Atom.to_string(view), @view_prefix)
 
   defp staff_pool?([pool | _]) when pool in @staff_pools, do: true

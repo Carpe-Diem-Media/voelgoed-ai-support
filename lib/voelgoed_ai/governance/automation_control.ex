@@ -59,6 +59,8 @@ defmodule VoelgoedAi.Governance.AutomationControl do
 
     attribute(:security_epoch, :integer, allow_nil?: false, default: 0, constraints: [min: 0])
 
+    attribute(:emergency_latched, :boolean, allow_nil?: false, default: false)
+
     attribute(:generation_inhibited, :boolean, allow_nil?: false, default: false)
     attribute(:embedding_inhibited, :boolean, allow_nil?: false, default: false)
     attribute(:generation_inhibit_occurrence, :uuid)
@@ -136,7 +138,7 @@ defmodule VoelgoedAi.Governance.AutomationControl do
     update :update_row do
       transaction?(false)
       require_atomic?(false)
-      accept([:status, :mode, :security_epoch])
+      accept([:status, :mode, :security_epoch, :emergency_latched])
     end
   end
 

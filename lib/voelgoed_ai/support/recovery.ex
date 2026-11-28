@@ -28,6 +28,27 @@ defmodule VoelgoedAi.Support.Recovery do
     end
   end
 
+  @doc false
+  def operator_readback(staff, id, audit) do
+    with {:ok, {:read, delivery, session}} <-
+           VoelgoedAi.Accounts.StaffAccess.with_current(staff, :support_operator, fn operator ->
+             Delivery.with_delivery(id, fn config, session, row, now ->
+               with {:ok, {:read, reserved, _}} <- reserve(config, session, row, now),
+                    {:ok, _} <- audit.(operator, row, reserved, :request_readback) do
+                 {:ok, {:read, reserved, session}}
+               end
+             end)
+           end) do
+      observed = read_back(session, delivery)
+
+      Delivery.with_delivery(id, fn config, session, current, now ->
+        settle(config, session, current, delivery, now, observed)
+      end)
+    else
+      _ -> {:error, :unavailable}
+    end
+  end
+
   defp reserve(_, session, %{state: :unknown} = row, now) do
     cond do
       not remaining?(row, now) or row.read_count >= 3 ->
@@ -215,15 +236,26 @@ defmodule VoelgoedAi.Support.Recovery do
     def sweep do
       now = ChatwootAdapter.now()
 
-      with %{} <- ChatwootAdapter.fixture(),
-           {:ok, %{events: events, runs: runs, deliveries: deliveries}} <-
-             Repo.transact(fn -> due(now) end) do
+      with %{} = fixture <- ChatwootAdapter.fixture(),
+           {:ok, {binding, %{events: events, runs: runs, deliveries: deliveries}}} <-
+             Repo.transact(fn ->
+               inbox =
+                 Map.take(fixture, [:installation_ref, :external_account_id, :external_inbox_id])
+
+               with {:ok, config} <- Configuration.lock_inbox(inbox),
+                    {:ok, work} <- due(now) do
+                 {:ok, {config.binding, work}}
+               end
+             end) do
         for event <- events, do: Ownership.enqueue(ProcessEvent, %{"event_id" => event.id})
         for run <- runs, do: run_deadline(run.id)
         for delivery <- deliveries, do: delivery_deadline(delivery.id)
-        sweep_idle(nil)
+        idle_result = sweep_idle(nil)
+        alert_result = VoelgoedAi.Support.OperationalAlert.project(binding, now)
+        if idle_result == :ok, do: alert_result, else: idle_result
       else
         nil -> :ok
+        {:error, :scope_denied} -> :ok
         error -> RunProcessing.job_result(error)
       end
     end

@@ -8,7 +8,12 @@ defmodule VoelgoedAi.Intelligence.EmbeddingTransport do
   @model "text-embedding-3-small"
 
   def invoke(ref, input, timeout, mode) do
-    if Embedding.authorize_transport(ref), do: request(input, timeout, mode), else: :unknown
+    if Embedding.authorize_transport(ref) and
+         not VoelgoedAi.Governance.EmergencyOverride.asserted?() do
+      request(input, timeout, mode)
+    else
+      :unknown
+    end
   end
 
   defp request(input, timeout, mode) do

@@ -318,7 +318,8 @@ defmodule VoelgoedAi.Intelligence.Embedding do
                   end
                 end),
               remaining when remaining > 0 <-
-                DateTime.diff(cutoff, VoelgoedAi.Support.ChatwootAdapter.now(), :millisecond) do
+                DateTime.diff(cutoff, VoelgoedAi.Support.ChatwootAdapter.now(), :millisecond),
+              false <- VoelgoedAi.Governance.EmergencyOverride.asserted?() do
            timeout = min(remaining, @timeout_ms)
 
            wire.(
@@ -568,9 +569,11 @@ defmodule VoelgoedAi.Intelligence.Embedding do
            end
          end)
 
-       case authorized do
-         {:ok, :authorized} -> wire.(request)
-         _ -> {request, %Req.TransportError{reason: :closed}}
+       if authorized == {:ok, :authorized} and
+            not VoelgoedAi.Governance.EmergencyOverride.asserted?() do
+         wire.(request)
+       else
+         {request, %Req.TransportError{reason: :closed}}
        end
      end}
   end
@@ -1086,6 +1089,15 @@ defmodule VoelgoedAi.Intelligence.Embedding do
     Enum.find_value(fixture_settings(), {:error, :disabled}, work)
   end
 
+  @doc false
+  def configured_caps do
+    with_fixture_settings(fn config -> Map.take(config, [:day_cap, :month_cap]) end)
+    |> case do
+      %{day_cap: _, month_cap: _} = caps -> caps
+      _ -> nil
+    end
+  end
+
   defp budget_authority(config) do
     EmbeddingAccounting.budget_quote(
       EmbeddingProfile.provider(),
@@ -1132,6 +1144,12 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       else
         {:error, :disabled}
       end
+    end
+
+    @doc false
+    def enable_budget do
+      with {:ok, budget} <- gate(),
+           do: {:ok, Map.take(budget, [:price, :day_cap, :month_cap])}
     end
 
     defp enqueue_finalisation(revision),

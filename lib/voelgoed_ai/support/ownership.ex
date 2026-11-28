@@ -6,6 +6,7 @@ defmodule VoelgoedAi.Support.Ownership do
 
   use VoelgoedAi.Support.WorkStore, [:read, :create, :update]
 
+  alias VoelgoedAi.Governance.EmergencyOverride
   alias VoelgoedAi.Repo
   alias VoelgoedAi.Support.{ChatwootAdapter, Configuration, InboundEvent, OutboundDelivery}
   alias VoelgoedAi.Support.{SupportRun, SupportSession}
@@ -21,7 +22,11 @@ defmodule VoelgoedAi.Support.Ownership do
          true <- ChatwootAdapter.in_scope?(candidate),
          {:ok, config} <- Configuration.lock_inbox(Map.take(candidate, @inbox)),
          {:ok, %SupportSession{} = session} <- get(SupportSession, id, lock: true) do
-      operation.(config, session, ChatwootAdapter.now())
+      if session.binding_id == config.binding.id do
+        operation.(config, session, ChatwootAdapter.now())
+      else
+        {:error, :scope_denied}
+      end
     else
       {:ok, nil} -> {:error, :scope_denied}
       false -> {:error, :scope_denied}
@@ -91,7 +96,8 @@ defmodule VoelgoedAi.Support.Ownership do
 
   @doc false
   def write_enabled?(config) do
-    permitted?(config) and config.binding.operating_mode == :automatic and
+    not EmergencyOverride.blocked?(config.control) and permitted?(config) and
+      config.binding.operating_mode == :automatic and
       config.control.status == :enabled and config.control.mode == :fake and
       ChatwootAdapter.write_fixture?()
   end
@@ -100,6 +106,7 @@ defmodule VoelgoedAi.Support.Ownership do
     @doc false
     def shadow_fixture?(binding) do
       ChatwootAdapter.in_scope?(binding) and
+        (binding.operating_mode != :assisted or ChatwootAdapter.fixture()[:assisted_draft] == true) and
         match?(
           %{
             shadow_evaluation: true,
@@ -118,7 +125,8 @@ defmodule VoelgoedAi.Support.Ownership do
 
   @doc false
   def shadow_evaluation_enabled?(config) do
-    permitted?(config) and config.binding.operating_mode == :shadow and
+    not EmergencyOverride.blocked?(config.control) and permitted?(config) and
+      config.binding.operating_mode in [:shadow, :assisted] and
       config.control.status == :enabled and config.control.mode == :shadow_test and
       shadow_fixture?(config.binding)
   end
@@ -284,11 +292,27 @@ defmodule VoelgoedAi.Support.Ownership do
     if write_enabled?(config) do
       stage_handoff(config, session, now, :explicit_handoff)
     else
-      {:error, :disabled}
+      request_local_locked(config, session, now)
     end
   end
 
   def request_locked(_, _, _), do: {:error, :invalid_transition}
+
+  @doc false
+  def request_local_locked(config, %{state: :bot_active} = session, now) do
+    with true <- ChatwootAdapter.in_scope?(config.binding),
+         :ok <- fence(session, now, :explicit_handoff),
+         {:ok, session} <- store_update(session, :request_handoff, next_epoch(session)),
+         {:ok, intent} <- create_intent(config, session, nil, :handoff_status, now),
+         {:ok, _} <- store_update(intent, :cancel, %{reason_code: :explicit_handoff}) do
+      {:ok, session}
+    else
+      false -> {:error, :scope_denied}
+      error -> error
+    end
+  end
+
+  def request_local_locked(_, _, _), do: {:error, :invalid_transition}
 
   @doc false
   def route_overdue_locked(
@@ -363,6 +387,16 @@ defmodule VoelgoedAi.Support.Ownership do
 
   @doc false
   def prepare(config, session, run, purpose, deadline) do
+    with {:ok, row} <- create_intent(config, session, run, purpose, deadline),
+         {:ok, _} <- enqueue(Deliver, %{"delivery_id" => row.id}),
+         {:ok, _} <- enqueue(Sweep, %{"delivery_id" => row.id}, scheduled_at: deadline) do
+      {:ok, row}
+    end
+  end
+
+  # A manual local route commits a cancelled intent without a delivery job.
+  # The durable state remains terminal even if a stale delivery job reappears.
+  defp create_intent(config, session, run, purpose, deadline) do
     {purpose, payload_digest} =
       case purpose do
         {:typed_reply, digest} -> {:public_reply, digest}
@@ -379,16 +413,8 @@ defmodule VoelgoedAi.Support.Ownership do
       deadline_at: deadline
     }
 
-    with {:ok, attrs} <- template(delivery, config, run),
-         {:ok, row} <-
-           store_create(
-             OutboundDelivery,
-             :prepare,
-             Map.merge(attrs, epoch_snapshot(config, session))
-           ),
-         {:ok, _} <- enqueue(Deliver, %{"delivery_id" => row.id}),
-         {:ok, _} <- enqueue(Sweep, %{"delivery_id" => row.id}, scheduled_at: deadline) do
-      {:ok, row}
+    with {:ok, attrs} <- template(delivery, config, run) do
+      store_create(OutboundDelivery, :prepare, Map.merge(attrs, epoch_snapshot(config, session)))
     end
   end
 

@@ -38,7 +38,8 @@ defmodule VoelgoedAi.Governance.AuditEvent do
     :enable_automation,
     :disable_automation,
     :grant_collection,
-    :remove_collection
+    :remove_collection,
+    :recover_circuit
   ]
   @target_kinds [:assistant, :assistant_revision, :inbox_binding, :automation_control]
   @knowledge_targets [:knowledge_collection, :knowledge_article, :knowledge_revision]
@@ -81,7 +82,13 @@ defmodule VoelgoedAi.Governance.AuditEvent do
   ]
   @gap_events [:gap_reviewed, :gap_deferred, :gap_dismissed, :gap_addressed]
   @gap_reasons [:duplicate_issue, :out_of_scope, :no_change_needed]
-  @support_events [:request_handoff, :return_to_bot, :close_session, :abandon_delivery]
+  @support_events [
+    :request_handoff,
+    :return_to_bot,
+    :close_session,
+    :abandon_delivery,
+    :request_readback
+  ]
   @retention_events [:hold_reply, :release_reply, :purge_reply]
   @retention_reasons [:fixture_hold, :fixture_release, :synthetic_cutoff]
   @system_events [:delivery_unknown, :missed_deadline, :handoff_failed, :local_handoff]
@@ -244,7 +251,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             OR (target_kind = 'assistant_revision' AND revision_target_id IS NOT NULL
               AND event IN ('create_draft','edit_draft','publish','supersede','discard','grant_collection','remove_collection'))
             OR (target_kind = 'inbox_binding' AND binding_target_id IS NOT NULL
-              AND event IN ('create_draft','enable','disable','rebind','change_mode','retire'))
+              AND event IN ('create_draft','enable','disable','rebind','change_mode','retire','recover_circuit'))
             OR (target_kind = 'automation_control' AND control_target_id IS NOT NULL
               AND event IN ('enable_automation','disable_automation','reset_embedding_inhibit','reset_generation_inhibit','trip_generation_inhibit','trip_embedding_inhibit'))
             OR (target_kind = 'usage_settlement' AND settlement_target_id IS NOT NULL
@@ -273,7 +280,7 @@ defmodule VoelgoedAi.Governance.AuditEvent do
             OR (target_kind = 'support_session' AND session_target_id IS NOT NULL
               AND event IN ('request_handoff','return_to_bot','close_session'))
             OR (target_kind = 'outbound_delivery' AND delivery_target_id IS NOT NULL
-              AND event IN ('abandon_delivery','delivery_unknown','handoff_failed','local_handoff'))
+              AND event IN ('abandon_delivery','request_readback','delivery_unknown','handoff_failed','local_handoff'))
             OR (target_kind = 'inbound_event' AND event_target_id IS NOT NULL AND event = 'missed_deadline')
             OR (target_kind = 'support_run' AND run_target_id IS NOT NULL AND event IN ('missed_deadline','hold_reply','release_reply','purge_reply'))
           )
