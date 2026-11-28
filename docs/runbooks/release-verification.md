@@ -44,6 +44,14 @@ bash .github/scripts/compare_release_payloads.sh vgas-release:first vgas-release
   qualifying compatible upstream pins and repeating both complete builds
   and the packaged model checks.
   [Model normalization](../../rel/build/normalize_model_schemas.sh)
+- The VGAS-29 approval permits the production build to sort the
+  `ReqLLM.Message.ReasoningDetails` schema fields and give the generated
+  Jason encoder that same field order. The Dockerfile verifies the helper's
+  SHA-256 before invoking it. The helper verifies the locked ReqLLM 1.31.0
+  source, stages the edited file beside it, and checks the output hash
+  before replacing the source. A rejection preserves the original bytes.
+  Local DEV and TEST use the original package.
+  [Reasoning normalization](../../rel/build/normalize_reasoning_details.sh)
 - Phoenix 1.8.17 and LiveView 1.2.15 provide their minified browser bundles via
   the locked Hex packages. The app ships the staff CSS and JS from
   `priv/static/staff/`. DEV pins the esbuild and Tailwind wrappers to versions
@@ -52,6 +60,39 @@ bash .github/scripts/compare_release_payloads.sh vgas-release:first vgas-release
 The comparison checks every file under `/app` by SHA-256 along with path, type,
 mode, numeric ownership and symlink target. It excludes timestamps and OCI
 metadata. Record the image IDs as well as the manifest hashes.
+
+## Reasoning normalization checks
+
+Compile the locked and normalized `message.ex` from the same scratch path
+in fresh Elixir VMs. Intern `encrypted?`, `provider`, and `provider_data` in
+forward and reverse order before loading the compile probe. Strip the two
+compiled BEAMs with `Mix.Release.strip_beam/1` and compare their hashes.
+Load those exact files to compare the defaults, schema fields, valid
+structures, decoded direct and nested JSON, and all errors for a fixture
+with seven invalid fields. The pinned baseline and the normalized output
+shared the canonical semantic digest
+`f43ace6bdc60fa0abaa5bf9e1fe93610e4bb13a0dd15d69e5ef2c2d332053982`.
+The upstream hashes changed with atom order. Both normalized hashes
+matched across the two VMs.
+
+Raw JSON object member order, reflection order, and validation traversal
+order change. Jason can report a different first error for multiply
+invalid input. These diagnostic differences apply to internal invalid
+input. The packaged VGAS checks still require bounded redacted failures
+with zero wire calls on denied requests.
+
+In a scratch dependency directory, alter each guarded input separately.
+Use `cmp` to compare its source before and after the rejected call.
+Check an altered package source against the pre-image verification, an
+altered helper against the Dockerfile checksum, and an altered transform
+against the post-image verification. Each check must reject and preserve
+the input. Run the two clean Docker builds and compare the complete
+manifests, including both reasoning BEAMs.
+
+To back out this normalization, revert its Dockerfile checksum and
+invocation and remove the helper. Rebuild from the existing pins. The
+upstream output ordering returns and the reproducibility gate must be
+reestablished before accepting that build.
 
 ## Start and migrate
 

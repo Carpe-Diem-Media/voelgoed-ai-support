@@ -158,6 +158,25 @@ warnings as errors. Its release probe verifies fresh and predecessor
 migrations, readiness, denied integration paths and local shutdown.
 It creates its own private disposable network.
 
+The focused review run covers staff operations, health, delivery recovery,
+assisted drafts, emergency override, and workflow. Run it with the same
+seed and CI formatters inside a non-login Bash shell. The first trace
+reported 127 passes and Mix exited 0. The workstation's Bash logout hook
+ran `clear_console` on explicit exit. In the non-interactive runner
+that command returned 1 before the cleanup trap, which inherited that
+status. The non-login rerun avoids the logout hook and the CI report
+verifier checks every focused result. This discrepancy required no
+application or test change.
+
+The focused regressions record a previous binding epoch settling its
+delivery without changing the current circuit, the admin disable action
+remaining available during an accounting error, and readiness rejecting
+a stale fixture. The locked-query regression reproduces a 15-second
+Refresh delay, applies the PostgreSQL timeout under the existing staff
+transaction, and proves recovery and preservation of the caller's
+timeout. Build the combined candidate using the checksum-guarded
+[release procedure](release-verification.md#reasoning-normalization-checks).
+
 Browser artifacts are `operator-320.png`, `operator-375.png`,
 `operator-1440.png`, `admin-1440.png` and `denied.png` in
 `/tmp/vgas29-browser`. The Hallmark captures are in that directory's
