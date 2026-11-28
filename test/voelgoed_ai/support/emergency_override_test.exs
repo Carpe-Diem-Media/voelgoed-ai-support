@@ -136,8 +136,21 @@ defmodule VoelgoedAi.Support.EmergencyOverrideTest do
              Repo.transact(fn ->
                SQL.query!(Repo, "LOCK TABLE automation_controls IN ACCESS EXCLUSIVE MODE")
                send(worker, :continue)
-               # Hold the lock past the write-boundary timeout, then allow settlement.
-               Process.sleep(600)
+
+               assert Enum.any?(1..40, fn _ ->
+                        %{rows: [[waiting]]} =
+                          SQL.query!(Repo, """
+                          SELECT EXISTS (SELECT 1 FROM pg_locks
+                            WHERE relation = 'automation_controls'::regclass
+                              AND mode = 'AccessShareLock' AND NOT granted)
+                          """)
+
+                        if not waiting, do: Process.sleep(5)
+                        waiting
+                      end)
+
+               # Release after the first checkout expires, while a retry could still succeed.
+               Process.sleep(325)
                {:ok, :lock_released}
              end)
   end

@@ -282,6 +282,8 @@ defmodule VoelgoedAi.Support.Configuration do
 
   @doc false
   def write_epoch_current?(epoch) do
+    # A missed authorization deadline denies this dispatch even if storage
+    # becomes reachable again. A pool retry could grant it after the deadline.
     case Ecto.Adapters.SQL.query(
            Repo,
            """
@@ -291,6 +293,7 @@ defmodule VoelgoedAi.Support.Configuration do
            """,
            [epoch],
            timeout: 250,
+           checkout_retries: 0,
            log: false,
            telemetry_event: nil
          ) do

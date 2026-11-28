@@ -82,7 +82,7 @@ locks. The Chatwoot write adapter checks the emergency setting and reads
 the current persisted control immediately before calling the fake
 transport. It requires an enabled, unlatched control in the qualified
 mode and an exact match with the intent's immutable epoch. The read has
-a 250 ms deadline. Denial or a read failure cancels the matching
+a 250 ms deadline and zero pool checkout retries. Denial or a read failure cancels the matching
 proven-unissued claim. A worker loss after dispatch authorization still
 requires conservative recovery. A disable can occur after this last read
 or while an already issued request is in flight.
