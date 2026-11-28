@@ -1146,6 +1146,12 @@ defmodule VoelgoedAi.Intelligence.Embedding do
       end
     end
 
+    @doc false
+    def enable_budget do
+      with {:ok, budget} <- gate(),
+           do: {:ok, Map.take(budget, [:price, :day_cap, :month_cap])}
+    end
+
     defp enqueue_finalisation(revision),
       do:
         Map.get(fixture(), :enqueue_finalisation, &Publication.enqueue_finalisation/1).(revision)

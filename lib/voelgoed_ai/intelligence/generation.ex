@@ -292,6 +292,14 @@ defmodule VoelgoedAi.Intelligence.Generation do
 
   if Mix.env() == :test do
     @doc false
+    def enable_budget(%{generation_wire: wire} = settings) when is_function(wire, 1) do
+      if verified_profile?(settings), do: {:ok, budget(settings)}, else: {:error, :invalid_budget}
+    end
+
+    def enable_budget(%{generation_wire: _}), do: {:error, :invalid_budget}
+    def enable_budget(%{}), do: {:ok, nil}
+
+    @doc false
     def configured_caps do
       case ChatwootAdapter.fixture() do
         %{shadow_inference: %{generation_wire: wire} = settings} when is_function(wire, 1) ->

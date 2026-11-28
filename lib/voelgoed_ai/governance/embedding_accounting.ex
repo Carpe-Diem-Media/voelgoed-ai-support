@@ -169,6 +169,34 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
     alias VoelgoedAi.Intelligence.InferenceRun
 
     @doc false
+    def check_enable_budget(control, settings) do
+      # Enable already holds the control lock, which serializes this snapshot
+      # with reservations and settlement. No attempt or spend window is created.
+      with {:ok, query_budget} <- Embedding.enable_budget(),
+           {:ok, generation_budget} <- Generation.enable_budget(settings),
+           :ok <- enable_headroom(control, :query_embedding, Embedding.now(), query_budget) do
+        enable_headroom(
+          control,
+          :generate,
+          VoelgoedAi.Support.ChatwootAdapter.now(),
+          generation_budget
+        )
+      end
+    end
+
+    defp enable_headroom(_, :generate, _, nil), do: :ok
+
+    defp enable_headroom(control, purpose, now, %{price: price, day_cap: day, month_cap: month}) do
+      with true <- valid_caps?(day, month),
+           {:ok, ceiling} <- admission_price(%{purpose: purpose}, control, price) do
+        headroom(control, now, day, month, ceiling)
+      else
+        false -> {:error, :invalid_budget}
+        error -> error
+      end
+    end
+
+    @doc false
     def reset_headroom(control, lane, occurrence, now) do
       cleared = %{generation_inhibited: false, embedding_inhibited: false}
 

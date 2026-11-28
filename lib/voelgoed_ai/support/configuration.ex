@@ -489,6 +489,7 @@ defmodule VoelgoedAi.Support.Configuration do
          {:ok, %{status: :enabled} = binding} <- lock_binding(id),
          :ok <- eligible_binding(binding),
          {:ok, mode} <- control_mode(binding),
+         :ok <- enable_budget(control, mode),
          :ok <- Readiness.check_job_supervisor() do
       {:ok, %{status: :enabled, mode: mode}}
     else
@@ -499,6 +500,22 @@ defmodule VoelgoedAi.Support.Configuration do
   end
 
   defp control_transition(_, _, _), do: {:error, :invalid_transition}
+
+  defp enable_budget(_, :fake), do: :ok
+
+  if Mix.env() == :test do
+    defp enable_budget(control, :shadow_test) do
+      case fixture() do
+        # RunProcessing only enters the retrieval/inference path when this
+        # fixture section is present. Deterministic shadow is non-inference.
+        %{shadow_inference: %{} = settings} ->
+          VoelgoedAi.Governance.EmbeddingAccounting.check_enable_budget(control, settings)
+
+        _ ->
+          :ok
+      end
+    end
+  end
 
   if Mix.env() == :test do
     defp control_mode(%{operating_mode: :automatic}) do

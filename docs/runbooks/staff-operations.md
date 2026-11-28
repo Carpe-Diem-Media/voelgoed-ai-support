@@ -99,6 +99,17 @@ and proposed mode, then rechecks the Oban supervisor before updating
 control and appending the audit. A failed readiness check leaves the
 control state and enable audit history unchanged.
 
+For an inference-configured synthetic shadow or assisted fixture, Enable
+also checks the existing financial authority under the control lock.
+The current day and month must cover settled spend, reserved or UNKNOWN
+exposure and a full conservative attempt in each configured lane. The
+guard rejects an unavailable query embedding profile, an invalid
+configured generation profile, or a financial inhibit in a required lane.
+Fixed replies and deterministic shadow or assisted fixtures do not enter
+inference. Enable reserves nothing. Actual inference still needs a fresh
+reservation and dispatch check. VGAS-20 owns settlement and reset. Live
+pricing, caps, provider verification and activation remain separate gates.
+
 Circuit opening records a pending fact for its generation. Auth and
 configuration failures require a newer revalidated binding configuration
 and an explicit admin probe. The admin supplies an internal session
