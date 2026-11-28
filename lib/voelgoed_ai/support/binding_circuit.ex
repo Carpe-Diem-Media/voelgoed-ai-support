@@ -13,22 +13,29 @@ defmodule VoelgoedAi.Support.BindingCircuit do
   @probe_lease 2
 
   def label(binding) do
-    case state(binding) do
-      {_, _, nil, nil} ->
-        :closed
+    {_, _, retry_at, probe_until} = state(binding)
 
-      {_, _, _, %DateTime{} = until} ->
-        if DateTime.before?(VoelgoedAi.Support.ChatwootAdapter.now(), until),
-          do: :probe_pending,
-          else: open_label(binding)
-
-      _ ->
-        open_label(binding)
-    end
+    projection_label(
+      retry_at,
+      probe_until,
+      permanent_epoch(binding),
+      VoelgoedAi.Support.ChatwootAdapter.now()
+    )
   end
 
-  defp open_label(binding),
-    do: if(permanent_epoch(binding), do: :configuration_inhibited, else: :open)
+  @doc false
+  def projection_label(nil, nil, _, _), do: :closed
+
+  def projection_label(_, %DateTime{} = probe_until, permanent_epoch, now) do
+    if DateTime.before?(now, probe_until),
+      do: :probe_pending,
+      else: open_label(permanent_epoch)
+  end
+
+  def projection_label(_, _, permanent_epoch, _), do: open_label(permanent_epoch)
+
+  defp open_label(permanent_epoch),
+    do: if(permanent_epoch, do: :configuration_inhibited, else: :open)
 
   def reserve_for_admin(binding, now) do
     case permanent_epoch(binding) do

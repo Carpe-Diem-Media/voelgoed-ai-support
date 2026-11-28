@@ -127,12 +127,12 @@ defmodule VoelgoedAiWeb.OperationsLive do
         RunProcessing.review_draft(staff, detail.draft_id)
 
       {"readback", %{"id" => id}} ->
-        if Enum.any?(detail.deliveries, &(&1.id == id and &1.state == :unknown)),
+        if Enum.any?(detail.deliveries || [], &(&1.id == id and &1.state == "unknown")),
           do: Support.request_readback(staff, id),
           else: {:error, :unavailable}
 
       {"abandon", %{"delivery_id" => id, "acknowledge" => "true"}} ->
-        if Enum.any?(detail.deliveries, &(&1.id == id and &1.state == :unknown)),
+        if Enum.any?(detail.deliveries || [], &(&1.id == id and &1.state == "unknown")),
           do: Support.abandon_delivery(staff, id, :acknowledge_uncertainty),
           else: {:error, :unavailable}
 
@@ -149,20 +149,10 @@ defmodule VoelgoedAiWeb.OperationsLive do
            socket.private[:operations_detail]
          ) do
       {:ok, data} ->
-        notice =
-          if data.operator_unavailable, do: "The support queue could not load. Try Refresh."
-
-        assign(socket, data: data, notice: notice, draft: nil)
+        assign(socket, data: data, notice: nil, draft: nil)
 
       {:error, :denied} ->
         deny(socket)
-
-      _ ->
-        assign(socket,
-          data: nil,
-          notice: "The operations page could not load. Try Refresh.",
-          draft: nil
-        )
     end
   end
 
@@ -196,9 +186,9 @@ defmodule VoelgoedAiWeb.OperationsLive do
         <dt>Effective state</dt><dd>{label(@data.status)}</dd>
         <dt>Local readiness</dt><dd>{if @data.readiness == :ok, do: "Ready", else: "Unavailable"}</dd>
         <%= if configuration = @data.configuration do %>
-          <dt>Assistant</dt><dd>{label(configuration.assistant)}</dd>
-          <dt>Inbox</dt><dd>{label(configuration.binding)}</dd>
-          <dt>Mode</dt><dd>{label(configuration.mode)}</dd>
+          <dt>Assistant</dt><dd>{display(configuration.assistant)}</dd>
+          <dt>Inbox</dt><dd>{display(configuration.binding)}</dd>
+          <dt>Mode</dt><dd>{display(configuration.mode)}</dd>
           <dt>Chatwoot circuit</dt><dd>{label(configuration.circuit)}</dd>
         <% end %>
       </dl>
@@ -240,9 +230,10 @@ defmodule VoelgoedAiWeb.OperationsLive do
     </section>
     <section class="variant">
       <h2>Recent configuration activity</h2>
+      <p :if={is_nil(@data.audit)}>Configuration history is unavailable.</p>
       <p :if={@data.audit == []}>No recorded changes.</p>
-      <ul :if={@data.audit != []} class="operations-list">
-        <li :for={row <- @data.audit}>{label(row.event)} <span>{timestamp(row.occurred_at)}</span></li>
+      <ul :if={is_list(@data.audit) && @data.audit != []} class="operations-list">
+        <li :for={row <- @data.audit}>{display(row.event)} <span>{timestamp(row.occurred_at)}</span></li>
       </ul>
     </section>
     """
@@ -254,8 +245,9 @@ defmodule VoelgoedAiWeb.OperationsLive do
       <h2>Support queue</h2>
       <p>Send replies and resolve conversations in Chatwoot.</p>
       <p :if={!@data.available}>The qualified support inbox is unavailable.</p>
+      <p :if={@data.available && is_nil(@data.rows)} role="status">The support queue could not load. Try Refresh.</p>
       <p :if={@data.available && @data.rows == []}>No sessions need review.</p>
-      <ul :if={@data.rows != []} class="operations-list">
+      <ul :if={is_list(@data.rows) && @data.rows != []} class="operations-list">
         <li :for={[id, state, reason, updated, unknown] <- @data.rows}>
           <.link patch={"/staff/operations/#{id}"}>{id}</.link>
           <p>{display(state)}</p>
@@ -268,20 +260,21 @@ defmodule VoelgoedAiWeb.OperationsLive do
     <p :if={@data.detail_denied} class="notice" role="status">Session details are unavailable.</p>
     <section :if={detail = @data.detail} id="session-detail" class="variant">
       <h2>Session detail</h2>
-      <p>{label(detail.session.state)}</p>
-      <p :if={detail.session.reason_code}>{label(detail.session.reason_code)}</p>
-      <button :if={detail.session.state == :bot_active} type="button" phx-click="local-handoff"
+      <p>{display(detail.session.state)}</p>
+      <p :if={detail.session.reason_code}>{display(detail.session.reason_code)}</p>
+      <button :if={detail.session.state == "bot_active"} type="button" phx-click="local-handoff"
         phx-disable-with="Recording…" disabled={!@connected}>Route to staff locally</button>
       <h3>Deliveries</h3>
+      <p :if={is_nil(detail.deliveries)}>Delivery history is unavailable.</p>
       <p :if={detail.deliveries == []}>No delivery intents.</p>
-      <ul :if={detail.deliveries != []} class="operations-list">
+      <ul :if={is_list(detail.deliveries) && detail.deliveries != []} class="operations-list">
         <li :for={delivery <- detail.deliveries}>
-          <p>{label(delivery.purpose)}: {label(delivery.state)}</p>
-          <p :if={delivery.reason_code || delivery.uncertainty_reason}>{label(delivery.reason_code || delivery.uncertainty_reason)}</p>
+          <p>{display(delivery.purpose)}: {display(delivery.state)}</p>
+          <p :if={delivery.reason_code || delivery.uncertainty_reason}>{display(delivery.reason_code || delivery.uncertainty_reason)}</p>
           <p>Attempts {delivery.attempt_count}</p>
-          <button :if={delivery.state == :unknown} type="button" phx-click="readback" phx-value-id={delivery.id}
+          <button :if={delivery.state == "unknown"} type="button" phx-click="readback" phx-value-id={delivery.id}
             phx-disable-with="Checking…" disabled={!@connected}>Check Chatwoot for evidence</button>
-          <details :if={delivery.state == :unknown}>
+          <details :if={delivery.state == "unknown"}>
             <summary>Abandon unresolved delivery</summary>
             <form phx-submit="abandon">
               <fieldset disabled={!@connected}>
@@ -304,15 +297,17 @@ defmodule VoelgoedAiWeb.OperationsLive do
         <ul aria-label="Evidence revisions"><li :for={ref <- @draft.evidence}>{ref}</li></ul>
       </div>
       <h3>Recent session activity</h3>
+      <p :if={is_nil(detail.audit)}>Session history is unavailable.</p>
       <p :if={detail.audit == []}>No recorded activity.</p>
-      <ul :if={detail.audit != []} class="operations-list">
+      <ul :if={is_list(detail.audit) && detail.audit != []} class="operations-list">
         <li :for={[event, _reason, at] <- detail.audit}>{display(event)} <span>{timestamp(at)}</span></li>
       </ul>
     </section>
     <section class="variant">
       <h2>Attention history</h2>
+      <p :if={is_nil(@data.alerts)}>Attention history is unavailable.</p>
       <p :if={@data.alerts == []}>No local alerts.</p>
-      <ul :if={@data.alerts != []} class="operations-list">
+      <ul :if={is_list(@data.alerts) && @data.alerts != []} class="operations-list">
         <li :for={[kind, at] <- @data.alerts}>{display(kind)} <span>{timestamp(at)}</span></li>
       </ul>
     </section>

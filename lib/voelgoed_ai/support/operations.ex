@@ -1,159 +1,169 @@
 defmodule VoelgoedAi.Support.Operations do
   @moduledoc "Bounded, redacted projections for the staff operations page."
 
+  alias Ecto.Adapters.SQL
   alias VoelgoedAi.Accounts.StaffAccess
-  alias VoelgoedAi.Governance.{AuditEvent, EmergencyOverride, EmbeddingAccounting}
-  alias VoelgoedAi.Support.{Configuration, Readiness}
+  alias VoelgoedAi.Governance.{EmergencyOverride, EmbeddingAccounting}
+  alias VoelgoedAi.Repo
+  alias VoelgoedAi.Support.Readiness
+
+  @query_options [timeout: 750, checkout_retries: 0, log: false, telemetry_event: nil]
 
   def access(staff) do
-    StaffAccess.with_current(staff, nil, fn row ->
-      if :admin in row.roles or :support_operator in row.roles,
-        do: {:ok, :authorized},
-        else: {:error, :denied}
-    end)
+    with {:ok, _} <- operator_roles(staff), do: {:ok, :authorized}
   end
 
   def snapshot(staff, selected) do
+    # Authorization is checked again at the end so a slow projection cannot
+    # return information after expiry, revocation or a grant change.
+    with {:ok, roles} <- operator_roles(staff) do
+      binding = qualified_binding()
+      operator = if :support_operator in roles, do: operator(binding, selected)
+      admin = if :admin in roles, do: admin(staff, binding)
+
+      case operator_roles(staff) do
+        {:ok, ^roles} -> {:ok, %{admin: admin, operator: operator}}
+        _ -> {:error, :denied}
+      end
+    end
+  end
+
+  defp operator_roles(staff) do
+    with {:ok, roles} <- StaffAccess.current_roles(staff),
+         true <- :admin in roles or :support_operator in roles do
+      {:ok, roles}
+    else
+      _ -> {:error, :denied}
+    end
+  end
+
+  defp admin(staff, binding) do
+    configuration = configuration(binding)
+    history = history(binding)
+    spend = EmbeddingAccounting.staff_exposure(staff)
     readiness = Readiness.check()
 
-    with {:ok, {admin, operator?}} <-
-           StaffAccess.with_current(staff, nil, fn row ->
-             with true <- :admin in row.roles or :support_operator in row.roles,
-                  {:ok, admin} <- admin(staff, :admin in row.roles, readiness) do
-               {:ok, {admin, :support_operator in row.roles}}
-             else
-               false -> {:error, :denied}
-               error -> error
-             end
-           end),
-         {:ok, data} <- operator_snapshot(staff, admin, operator?, selected) do
-      attach_spend(staff, data)
+    %{
+      status: effective_status(readiness),
+      readiness: readiness,
+      configuration: configuration,
+      audit: history,
+      spend: spend
+    }
+  end
+
+  defp effective_status(readiness) do
+    case rows("SELECT status, emergency_latched FROM automation_controls WHERE singleton", []) do
+      [[status, latched]] ->
+        cond do
+          EmergencyOverride.blocked?(%{emergency_latched: latched}) -> :emergency_disabled
+          status == "disabled" -> :disabled
+          status == "enabled" and readiness == :ok -> :enabled
+          true -> :configuration_unavailable
+        end
+
+      _ ->
+        :control_unavailable
     end
   end
 
-  defp operator_snapshot(_, admin, false, _),
-    do: {:ok, %{admin: admin, operator: nil, operator_unavailable: false}}
+  defp history(binding) do
+    case rows(
+           """
+           SELECT event, reason_code, occurred_at FROM audit_events
+           WHERE (target_kind = 'automation_control' AND control_target_id =
+                    (SELECT id FROM automation_controls WHERE singleton))
+              OR (target_kind = 'inbox_binding' AND binding_target_id = $1)
+           ORDER BY occurred_at DESC, id DESC LIMIT 25
+           """,
+           [binding && binding.id]
+         ) do
+      nil ->
+        nil
 
-  defp operator_snapshot(staff, admin, true, selected) do
-    case StaffAccess.with_current(staff, :support_operator, fn _ -> operator(staff, selected) end) do
-      {:ok, operator} ->
-        {:ok, %{admin: admin, operator: operator, operator_unavailable: false}}
-
-      {:error, :denied} = error ->
-        error
-
-      {:error, _} when not is_nil(admin) ->
-        {:ok, %{admin: admin, operator: nil, operator_unavailable: true}}
-
-      error ->
-        error
+      records ->
+        for [event, reason, at] <- records,
+            do: %{event: event, reason_code: reason, occurred_at: at}
     end
   end
 
-  defp attach_spend(_, %{admin: nil} = data), do: {:ok, data}
-
-  defp attach_spend(staff, %{admin: admin} = data) do
-    # A failed accounting transaction must leave the disable control available.
-    case EmbeddingAccounting.staff_exposure(staff) do
-      {:error, :denied} = error -> error
-      spend -> {:ok, %{data | admin: Map.put(admin, :spend, spend)}}
+  defp rows(query, arguments) do
+    case SQL.query(Repo, query, arguments, @query_options) do
+      {:ok, %{rows: rows}} -> rows
+      {:error, _} -> nil
     end
-  end
-
-  defp admin(_, false, _), do: {:ok, nil}
-
-  defp admin(staff, true, readiness) do
-    with {:ok, control} <- Configuration.lock_control(),
-         {:ok, configuration} <- configuration(),
-         {:ok, audit} <- history(staff, :automation_control, control.id),
-         {:ok, binding_audit} <- binding_history(staff, configuration) do
-      {:ok,
-       %{
-         status: effective_status(control, readiness),
-         readiness: readiness,
-         configuration: configuration,
-         audit:
-           (audit ++ binding_audit)
-           |> Enum.sort_by(& &1.occurred_at, {:desc, DateTime})
-           |> Enum.take(25)
-           |> Enum.map(&Map.take(&1, [:event, :reason_code, :occurred_at]))
-       }}
-    end
-  end
-
-  defp effective_status(control, readiness) do
-    cond do
-      EmergencyOverride.blocked?(control) -> :emergency_disabled
-      control.status == :disabled -> :disabled
-      readiness == :ok -> :enabled
-      true -> :configuration_unavailable
-    end
-  end
-
-  defp history(staff, kind, id) do
-    AuditEvent
-    |> Ash.ActionInput.for_action(
-      :operational_history,
-      %{target_kind: kind, id: id},
-      actor: staff
-    )
-    |> Ash.run_action()
   end
 
   if Mix.env() == :test do
-    alias Ecto.Adapters.SQL
-    alias VoelgoedAi.{Repo, Support}
-    alias VoelgoedAi.Support.{BindingCircuit, ChatwootAdapter, Ownership}
+    alias VoelgoedAi.Support.{BindingCircuit, ChatwootAdapter}
 
-    @query_options [timeout: 1_000, log: false, telemetry_event: nil]
-
-    defp configuration do
-      with %{} = fixture <- ChatwootAdapter.fixture(),
-           {:ok, config} <- Configuration.lock_inbox(inbox(fixture)) do
-        {:ok,
-         %{
-           assistant: config.assistant.status,
-           binding: config.binding.status,
-           mode: config.binding.operating_mode,
-           circuit: BindingCircuit.label(config.binding),
-           binding_id: config.binding.id
-         }}
+    defp qualified_binding do
+      with %{
+             installation_ref: installation,
+             external_account_id: account,
+             external_inbox_id: inbox
+           } <-
+             ChatwootAdapter.fixture(),
+           scope = [installation, account, inbox],
+           [[id]] <-
+             rows(
+               """
+               SELECT id FROM inbox_bindings
+               WHERE installation_ref = $1 AND external_account_id = $2 AND external_inbox_id = $3
+               """,
+               scope
+             ) do
+        %{id: id, scope: scope}
       else
-        nil -> {:ok, nil}
-        {:error, :scope_denied} -> {:ok, nil}
-        error -> error
+        _ -> nil
       end
     end
 
-    defp binding_history(_, nil), do: {:ok, []}
+    defp configuration(nil), do: nil
 
-    defp binding_history(staff, configuration),
-      do: history(staff, :inbox_binding, configuration.binding_id)
+    defp configuration(%{id: id}) do
+      case rows(
+             """
+             SELECT a.status, b.status, b.operating_mode, c.retry_at, c.probe_until, c.permanent_epoch
+             FROM inbox_bindings b JOIN assistants a ON a.id = b.assistant_id
+             LEFT JOIN support_binding_circuits c ON c.binding_id = b.id
+             WHERE b.id = $1
+             """,
+             [id]
+           ) do
+        [[assistant, binding, mode, retry_at, probe_until, permanent_epoch]] ->
+          %{
+            assistant: assistant,
+            binding: binding,
+            mode: mode,
+            circuit:
+              BindingCircuit.projection_label(
+                retry_at,
+                probe_until,
+                permanent_epoch,
+                ChatwootAdapter.now()
+              ),
+            binding_id: Ecto.UUID.load!(id)
+          }
 
-    defp operator(staff, selected) do
-      with %{} = fixture <- ChatwootAdapter.fixture(),
-           {:ok, config} <- Configuration.lock_inbox(inbox(fixture)),
-           {:ok, rows} <- queue(config.binding.id),
-           {:ok, alerts} <- alerts(config.binding.id),
-           {:ok, detail} <- detail(staff, selected) do
-        {:ok,
-         %{
-           rows: rows,
-           detail: detail,
-           alerts: alerts,
-           available: true,
-           detail_denied: is_binary(selected) and is_nil(detail)
-         }}
-      else
-        nil ->
-          {:ok, %{rows: [], detail: nil, alerts: [], available: false, detail_denied: false}}
-
-        {:error, :scope_denied} ->
-          {:ok, %{rows: [], detail: nil, alerts: [], available: false, detail_denied: false}}
-
-        error ->
-          error
+        _ ->
+          nil
       end
+    end
+
+    defp operator(nil, _selected),
+      do: %{rows: [], detail: nil, alerts: [], available: false, detail_denied: false}
+
+    defp operator(%{id: id} = binding, selected) do
+      detail = detail(binding, selected)
+
+      %{
+        rows: queue(id),
+        detail: detail,
+        alerts: alerts(id),
+        available: true,
+        detail_denied: is_binary(selected) and is_nil(detail)
+      }
     end
 
     defp queue(binding_id) do
@@ -171,7 +181,7 @@ defmodule VoelgoedAi.Support.Operations do
         )
         ORDER BY s.updated_at DESC, s.id DESC LIMIT 25
         """,
-        [Ecto.UUID.dump!(binding_id)]
+        [binding_id]
       )
     end
 
@@ -181,26 +191,61 @@ defmodule VoelgoedAi.Support.Operations do
         SELECT kind, opened_at FROM support_alert_episodes
         WHERE binding_id = $1 ORDER BY opened_at DESC, id DESC LIMIT 25
         """,
-        [Ecto.UUID.dump!(binding_id)]
+        [binding_id]
       )
     end
 
-    defp detail(_, nil), do: {:ok, nil}
+    defp detail(_, nil), do: nil
 
-    defp detail(staff, id) do
-      with {:ok, id} <- Ecto.UUID.cast(id),
-           {:ok, session} <-
-             Ownership.locked_session(id, fn _, row, _ ->
-               {:ok, Map.take(row, [:id, :state, :reason_code])}
-             end),
-           {:ok, deliveries} <- Support.reconciliation_projection(staff, id),
-           {:ok, [[draft_id]]} <- current_draft(id),
-           {:ok, audit} <- session_history(id) do
-        {:ok, %{session: session, deliveries: deliveries, draft_id: draft_id, audit: audit}}
+    defp detail(%{id: binding_id, scope: scope}, selected) do
+      with {:ok, id} <- Ecto.UUID.dump(selected),
+           [[state, reason]] <-
+             rows(
+               """
+               SELECT state, reason_code FROM support_sessions
+               WHERE id = $1 AND binding_id = $2 AND installation_ref = $3
+                 AND external_account_id = $4 AND external_inbox_id = $5
+               """,
+               [id, binding_id | scope]
+             ) do
+        %{
+          session: %{id: Ecto.UUID.load!(id), state: state, reason_code: reason},
+          deliveries: deliveries(id),
+          draft_id: draft_id(current_draft(id)),
+          audit: session_history(id)
+        }
       else
-        _ -> {:ok, nil}
+        _ -> nil
       end
     end
+
+    defp deliveries(id) do
+      case rows(
+             """
+             SELECT id::text, purpose, state, attempt_count, reason_code, uncertainty_reason
+             FROM outbound_deliveries WHERE session_id = $1 ORDER BY id LIMIT 100
+             """,
+             [id]
+           ) do
+        nil ->
+          nil
+
+        records ->
+          for [id, purpose, state, attempts, reason, uncertainty] <- records do
+            %{
+              id: id,
+              purpose: purpose,
+              state: state,
+              attempt_count: attempts,
+              reason_code: reason,
+              uncertainty_reason: uncertainty
+            }
+          end
+      end
+    end
+
+    defp draft_id([[id]]), do: id
+    defp draft_id(_), do: nil
 
     defp current_draft(id) do
       rows(
@@ -216,7 +261,7 @@ defmodule VoelgoedAi.Support.Operations do
             AND r.binding_epoch = b.security_epoch AND r.assistant_epoch = a.security_epoch
             AND r.deadline_at > $2 ORDER BY r.finished_at DESC, r.id DESC LIMIT 1)
         """,
-        [Ecto.UUID.dump!(id), ChatwootAdapter.now()]
+        [id, ChatwootAdapter.now()]
       )
     end
 
@@ -229,40 +274,14 @@ defmodule VoelgoedAi.Support.Operations do
         )
         ORDER BY occurred_at DESC, id DESC LIMIT 25
         """,
-        [Ecto.UUID.dump!(id)]
+        [id]
       )
     end
-
-    defp rows(query, arguments) do
-      # The staff transaction already owns the connection. Let PostgreSQL
-      # enforce the timeout and roll it back with this read-only savepoint.
-      with {:ok, _} <- projection_query("SAVEPOINT staff_operations_projection"),
-           result <- timed_projection(query, arguments),
-           {:ok, _} <- projection_query("ROLLBACK TO SAVEPOINT staff_operations_projection"),
-           {:ok, _} <- projection_query("RELEASE SAVEPOINT staff_operations_projection"),
-           {:ok, %{rows: rows}} <- result do
-        {:ok, rows}
-      else
-        {:error, _} -> {:error, :unavailable}
-      end
-    end
-
-    defp timed_projection(query, arguments) do
-      with {:ok, _} <- projection_query("SET LOCAL statement_timeout = '750ms'") do
-        projection_query(query, arguments)
-      end
-    end
-
-    defp projection_query(query, arguments \\ []),
-      do: SQL.query(Repo, query, arguments, @query_options)
-
-    defp inbox(row),
-      do: Map.take(row, [:installation_ref, :external_account_id, :external_inbox_id])
   else
-    defp configuration, do: {:ok, nil}
-    defp binding_history(_, _), do: {:ok, []}
+    defp qualified_binding, do: nil
+    defp configuration(nil), do: nil
 
-    defp operator(_, _),
-      do: {:ok, %{rows: [], detail: nil, alerts: [], available: false, detail_denied: false}}
+    defp operator(nil, _selected),
+      do: %{rows: [], detail: nil, alerts: [], available: false, detail_denied: false}
   end
 end

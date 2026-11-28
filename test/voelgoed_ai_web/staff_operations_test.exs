@@ -12,6 +12,7 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
   alias VoelgoedAi.{Accounts, StaffEntraFixture, StaffFixtures}
   alias VoelgoedAi.{Repo, SupportDBCase}
   alias VoelgoedAi.Governance.EmbeddingAccounting
+  alias VoelgoedAi.Support.Operations
 
   setup do
     StaffFixtures.setup()
@@ -122,7 +123,7 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
     assert {:ok, view, _} = live(page)
     assert has_element?(view, "h2", "Support queue")
 
-    with_locked_table("support_alert_episodes", fn ->
+    with_locked_table("support_sessions", fn ->
       started_at = System.monotonic_time(:millisecond)
       render_click(view, "refresh", %{})
       elapsed = System.monotonic_time(:millisecond) - started_at
@@ -130,7 +131,7 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
       assert has_element?(
                view,
                "[role=status]",
-               "The operations page could not load. Try Refresh."
+               "The support queue could not load. Try Refresh."
              )
 
       assert elapsed < 3_000
@@ -138,7 +139,7 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
 
     render_click(view, "refresh", %{})
     assert has_element?(view, "h2", "Support queue")
-    refute has_element?(view, "[role=status]", "The operations page could not load. Try Refresh.")
+    refute has_element?(view, "[role=status]", "The support queue could not load. Try Refresh.")
   end
 
   test "a blocked accounting read times out without blocking the same admin from disabling" do
@@ -168,7 +169,7 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
     end)
   end
 
-  test "a queue timeout leaves Disable automation available for dual-role staff" do
+  test "an attention history timeout leaves Disable automation available for dual-role staff" do
     %{admin: admin, operator: operator} = SupportDBCase.setup()
     assert {:ok, _} = Accounts.set_roles(admin, operator.id, [:admin, :support_operator])
     assert {:ok, staff} = StaffFixtures.authenticate(operator.id)
@@ -194,7 +195,7 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
     with_locked_table("support_alert_episodes", fn ->
       render_click(view, "refresh", %{})
       assert has_element?(view, "button[phx-click=disable]")
-      refute has_element?(view, "h2", "Support queue")
+      assert render(view) =~ "Attention history is unavailable."
       render_click(view, "disable", %{})
       assert %{rows: [["disabled"]]} = SQL.query!(Repo, "SELECT status FROM automation_controls")
     end)
@@ -203,30 +204,207 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
     assert has_element?(view, "h2", "Support queue")
   end
 
-  defp accounting_waiting? do
+  for {table, path} <- [{"inbox_bindings", [:binding_id]}, {"assistants", [:assistant, :id]}] do
+    test "the operations snapshot does not wait for a locked #{table} row" do
+      support = SupportDBCase.setup()
+      id = get_in(support, Enum.map(unquote(path), &Access.key!/1))
+      table = unquote(table)
+
+      with_projection_lock(
+        "SELECT id FROM #{table} WHERE id = $1 FOR UPDATE",
+        [uuid(id)],
+        fn holder ->
+          projection = Task.async(fn -> Operations.snapshot(support.admin, nil) end)
+
+          case projection_or_wait(projection, holder) do
+            {:ok, {:ok, %{admin: %{configuration: %{binding_id: binding_id}}}}} ->
+              assert binding_id == support.binding_id
+
+            :blocked ->
+              locks = {staff_lock(support.admin), control_lock()}
+              Task.shutdown(projection, :brutal_kill)
+
+              flunk(
+                "projection waited on #{table} while staff/control locks were #{inspect(locks)}"
+              )
+          end
+        end
+      )
+    end
+  end
+
+  test "Disable commits while the circuit configuration projection is waiting" do
+    support = SupportDBCase.setup()
+
+    with_locked_table("support_binding_circuits", fn ->
+      projection = Task.async(fn -> Operations.snapshot(support.admin, nil) end)
+
+      try do
+        assert projection_waiting?("support_binding_circuits")
+        assert {:ok, _} = staff_lock(support.admin)
+        assert_disable_commits(support)
+        assert projection_waiting?("support_binding_circuits")
+
+        assert {:ok, %{admin: %{configuration: nil, status: :disabled}}} =
+                 Task.await(projection, 3_000)
+      after
+        Task.shutdown(projection, :brutal_kill)
+      end
+    end)
+
+    assert {:ok, %{admin: %{status: :disabled, configuration: %{}}}} =
+             Operations.snapshot(support.admin, nil)
+
+    page = read_page(support.admin, "/staff/operations")
+    admin = support.admin
+    session = %{"staff" => {admin.id, admin.generation, admin.expiry, admin.binding}}
+    page = put_private(page, :live_view_connect_info, %{session: session})
+    assert {:ok, view, _} = live(page)
+    assert has_element?(view, "button[phx-click=enable]")
+
+    with_locked_table("support_binding_circuits", fn ->
+      assert render_click(view, "refresh", %{}) =~ "Qualified inbox configuration is unavailable."
+      assert has_element?(view, "button[phx-click=disable]")
+      refute has_element?(view, "button[phx-click=enable]")
+      assert render_click(view, "enable", %{}) =~ "This operation is unavailable."
+      assert %{rows: [["disabled"]]} = SQL.query!(Repo, "SELECT status FROM automation_controls")
+    end)
+
+    render_click(view, "refresh", %{})
+    assert has_element?(view, "button[phx-click=enable]")
+  end
+
+  test "audit history failure releases the staff and control rows and preserves other data" do
+    support = SupportDBCase.setup()
+
+    with_locked_table("audit_events", fn ->
+      projection = Task.async(fn -> Operations.snapshot(support.admin, nil) end)
+
+      try do
+        assert projection_waiting?("audit_events")
+        assert {:ok, _} = staff_lock(support.admin)
+        assert {:ok, _} = control_lock()
+        assert {:ok, %{admin: %{audit: nil, configuration: %{}}}} = Task.await(projection, 3_000)
+      after
+        Task.shutdown(projection, :brutal_kill)
+      end
+    end)
+
+    assert {:ok, %{admin: %{audit: [first | _]}}} = Operations.snapshot(support.admin, nil)
+    assert first.event
+  end
+
+  test "operator reads release the staff row and discard projected data when the grant changes" do
+    support = SupportDBCase.setup()
+    SupportDBCase.prepare_reply(support)
+    id = SupportDBCase.session_id(support)
+
+    with_locked_table("support_alert_episodes", fn ->
+      projection = Task.async(fn -> Operations.snapshot(support.operator, id) end)
+
+      try do
+        assert projection_waiting?("support_alert_episodes")
+        assert {:ok, _} = staff_lock(support.operator)
+        SupportDBCase.disable_automation(support)
+
+        assert {:ok, _} =
+                 Accounts.set_roles(support.admin, support.operator.id, [:knowledge_editor])
+
+        assert {:error, :denied} = Task.await(projection, 3_000)
+      after
+        Task.shutdown(projection, :brutal_kill)
+      end
+    end)
+  end
+
+  defp assert_disable_commits(support) do
+    assert {:ok, %{rows: [[control]]}} = control_lock()
+    previous = SupportDBCase.audit_rows(:control_target_id, control)
+    SupportDBCase.disable_automation(support)
+
+    assert %{rows: [["disabled"]]} =
+             SQL.query!(Repo, "SELECT status FROM automation_controls WHERE singleton")
+
+    audit = SupportDBCase.audit_rows(:control_target_id, control)
+    assert length(audit) == length(previous) + 1
+    assert ["staff", "automation_control", "disable_automation", _] = List.last(audit)
+  end
+
+  defp projection_or_wait(projection, holder) do
+    Enum.reduce_while(1..75, :blocked, fn _, _ ->
+      case Task.yield(projection, 10) do
+        nil ->
+          result =
+            SQL.query!(
+              Repo,
+              """
+              SELECT EXISTS (
+                SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))
+              )
+              """,
+              [holder]
+            )
+
+          if result.rows == [[true]], do: {:halt, :blocked}, else: {:cont, :blocked}
+
+        result ->
+          {:halt, result}
+      end
+    end)
+  end
+
+  defp staff_lock(staff),
+    do:
+      SQL.query(Repo, "SELECT id FROM staff_users WHERE id = $1 FOR UPDATE NOWAIT", [
+        uuid(staff.id)
+      ])
+
+  defp control_lock,
+    do:
+      SQL.query(
+        Repo,
+        "SELECT id::text FROM automation_controls WHERE singleton FOR UPDATE NOWAIT"
+      )
+
+  defp uuid(id), do: Ecto.UUID.dump!(id)
+
+  defp accounting_waiting?, do: projection_waiting?("usage_reservations")
+
+  defp projection_waiting?(table) do
     Enum.any?(1..75, fn _ ->
       %{rows: [[waiting]]} =
-        SQL.query!(Repo, """
-        SELECT EXISTS (
-          SELECT 1 FROM pg_locks
-          WHERE relation = 'usage_reservations'::regclass AND NOT granted
+        SQL.query!(
+          Repo,
+          """
+          SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE relation = $1::text::regclass AND NOT granted
+          )
+          """,
+          [table]
         )
-        """)
 
       if not waiting, do: Process.sleep(10)
       waiting
     end)
   end
 
-  defp with_locked_table(table, callback) do
+  defp with_locked_table(table, callback),
+    do:
+      with_projection_lock("LOCK TABLE #{table} IN ACCESS EXCLUSIVE MODE", [], fn _ ->
+        callback.()
+      end)
+
+  defp with_projection_lock(query, params, callback) do
     parent = self()
 
     holder =
       Task.async(fn ->
         Repo.transact(
           fn ->
-            SQL.query!(Repo, "LOCK TABLE #{table} IN ACCESS EXCLUSIVE MODE")
-            send(parent, :projection_locked)
+            SQL.query!(Repo, query, params)
+            %{rows: [[pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()")
+            send(parent, {:projection_locked, pid})
 
             receive do
               :release_projection -> {:ok, :released}
@@ -239,8 +417,8 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
       end)
 
     try do
-      assert_receive :projection_locked, 3_000
-      callback.()
+      assert_receive {:projection_locked, pid}, 3_000
+      callback.(pid)
     after
       send(holder.pid, :release_projection)
       assert {:ok, :released} = Task.await(holder)

@@ -666,10 +666,13 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
   def staff_exposure(staff) do
     alias VoelgoedAi.Accounts.StaffAccess
 
-    with {:ok, :authorized} <- StaffAccess.require_role(staff, :admin),
+    with {:ok, roles} <- StaffAccess.current_roles(staff),
+         true <- :admin in roles,
          result <- staff_totals(dates(DateTime.utc_now())),
-         {:ok, :authorized} <- StaffAccess.require_role(staff, :admin) do
+         {:ok, ^roles} <- StaffAccess.current_roles(staff) do
       result
+    else
+      _ -> {:error, :denied}
     end
   end
 

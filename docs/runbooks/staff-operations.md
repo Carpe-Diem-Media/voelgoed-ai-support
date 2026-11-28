@@ -110,6 +110,15 @@ corresponding deduplicated alert commits. Queue alerts reflect the pending
 backlog at scan time. Use approved manual escalation when the application
 or its database is unavailable.
 
+## Dashboard contention
+
+Dashboard reads check current staff grants before and after the projections.
+Configuration, history, spend and operator reads do not lock the staff or
+automation-control rows. A section that times out reports that it is
+unavailable. Disable remains available to a current admin, and Enable
+requires a loaded qualified configuration. The control commands still
+check current grants under lock and commit state and audit together.
+
 ## Verification and rollback
 
 Use the restricted PostgreSQL 18.7 and pgvector 0.8.7
