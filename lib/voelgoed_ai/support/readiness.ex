@@ -7,9 +7,18 @@ defmodule VoelgoedAi.Support.Readiness do
 
   @timeout 500
 
+  @doc false
+  @spec check_job_supervisor() :: :ok | {:error, :job_supervisor}
+  def check_job_supervisor do
+    case Oban.whereis(Oban) do
+      pid when is_pid(pid) -> if Process.alive?(pid), do: :ok, else: {:error, :job_supervisor}
+      nil -> {:error, :job_supervisor}
+    end
+  end
+
   @spec check() :: :ok | {:error, :job_supervisor | :storage | :configuration}
   def check do
-    with pid when is_pid(pid) <- Oban.whereis(Oban),
+    with :ok <- check_job_supervisor(),
          {:ok, %{rows: [[status, mode, latched, _]]}} <-
            SQL.query(
              Repo,
@@ -24,7 +33,7 @@ defmodule VoelgoedAi.Support.Readiness do
            ) do
       mode_readiness(status, mode, latched)
     else
-      nil -> {:error, :job_supervisor}
+      {:error, :job_supervisor} = error -> error
       _ -> {:error, :storage}
     end
   catch

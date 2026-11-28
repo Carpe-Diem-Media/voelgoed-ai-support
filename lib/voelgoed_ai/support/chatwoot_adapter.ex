@@ -134,12 +134,12 @@ defmodule VoelgoedAi.Support.ChatwootAdapter do
   end
 
   @doc false
-  def write(operation, destination, args, deadline, %OutboundDelivery{control_epoch: epoch})
+  def write(operation, destination, args, deadline, %OutboundDelivery{} = claim)
       when operation in [:reply, :open_for_handoff] do
     with false <- Repo.in_transaction?(),
          %{adapter: {module, context}} <- configured_adapter(),
          false <- EmergencyOverride.asserted?(),
-         true <- Configuration.write_epoch_current?(epoch),
+         true <- Configuration.write_claim_current?(claim, now()),
          false <- EmergencyOverride.asserted?() do
       budget = min(500, DateTime.diff(deadline, now(), :millisecond))
 

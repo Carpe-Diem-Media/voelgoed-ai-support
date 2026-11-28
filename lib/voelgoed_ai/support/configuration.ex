@@ -16,7 +16,7 @@ defmodule VoelgoedAi.Support.Configuration do
   alias VoelgoedAi.Intelligence.{Assistant, AssistantKnowledgeGrant, AssistantRevision}
   alias VoelgoedAi.Knowledge.KnowledgeCollection
   alias VoelgoedAi.Repo
-  alias VoelgoedAi.Support.{ActionScope, InboxBinding}
+  alias VoelgoedAi.Support.{ActionScope, InboxBinding, OutboundDelivery, Readiness}
   alias VoelgoedAi.Support.ActionScope.Storage
 
   @revision_fields [:workflow_version, :template_version, :locale, :response_policy]
@@ -60,10 +60,14 @@ defmodule VoelgoedAi.Support.Configuration do
 
   @impl true
   def run(input, _opts, %{actor: %Session{} = session}) do
-    StaffAccess.with_current(session, :admin, fn admin ->
-      execute(input.resource, input.action.name, input.arguments, admin.id)
-    end)
-    |> result()
+    result =
+      with :ok <- check_action_readiness(input) do
+        StaffAccess.with_current(session, :admin, fn admin ->
+          execute(input.resource, input.action.name, input.arguments, admin.id)
+        end)
+      end
+
+    result(result)
   end
 
   def run(input, _opts, %{actor: scope}) do
@@ -74,6 +78,16 @@ defmodule VoelgoedAi.Support.Configuration do
       {:error, "configuration access denied"}
     end
   end
+
+  # Readiness includes a storage probe. Do it before taking the locks
+  # shared with Disable and recheck the supervisor inside the transition.
+  defp check_action_readiness(%{
+         resource: AutomationControl,
+         action: %{name: :enable_automation}
+       }),
+       do: Readiness.check()
+
+  defp check_action_readiness(_), do: :ok
 
   defp execute(Assistant, :create, args, admin) do
     insert(Assistant, Map.put(args, :disabled_at, DateTime.utc_now()), :create, admin)
@@ -281,28 +295,68 @@ defmodule VoelgoedAi.Support.Configuration do
   def lock_control, do: get(AutomationControl, :global, :for_update)
 
   @doc false
-  def write_epoch_current?(epoch) do
-    # A missed authorization deadline denies this dispatch even if storage
-    # becomes reachable again. A pool retry could grant it after the deadline.
-    case Ecto.Adapters.SQL.query(
-           Repo,
-           """
-           SELECT 1 FROM automation_controls
-           WHERE singleton AND status = 'enabled' AND mode = 'fake'
-             AND NOT emergency_latched AND security_epoch = $1
-           """,
-           [epoch],
-           timeout: 250,
-           checkout_retries: 0,
-           log: false,
-           telemetry_event: nil
-         ) do
-      {:ok, %{rows: [[1]]}} -> true
+  def write_claim_current?(
+        %OutboundDelivery{dispatch_authorized_at: %DateTime{} = authorized_at} = claim,
+        now
+      ) do
+    # One unlocked snapshot sees revocations committed before this read.
+    # A checkout failure denies this attempt without a second authorization read.
+    with {:ok, id} <- Ecto.UUID.dump(claim.id),
+         {:ok, %{rows: [[1]]}} <-
+           Ecto.Adapters.SQL.query(
+             Repo,
+             """
+             SELECT 1
+             FROM outbound_deliveries d
+             JOIN support_sessions s ON s.id = d.session_id
+             JOIN inbox_bindings b ON b.id = s.binding_id
+               AND b.installation_ref = s.installation_ref
+               AND b.external_account_id = s.external_account_id
+               AND b.external_inbox_id = s.external_inbox_id
+             JOIN assistants a ON a.id = b.assistant_id
+             CROSS JOIN automation_controls c
+             LEFT JOIN support_runs r ON r.id = d.run_id AND r.session_id = s.id
+             WHERE d.id = $1 AND d.state = 'sending'
+               AND d.claim_generation = $2 AND d.read_sequence = $3
+               AND d.dispatch_authorized_at = $4
+               AND d.lease_expires_at > $5 AND d.deadline_at > $5
+               AND c.singleton AND c.status = 'enabled' AND c.mode = 'fake'
+               AND NOT c.emergency_latched AND c.security_epoch = d.control_epoch
+               AND b.status = 'enabled' AND b.operating_mode = 'automatic'
+               AND b.security_epoch = d.binding_epoch
+               AND a.status = 'active' AND a.audience = 'public'
+               AND a.security_epoch = d.assistant_epoch AND s.ownership_epoch = d.ownership_epoch
+               AND (
+                 (d.purpose = 'handoff_status' AND s.state = 'handoff_pending')
+                 OR (
+                   d.purpose = 'public_reply' AND s.state = 'bot_active' AND NOT s.human_inhibit
+                   AND r.state = 'completed' AND r.assistant_revision_id = a.active_revision_id
+                   AND (r.ownership_epoch, r.assistant_epoch, r.binding_epoch, r.control_epoch) =
+                       (d.ownership_epoch, d.assistant_epoch, d.binding_epoch, d.control_epoch)
+                 )
+               )
+             """,
+             [
+               id,
+               claim.claim_generation,
+               claim.read_sequence,
+               DateTime.to_naive(authorized_at),
+               DateTime.to_naive(now)
+             ],
+             timeout: 250,
+             checkout_retries: 0,
+             log: false,
+             telemetry_event: nil
+           ) do
+      true
+    else
       _ -> false
     end
   rescue
     DBConnection.ConnectionError -> false
   end
+
+  def write_claim_current?(_, _), do: false
 
   defp change_grant(:grant_collection, assistant, revision, collection, grants) do
     with :ok <- eligible_grant(assistant, collection) do
@@ -434,7 +488,8 @@ defmodule VoelgoedAi.Support.Configuration do
     with false <- EmergencyOverride.blocked?(control),
          {:ok, %{status: :enabled} = binding} <- lock_binding(id),
          :ok <- eligible_binding(binding),
-         {:ok, mode} <- control_mode(binding) do
+         {:ok, mode} <- control_mode(binding),
+         :ok <- Readiness.check_job_supervisor() do
       {:ok, %{status: :enabled, mode: mode}}
     else
       true -> {:error, :disabled}

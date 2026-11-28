@@ -2,12 +2,15 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
   use ExUnit.Case, async: false
 
   alias Ecto.Adapters.SQL
-  alias VoelgoedAi.{Repo, Support, SupportDBCase}
+  alias VoelgoedAi.{Repo, Support, SupportDBCase, SupportFixtures}
   alias VoelgoedAi.Governance.AuditEvent
+  alias VoelgoedAi.Intelligence.{Assistant, AssistantRevision}
 
   alias VoelgoedAi.Support.{
     ActionScope,
+    ChatwootAdapter,
     Delivery,
+    InboxBinding,
     Ingress,
     OutboundDelivery,
     Recovery,
@@ -1221,6 +1224,139 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     send(worker, :resume_delivery_authorization)
     assert :ok = Task.await(task)
     assert [] = SupportDBCase.writes(ctx)
+  end
+
+  for revocation <- [
+        :local_handoff,
+        :signed_takeover,
+        :binding_disable,
+        :binding_rebind,
+        :assistant_disable
+      ] do
+    test "#{revocation} committed at before_wire prevents the public reply", ctx do
+      id = SupportDBCase.prepare_reply(ctx)
+      owner = self()
+
+      fixture =
+        Map.put(ChatwootAdapter.fixture(), :before_wire, fn ->
+          send(owner, {:before_wire, self()})
+
+          receive do
+            :continue -> :ok
+          after
+            4_000 -> :timeout
+          end
+        end)
+
+      Application.put_env(:voelgoed_ai, :support_fixture, fixture)
+      task = Task.async(fn -> Delivery.deliver(id) end)
+      assert_receive {:before_wire, worker}, 2_000
+
+      try do
+        assert [["sending", %NaiveDateTime{}, 1]] =
+                 dispatch_row(id, "state, dispatch_authorized_at, attempt_count")
+
+        assert %{rows: [[epoch]]} =
+                 SQL.query!(
+                   Repo,
+                   "SELECT security_epoch FROM automation_controls WHERE singleton"
+                 )
+
+        expected = revoke_before_wire(ctx, unquote(revocation))
+
+        assert %{rows: [["enabled", ^epoch]]} =
+                 SQL.query!(
+                   Repo,
+                   "SELECT status, security_epoch FROM automation_controls WHERE singleton"
+                 )
+
+        send(worker, :continue)
+        assert :ok = Task.await(task)
+        assert [] = SupportDBCase.writes(ctx)
+        assert [[^expected, 1]] = dispatch_row(id, "state, attempt_count")
+
+        assert :ok = Delivery.deliver(id)
+        assert [] = SupportDBCase.writes(ctx)
+      after
+        Task.shutdown(task, :brutal_kill)
+      end
+    end
+  end
+
+  defp revoke_before_wire(ctx, :local_handoff) do
+    assert {:ok, %{state: :handoff_pending}} =
+             Support.route_locally(ctx.operator, SupportDBCase.session_id(ctx))
+
+    "unknown"
+  end
+
+  defp revoke_before_wire(ctx, :signed_takeover) do
+    assert signed_takeover(ctx) == 204
+    assert %{rows: [["human_active", true]]} = session_state(ctx, "state, human_inhibit")
+    "unknown"
+  end
+
+  defp revoke_before_wire(ctx, :binding_disable) do
+    assert {:ok, %{status: :disabled}} =
+             SupportFixtures.invoke(InboxBinding, :disable, %{id: ctx.binding_id}, ctx.admin)
+
+    "cancelled"
+  end
+
+  defp revoke_before_wire(ctx, :binding_rebind) do
+    revoke_before_wire(ctx, :binding_disable)
+    original = ChatwootAdapter.fixture()
+    replacement = SupportFixtures.create(ctx.admin, ctx.assistant.slug <> "-other")
+    :ok = configure_replacement(ctx, original, replacement)
+
+    # Keep the adapter and paused worker's original fixture available so the
+    # test proves the persisted rebind is what stops the write.
+    Application.put_env(:voelgoed_ai, :support_fixture, original)
+    "cancelled"
+  end
+
+  defp revoke_before_wire(ctx, :assistant_disable) do
+    assert {:ok, %{status: :disabled}} =
+             SupportFixtures.invoke(Assistant, :disable, %{id: ctx.assistant.id}, ctx.admin)
+
+    "cancelled"
+  end
+
+  defp configure_replacement(ctx, original, replacement) do
+    SupportFixtures.allow_fixture(replacement, Map.delete(original, :assistant_id))
+    revision = SupportFixtures.draft(ctx.admin, replacement)
+
+    assert {:ok, _} =
+             SupportFixtures.invoke(
+               AssistantRevision,
+               :publish,
+               %{id: revision.id, expected_active_revision_id: nil},
+               ctx.admin
+             )
+
+    assert {:ok, _} =
+             SupportFixtures.invoke(Assistant, :activate, %{id: replacement.id}, ctx.admin)
+
+    assert {:ok, %{assistant_id: assistant_id}} =
+             SupportFixtures.invoke(
+               InboxBinding,
+               :rebind,
+               %{id: ctx.binding_id, assistant_id: replacement.id},
+               ctx.admin
+             )
+
+    assert assistant_id == replacement.id
+
+    assert {:ok, %{status: :enabled}} =
+             SupportFixtures.invoke(InboxBinding, :enable, %{id: ctx.binding_id}, ctx.admin)
+
+    :ok
+  end
+
+  defp dispatch_row(id, columns) do
+    SQL.query!(Repo, "SELECT #{columns} FROM outbound_deliveries WHERE id = $1", [
+      Ecto.UUID.dump!(id)
+    ]).rows
   end
 
   for phase <- [:pending, :claimed, :authorized] do

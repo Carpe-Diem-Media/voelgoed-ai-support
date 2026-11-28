@@ -78,14 +78,26 @@ dispatch. Leave scope disabled whenever the current configuration or
 ownership cannot be verified.
 
 DB admission, reservation and dispatch checks run under the existing
-locks. The Chatwoot write adapter checks the emergency setting and reads
-the current persisted control immediately before calling the fake
-transport. It requires an enabled, unlatched control in the qualified
-mode and an exact match with the intent's immutable epoch. The read has
-a 250 ms deadline and zero pool checkout retries. Denial or a read failure cancels the matching
-proven-unissued claim. A worker loss after dispatch authorization still
-requires conservative recovery. A disable can occur after this last read
-or while an already issued request is in flight.
+locks. Immediately before calling the fake transport, the Chatwoot
+adapter checks the emergency setting and takes one unlocked database
+snapshot. The intent must still be sending under the same claim and
+dispatch marker with a valid lease and deadline. The snapshot checks
+current control, inbox binding, assistant and session ownership epochs.
+A public reply also needs the current completed run and bot ownership.
+A handoff status write needs a current handoff-pending session.
+
+The snapshot has a 250 ms deadline and zero pool checkout retries.
+Denial cancels a matching proven-unissued claim and preserves any
+UNKNOWN state already recorded by recovery or a revocation. Worker
+loss after dispatch authorization still requires conservative recovery.
+A revocation can commit after the last read or while an already-issued
+request is in flight.
+
+The server checks local readiness before Enable takes the configuration
+locks. Under lock it checks the current admin grant, qualified binding
+and proposed mode, then rechecks the Oban supervisor before updating
+control and appending the audit. A failed readiness check leaves the
+control state and enable audit history unchanged.
 
 Circuit opening records a pending fact for its generation. Auth and
 configuration failures require a newer revalidated binding configuration

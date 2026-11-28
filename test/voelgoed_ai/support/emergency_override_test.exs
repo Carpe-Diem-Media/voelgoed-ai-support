@@ -105,6 +105,46 @@ defmodule VoelgoedAi.Support.EmergencyOverrideTest do
     end
   end
 
+  test "the direct Enable action requires the Oban supervisor and leaves no enable audit", ctx do
+    SupportDBCase.disable_automation(ctx)
+
+    assert %{rows: [[id, epoch]]} =
+             SQL.query!(
+               Repo,
+               "SELECT id::text, security_epoch FROM automation_controls WHERE singleton AND status = 'disabled'"
+             )
+
+    audit = SupportDBCase.audit_rows(:control_target_id, id)
+    assert :ok = Supervisor.terminate_child(VoelgoedAi.Supervisor, Oban)
+
+    try do
+      assert Oban.whereis(Oban) == nil
+
+      assert {:error, _} =
+               VoelgoedAi.SupportFixtures.invoke(
+                 AutomationControl,
+                 :enable_automation,
+                 %{binding_id: ctx.binding_id},
+                 ctx.admin
+               )
+
+      assert %{rows: [["disabled", "disabled", ^epoch]]} =
+               SQL.query!(
+                 Repo,
+                 "SELECT status, mode, security_epoch FROM automation_controls WHERE singleton"
+               )
+
+      assert SupportDBCase.audit_rows(:control_target_id, id) == audit
+    after
+      assert {:ok, _} = Supervisor.restart_child(VoelgoedAi.Supervisor, Oban)
+    end
+
+    SupportDBCase.enable_automation(ctx)
+
+    assert SupportDBCase.audit_rows(:control_target_id, id) ==
+             audit ++ [["staff", "automation_control", "enable_automation", "local_admin"]]
+  end
+
   defp prepare(ctx, :reply), do: SupportDBCase.prepare_reply(ctx)
 
   defp prepare(ctx, :handoff) do
