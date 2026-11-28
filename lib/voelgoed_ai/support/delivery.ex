@@ -533,10 +533,22 @@ defmodule VoelgoedAi.Support.Delivery do
 
       case delivery.purpose do
         :public_reply ->
-          ChatwootAdapter.call(:reply, destination, [text, delivery.operation_ref], deadline)
+          ChatwootAdapter.write(
+            :reply,
+            destination,
+            [text, delivery.operation_ref],
+            deadline,
+            delivery
+          )
 
         :handoff_status ->
-          ChatwootAdapter.call(:open_for_handoff, destination, [delivery.operation_ref], deadline)
+          ChatwootAdapter.write(
+            :open_for_handoff,
+            destination,
+            [delivery.operation_ref],
+            deadline,
+            delivery
+          )
       end
     else
       {:error, {:not_issued, :deadline}}
@@ -544,8 +556,12 @@ defmodule VoelgoedAi.Support.Delivery do
   end
 
   defp settle(config, session, delivery, now, claim, result, generation) do
-    if current_claim?(delivery, claim) and DateTime.compare(now, delivery.lease_expires_at) == :lt do
-      if config.binding.security_epoch == claim.binding_epoch do
+    denied_before_write? =
+      result in [{:error, {:not_issued, :disabled}}, {:error, {:not_issued, :deadline}}]
+
+    if current_claim?(delivery, claim) and
+         (denied_before_write? or DateTime.compare(now, delivery.lease_expires_at) == :lt) do
+      if not denied_before_write? and config.binding.security_epoch == claim.binding_epoch do
         :ok = BindingCircuit.record(config.binding, generation, now, result)
       end
 
@@ -562,8 +578,11 @@ defmodule VoelgoedAi.Support.Delivery do
       else: unknown(delivery, now, :ambiguous_write)
   end
 
-  defp finish_post(_, delivery, _now, {:error, {:not_issued, :disabled}}),
-    do: fail_intent(delivery, :cancel, :dispatch_denied)
+  defp finish_post(_, delivery, _now, {:error, {:not_issued, :disabled}}) do
+    with {:ok, row} <- store_update(delivery, :cancel, %{reason_code: :dispatch_denied}) do
+      audit_handoff_failure(row, :no_effect)
+    end
+  end
 
   defp finish_post(_, delivery, _now, {:error, {:not_issued, :deadline}}),
     do: fail_intent(delivery, :cancel, :deadline)

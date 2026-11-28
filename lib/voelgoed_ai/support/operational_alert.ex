@@ -10,83 +10,128 @@ defmodule VoelgoedAi.Support.OperationalAlert do
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.Repo
 
+  @batch_size 25
+  @query_options [timeout: 1_000, log: false, telemetry_event: nil]
+
   @doc false
-  def record(binding_id, kind, episode, now)
-      when kind in [:circuit_open, :delivery_unknown, :handoff_failed] do
-    SQL.query!(
-      Repo,
+  def project(binding, now) do
+    with false <- Repo.in_transaction?(),
+         {:ok, :projected} <-
+           Repo.transact(
+             fn ->
+               with {:ok, _} <- query("SET LOCAL statement_timeout = '750ms'", []),
+                    {:ok, _} <- project_circuits(binding),
+                    {:ok, _} <- project_deliveries(binding),
+                    {:ok, _} <- scan_queue(binding, now) do
+                 {:ok, :projected}
+               end
+             end,
+             timeout: 4_000
+           ) do
+      :ok
+    else
+      _ -> projection_failed(binding)
+    end
+  rescue
+    DBConnection.ConnectionError -> projection_failed(binding)
+  end
+
+  defp projection_failed(binding) do
+    :telemetry.execute([:voelgoed_ai, :support, :alert_projection_failed], %{count: 1}, %{
+      binding_id: binding.id,
+      reason: :alert_projection_unavailable
+    })
+
+    {:error, :alert_projection_unavailable}
+  end
+
+  defp project_circuits(binding) do
+    query(
+      """
+      WITH pending AS (
+        SELECT generation, opened_at FROM support_circuit_alerts_pending
+        WHERE binding_id = $1 ORDER BY generation
+        LIMIT $2 FOR UPDATE SKIP LOCKED
+      ), projected AS (
+        INSERT INTO support_alert_episodes (id, binding_id, kind, episode, opened_at)
+        SELECT uuidv7(), $1, 'circuit_open', generation::text, opened_at FROM pending
+        ON CONFLICT (binding_id, kind, episode) DO NOTHING
+      )
+      DELETE FROM support_circuit_alerts_pending
+      WHERE binding_id = $1 AND generation IN (SELECT generation FROM pending)
+      """,
+      [uuid(binding.id), @batch_size]
+    )
+  end
+
+  defp project_deliveries(binding) do
+    query(
       """
       INSERT INTO support_alert_episodes (id, binding_id, kind, episode, opened_at)
-      VALUES ($1, $2, $3, $4, $5)
+      SELECT uuidv7(), $1, facts.event, facts.delivery_id::text, facts.opened_at
+      FROM (
+        SELECT a.event, d.id AS delivery_id, min(a.occurred_at) AS opened_at
+        FROM support_sessions s
+        JOIN outbound_deliveries d ON d.session_id = s.id
+        JOIN audit_events a ON a.delivery_target_id = d.id
+        WHERE s.binding_id = $1 AND a.event IN ('delivery_unknown', 'handoff_failed')
+          AND NOT EXISTS (
+            SELECT 1 FROM support_alert_episodes e
+            WHERE e.binding_id = $1 AND e.kind = a.event AND e.episode = d.id::text
+          )
+        GROUP BY a.event, d.id
+        ORDER BY min(a.occurred_at), d.id, a.event
+        LIMIT $2
+      ) facts
       ON CONFLICT (binding_id, kind, episode) DO NOTHING
       """,
-      [uuid(Ash.UUIDv7.generate()), uuid(binding_id), Atom.to_string(kind), episode, now],
-      telemetry_event: nil
+      [uuid(binding.id), @batch_size]
     )
-
-    :ok
   end
 
-  @doc false
-  def delivery_fact(row, kind) when kind in [:delivery_unknown, :handoff_failed] do
-    case SQL.query!(
-           Repo,
-           "SELECT binding_id::text FROM support_sessions WHERE id = $1",
-           [uuid(row.session_id)],
-           telemetry_event: nil
-         ).rows do
-      [[binding]] -> record(binding, kind, row.id, DateTime.utc_now())
+  defp scan_queue(binding, now) do
+    with {:ok, %{rows: [[overdue]]}} <-
+           query(
+             """
+             SELECT EXISTS (SELECT 1 FROM inbound_events
+               WHERE installation_ref = $1 AND external_account_id = $2 AND external_inbox_id = $3
+                 AND state = 'dispatched' AND disposition = 'pending' AND received_at <= $4)
+             """,
+             [
+               binding.installation_ref,
+               binding.external_account_id,
+               binding.external_inbox_id,
+               DateTime.add(now, -45)
+             ]
+           ) do
+      queue_episode(binding.id, now, overdue)
     end
   end
 
-  def delivery_fact(_, _), do: :ok
+  defp queue_episode(binding_id, now, true) do
+    id = Ash.UUIDv7.generate()
 
-  @doc false
-  def scan_queue(binding, now) do
-    result =
-      SQL.query!(
-        Repo,
-        """
-        SELECT EXISTS (SELECT 1 FROM inbound_events
-          WHERE installation_ref = $1 AND external_account_id = $2 AND external_inbox_id = $3
-            AND state = 'dispatched' AND disposition = 'pending' AND received_at <= $4)
-        """,
-        [
-          binding.installation_ref,
-          binding.external_account_id,
-          binding.external_inbox_id,
-          DateTime.add(now, -45)
-        ],
-        telemetry_event: nil
-      )
-
-    if result.rows == [[true]] do
-      id = Ash.UUIDv7.generate()
-
-      SQL.query!(
-        Repo,
-        """
-        INSERT INTO support_alert_episodes (id, binding_id, kind, episode, opened_at)
-        VALUES ($1, $2, 'queue_overdue', $3, $4)
-        ON CONFLICT (binding_id) WHERE kind = 'queue_overdue' AND closed_at IS NULL DO NOTHING
-        """,
-        [uuid(id), uuid(binding.id), id, now],
-        telemetry_event: nil
-      )
-    else
-      SQL.query!(
-        Repo,
-        """
-        UPDATE support_alert_episodes SET closed_at = $2
-        WHERE binding_id = $1 AND kind = 'queue_overdue' AND closed_at IS NULL
-        """,
-        [uuid(binding.id), now],
-        telemetry_event: nil
-      )
-    end
-
-    :ok
+    query(
+      """
+      INSERT INTO support_alert_episodes (id, binding_id, kind, episode, opened_at)
+      VALUES ($1, $2, 'queue_overdue', $3, $4)
+      ON CONFLICT (binding_id) WHERE kind = 'queue_overdue' AND closed_at IS NULL DO NOTHING
+      """,
+      [uuid(id), uuid(binding_id), id, now]
+    )
   end
+
+  defp queue_episode(binding_id, now, false) do
+    query(
+      """
+      UPDATE support_alert_episodes SET closed_at = $2
+      WHERE binding_id = $1 AND kind = 'queue_overdue' AND closed_at IS NULL AND opened_at <= $2
+      """,
+      [uuid(binding_id), now]
+    )
+  end
+
+  defp query(statement, args), do: SQL.query(Repo, statement, args, @query_options)
 
   defp uuid(id), do: Ecto.UUID.dump!(id)
 

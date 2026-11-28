@@ -78,13 +78,16 @@ dispatch. Leave scope disabled whenever the current configuration or
 ownership cannot be verified.
 
 DB admission, reservation and dispatch checks run under the existing
-locks. The transport checks the emergency setting again immediately before
-calling the underlying adapter. There is still an interval between the
-last local check and I/O. An already issued request can complete after a
-disable. Preserve reliable settlement, UNKNOWN outcomes and unresolved
-spend. The local check cannot make remote ownership and send atomic.
+locks. The Chatwoot write adapter checks the emergency setting and reads
+the current persisted control immediately before calling the fake
+transport. It requires an enabled, unlatched control in the qualified
+mode and an exact match with the intent's immutable epoch. The read has
+a 250 ms deadline. Denial or a read failure cancels the matching
+proven-unissued claim. A worker loss after dispatch authorization still
+requires conservative recovery. A disable can occur after this last read
+or while an already issued request is in flight.
 
-Circuit opening records a durable local alert for its generation. Auth and
+Circuit opening records a pending fact for its generation. Auth and
 configuration failures require a newer revalidated binding configuration
 and an explicit admin probe. The admin supplies an internal session
 reference in the qualified inbox. A bounded observation runs outside the
@@ -98,8 +101,14 @@ A queue episode opens when a pending receipt reaches its original intake
 deadline. Repeated sweeps keep one open episode per inbox. A clear scan
 closes it so another breach can open a new episode. UNKNOWN delivery and
 failed handoff episodes use their durable internal intent identifier. The
-database is the local attention sink. Use approved manual escalation when
-the application or its database is unavailable.
+recovery sweep schedules core work before a separate alert transaction
+reads committed facts. Alert queries have a 750 ms statement deadline.
+A failed projection rolls back its own batch, reports
+`alert_projection_failed`, and leaves the facts for the next sweep.
+The circuit fact survives circuit closure and is removed only when the
+corresponding deduplicated alert commits. Queue alerts reflect the pending
+backlog at scan time. Use approved manual escalation when the application
+or its database is unavailable.
 
 ## Verification and rollback
 

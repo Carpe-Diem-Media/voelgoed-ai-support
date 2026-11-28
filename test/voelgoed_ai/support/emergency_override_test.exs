@@ -2,13 +2,13 @@ defmodule VoelgoedAi.Support.EmergencyOverrideTest do
   use ExUnit.Case, async: false
 
   alias Ecto.Adapters.SQL
-  alias VoelgoedAi.{Repo, SupportDBCase}
+  alias VoelgoedAi.{Repo, Support, SupportDBCase}
   alias VoelgoedAi.Governance.{AutomationControl, EmergencyOverride}
   alias VoelgoedAi.Support.{ChatwootAdapter, Delivery, Ingress, RunProcessing}
 
   setup do
     ctx = SupportDBCase.setup()
-    original = Application.get_env(:voelgoed_ai, :emergency_override)
+    original = Application.get_env(:voelgoed_ai, :emergency_override, false)
     on_exit(fn -> Application.put_env(:voelgoed_ai, :emergency_override, original) end)
     ctx
   end
@@ -73,5 +73,72 @@ defmodule VoelgoedAi.Support.EmergencyOverrideTest do
     SupportDBCase.enable_automation(ctx)
     assert :ok = Delivery.deliver(id)
     assert [] = SupportDBCase.writes(ctx)
+  end
+
+  for purpose <- [:reply, :handoff], denial <- [:disable, :changed_epoch, :latch, :storage] do
+    test "#{purpose} is cancelled when #{denial} invalidates the last write check", ctx do
+      id = prepare(ctx, unquote(purpose))
+      owner = self()
+      Application.put_env(:voelgoed_ai, :emergency_override, false)
+
+      fixture =
+        Map.put(ChatwootAdapter.fixture(), :before_wire, fn ->
+          send(owner, {:before_wire, self()})
+
+          receive do
+            :continue -> :ok
+          end
+        end)
+
+      Application.put_env(:voelgoed_ai, :support_fixture, fixture)
+      task = Task.async(fn -> Delivery.deliver(id) end)
+      assert_receive {:before_wire, worker}, 2_000
+      assert %{rows: [["sending", 1]]} = SupportDBCase.delivery_rows(ctx, "state, attempt_count")
+      invalidate(ctx, unquote(denial), worker)
+      assert :ok = Task.await(task)
+
+      assert %{rows: [["cancelled", "dispatch_denied", 1]]} =
+               SupportDBCase.delivery_rows(ctx, "state, reason_code, attempt_count")
+
+      assert :ok = Delivery.deliver(id)
+      assert [] = SupportDBCase.writes(ctx)
+    end
+  end
+
+  defp prepare(ctx, :reply), do: SupportDBCase.prepare_reply(ctx)
+
+  defp prepare(ctx, :handoff) do
+    assert {:ok, receipt} = Ingress.accept(ctx.event)
+    assert :ok = RunProcessing.process_event(receipt)
+    assert {:ok, _} = Support.request_handoff(ctx.operator, SupportDBCase.session_id(ctx))
+    assert %{rows: [[id]]} = SupportDBCase.delivery_rows(ctx, "id::text")
+    id
+  end
+
+  defp invalidate(ctx, :disable, worker) do
+    SupportDBCase.disable_automation(ctx)
+    send(worker, :continue)
+  end
+
+  defp invalidate(ctx, :changed_epoch, worker) do
+    SupportDBCase.disable_automation(ctx)
+    SupportDBCase.enable_automation(ctx)
+    send(worker, :continue)
+  end
+
+  defp invalidate(_, :latch, worker) do
+    SQL.query!(Repo, "UPDATE automation_controls SET emergency_latched = true WHERE singleton")
+    send(worker, :continue)
+  end
+
+  defp invalidate(_, :storage, worker) do
+    assert {:ok, :lock_released} =
+             Repo.transact(fn ->
+               SQL.query!(Repo, "LOCK TABLE automation_controls IN ACCESS EXCLUSIVE MODE")
+               send(worker, :continue)
+               # Hold the lock past the write-boundary timeout, then allow settlement.
+               Process.sleep(600)
+               {:ok, :lock_released}
+             end)
   end
 end

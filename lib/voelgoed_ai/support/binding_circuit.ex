@@ -135,13 +135,21 @@ defmodule VoelgoedAi.Support.BindingCircuit do
     generation = generation + 1
     :ok = save(binding, generation, failures, DateTime.add(now, @cooldown), nil)
 
-    :ok =
-      VoelgoedAi.Support.OperationalAlert.record(
-        binding.id,
-        :circuit_open,
-        Integer.to_string(generation),
-        now
-      )
+    # The current circuit row can close before the alert sink recovers.
+    # Keep each opening until a separate sweep commits its alert.
+    SQL.query!(
+      Repo,
+      """
+      INSERT INTO support_circuit_alerts_pending (binding_id, generation, opened_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (binding_id, generation) DO NOTHING
+      """,
+      [Ecto.UUID.dump!(binding.id), generation, now],
+      log: false,
+      telemetry_event: nil
+    )
+
+    :ok
   end
 
   defp permanent_epoch(binding) do

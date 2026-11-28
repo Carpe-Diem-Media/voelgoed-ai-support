@@ -63,6 +63,37 @@ try {
 
       await page.focus("a[href^='/staff/operations/']");
       assert.equal(await page.evaluate(() => getComputedStyle(document.activeElement).outlineStyle), "solid");
+      const contrast = await page.evaluate(() => {
+        const focused = document.activeElement;
+        const style = getComputedStyle(focused);
+        let background = "rgb(255, 255, 255)";
+        for (let node = focused; node; node = node.parentElement) {
+          const color = getComputedStyle(node).backgroundColor;
+          if (color.startsWith("rgb(")) {
+            background = color;
+            break;
+          }
+        }
+
+        function luminance(color) {
+          const [red, green, blue] = color.match(/\d+(?:\.\d+)?/g).slice(0, 3).map(Number);
+          const linear = (channel) => {
+            const scaled = channel / 255;
+            return scaled <= 0.04045 ? scaled / 12.92 : ((scaled + 0.055) / 1.055) ** 2.4;
+          };
+          return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue);
+        }
+
+        function ratio(color) {
+          const values = [luminance(color), luminance(background)].sort((a, b) => b - a);
+          return (values[0] + 0.05) / (values[1] + 0.05);
+        }
+
+        return { text: ratio(style.color), focus: ratio(style.outlineColor) };
+      });
+      assert.ok(contrast.text >= 4.5, "Normal text contrast");
+      assert.ok(contrast.focus >= 3, "Keyboard focus contrast");
+      console.log(`Queue link text contrast ${contrast.text.toFixed(2)}:1, focus contrast ${contrast.focus.toFixed(2)}:1.`);
       await page.keyboard.press("Enter");
       await page.waitForSelector("#session-detail button:not([disabled])", { timeout: 5_000 });
 
@@ -86,7 +117,7 @@ try {
     stage = role + " sanitized capture";
     const html = await page.evaluate(() => {
       const doc = document.documentElement.cloneNode(true);
-      doc.querySelectorAll("script, meta[name=csrf-token]").forEach((el) => el.remove());
+      doc.querySelectorAll('script, meta[name="csrf-token"], input[name="_csrf_token"]').forEach((el) => el.remove());
       doc.querySelectorAll("*").forEach((el) => {
         for (const name of el.getAttributeNames()) {
           if (name.startsWith("data-phx-") || name.startsWith("phx-")) el.removeAttribute(name);
@@ -100,6 +131,7 @@ try {
 
     assert.ok(!html.includes("_vgas_staff"));
     assert.ok(!html.includes("data-phx-session"));
+    for (const cookie of Object.values(cookies)) assert.ok(!html.includes(cookie));
     await writeFile(resolve(output, `${role}.html`), html);
     await context.close();
   }

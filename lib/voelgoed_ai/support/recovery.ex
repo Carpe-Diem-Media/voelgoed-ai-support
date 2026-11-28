@@ -237,20 +237,22 @@ defmodule VoelgoedAi.Support.Recovery do
       now = ChatwootAdapter.now()
 
       with %{} = fixture <- ChatwootAdapter.fixture(),
-           {:ok, %{events: events, runs: runs, deliveries: deliveries}} <-
+           {:ok, {binding, %{events: events, runs: runs, deliveries: deliveries}}} <-
              Repo.transact(fn ->
                inbox =
                  Map.take(fixture, [:installation_ref, :external_account_id, :external_inbox_id])
 
-               with {:ok, config} <- VoelgoedAi.Support.Configuration.lock_inbox(inbox),
-                    :ok <- VoelgoedAi.Support.OperationalAlert.scan_queue(config.binding, now) do
-                 due(now)
+               with {:ok, config} <- Configuration.lock_inbox(inbox),
+                    {:ok, work} <- due(now) do
+                 {:ok, {config.binding, work}}
                end
              end) do
         for event <- events, do: Ownership.enqueue(ProcessEvent, %{"event_id" => event.id})
         for run <- runs, do: run_deadline(run.id)
         for delivery <- deliveries, do: delivery_deadline(delivery.id)
-        sweep_idle(nil)
+        idle_result = sweep_idle(nil)
+        alert_result = VoelgoedAi.Support.OperationalAlert.project(binding, now)
+        if idle_result == :ok, do: alert_result, else: idle_result
       else
         nil -> :ok
         {:error, :scope_denied} -> :ok

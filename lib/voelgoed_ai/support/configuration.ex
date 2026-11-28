@@ -280,6 +280,27 @@ defmodule VoelgoedAi.Support.Configuration do
   @doc false
   def lock_control, do: get(AutomationControl, :global, :for_update)
 
+  @doc false
+  def write_epoch_current?(epoch) do
+    case Ecto.Adapters.SQL.query(
+           Repo,
+           """
+           SELECT 1 FROM automation_controls
+           WHERE singleton AND status = 'enabled' AND mode = 'fake'
+             AND NOT emergency_latched AND security_epoch = $1
+           """,
+           [epoch],
+           timeout: 250,
+           log: false,
+           telemetry_event: nil
+         ) do
+      {:ok, %{rows: [[1]]}} -> true
+      _ -> false
+    end
+  rescue
+    DBConnection.ConnectionError -> false
+  end
+
   defp change_grant(:grant_collection, assistant, revision, collection, grants) do
     with :ok <- eligible_grant(assistant, collection) do
       cond do

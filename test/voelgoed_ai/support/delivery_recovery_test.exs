@@ -277,6 +277,8 @@ defmodule VoelgoedAi.Support.DeliveryRecoveryTest do
     assert {:ok, :closed} = Task.await(task)
     assert [_] = SupportDBCase.writes(ctx)
 
+    assert :ok = Recovery.sweep()
+
     assert %{rows: [[1]]} =
              SQL.query!(
                Repo,
