@@ -10,6 +10,14 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
   alias VoelgoedAi.Knowledge.Storage
   alias VoelgoedAi.Repo
 
+  @exposure_query """
+  SELECT COALESCE(sum(r.reserved_nano_usd::numeric)
+    FILTER (WHERE r.state IN ('reserved', 'unknown')), 0)::text AS outstanding,
+    COALESCE(bool_or(i.overflow_evidence IS NOT NULL AND i.overflow_resolved_at IS NULL
+      OR r.state = 'unknown' AND r.reason_code = 'amount_overflow'), false) AS overflow
+  FROM usage_reservations r JOIN inference_runs i ON i.id = r.inference_run_id
+  """
+
   @max_bigint 9_223_372_036_854_775_807
 
   @doc "Price trusted whole input tokens using a frozen rational nano-USD rate."
@@ -656,35 +664,48 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
 
   @doc "Read exact aggregate exposure and configured fixture caps for a current admin."
   def staff_exposure(staff) do
-    VoelgoedAi.Accounts.StaffAccess.with_current(staff, :admin, fn _ ->
-      dates = dates(DateTime.utc_now())
+    alias VoelgoedAi.Accounts.StaffAccess
 
-      with {:ok, control} <- VoelgoedAi.Support.Configuration.lock_control(),
-           {:ok, outstanding} <- exposure(control),
-           {:ok, %{rows: [[day, month]]}} <-
-             SQL.query(
-               Repo,
-               """
-               SELECT
-                 COALESCE((SELECT settled_nano_usd FROM spend_windows WHERE kind = 'day' AND window_start = $1), 0),
-                 COALESCE((SELECT settled_nano_usd FROM spend_windows WHERE kind = 'month' AND window_start = $2), 0)
-               """,
-               [dates.day_window, dates.month_window],
-               timeout: 750,
-               telemetry_event: nil
-             ) do
+    with {:ok, :authorized} <- StaffAccess.require_role(staff, :admin),
+         result <- staff_totals(dates(DateTime.utc_now())),
+         {:ok, :authorized} <- StaffAccess.require_role(staff, :admin) do
+      result
+    end
+  end
+
+  defp staff_totals(dates) do
+    # A single MVCC snapshot keeps the totals consistent without holding
+    # either the staff or the automation row while accounting tables are busy.
+    case SQL.query(
+           Repo,
+           """
+           SELECT
+             COALESCE((SELECT settled_nano_usd FROM spend_windows WHERE kind = 'day' AND window_start = $1), 0),
+             COALESCE((SELECT settled_nano_usd FROM spend_windows WHERE kind = 'month' AND window_start = $2), 0),
+             exposure.outstanding, exposure.overflow OR
+               (c.embedding_inhibited AND c.embedding_inhibit_occurrence IS NULL) OR
+               (c.generation_inhibited AND c.generation_inhibit_occurrence IS NULL)
+           FROM automation_controls c CROSS JOIN (#{@exposure_query}) exposure
+           WHERE c.singleton
+           """,
+           [dates.day_window, dates.month_window],
+           timeout: 750,
+           log: false,
+           telemetry_event: nil
+         ) do
+      {:ok, %{rows: [[day, month, outstanding, false]]}} ->
         {:ok,
          %{
            day: day,
            month: month,
-           outstanding: outstanding,
-           generation_caps: VoelgoedAi.Intelligence.Generation.configured_caps(),
-           embedding_caps: VoelgoedAi.Intelligence.Embedding.configured_caps()
+           outstanding: String.to_integer(outstanding),
+           generation_caps: Generation.configured_caps(),
+           embedding_caps: Embedding.configured_caps()
          }}
-      else
-        _ -> {:error, :unavailable}
-      end
-    end)
+
+      _ ->
+        {:error, :unavailable}
+    end
   end
 
   defp exposure(%{embedding_inhibited: true, embedding_inhibit_occurrence: nil}),
@@ -694,13 +715,7 @@ defmodule VoelgoedAi.Governance.EmbeddingAccounting do
     do: {:error, :unclassified_inhibit}
 
   defp exposure(_control) do
-    case SQL.query(Repo, """
-         SELECT COALESCE(sum(r.reserved_nano_usd::numeric)
-           FILTER (WHERE r.state IN ('reserved', 'unknown')), 0)::text,
-           COALESCE(bool_or(i.overflow_evidence IS NOT NULL AND i.overflow_resolved_at IS NULL
-             OR r.state = 'unknown' AND r.reason_code = 'amount_overflow'), false)
-         FROM usage_reservations r JOIN inference_runs i ON i.id = r.inference_run_id
-         """) do
+    case SQL.query(Repo, @exposure_query) do
       {:ok, %{rows: [[total, false]]}} -> {:ok, String.to_integer(total)}
       {:ok, %{rows: [[_, true]]}} -> {:error, :amount_overflow}
       {:error, _} -> {:error, :accounting_storage}

@@ -16,18 +16,37 @@ defmodule VoelgoedAi.Support.Operations do
   def snapshot(staff, selected) do
     readiness = Readiness.check()
 
-    with {:ok, data} <-
+    with {:ok, {admin, operator?}} <-
            StaffAccess.with_current(staff, nil, fn row ->
              with true <- :admin in row.roles or :support_operator in row.roles,
-                  {:ok, admin} <- admin(staff, :admin in row.roles, readiness),
-                  {:ok, operator} <- operator(staff, :support_operator in row.roles, selected) do
-               {:ok, %{admin: admin, operator: operator}}
+                  {:ok, admin} <- admin(staff, :admin in row.roles, readiness) do
+               {:ok, {admin, :support_operator in row.roles}}
              else
                false -> {:error, :denied}
                error -> error
              end
-           end) do
+           end),
+         {:ok, data} <- operator_snapshot(staff, admin, operator?, selected) do
       attach_spend(staff, data)
+    end
+  end
+
+  defp operator_snapshot(_, admin, false, _),
+    do: {:ok, %{admin: admin, operator: nil, operator_unavailable: false}}
+
+  defp operator_snapshot(staff, admin, true, selected) do
+    case StaffAccess.with_current(staff, :support_operator, fn _ -> operator(staff, selected) end) do
+      {:ok, operator} ->
+        {:ok, %{admin: admin, operator: operator, operator_unavailable: false}}
+
+      {:error, :denied} = error ->
+        error
+
+      {:error, _} when not is_nil(admin) ->
+        {:ok, %{admin: admin, operator: nil, operator_unavailable: true}}
+
+      error ->
+        error
     end
   end
 
@@ -111,9 +130,7 @@ defmodule VoelgoedAi.Support.Operations do
     defp binding_history(staff, configuration),
       do: history(staff, :inbox_binding, configuration.binding_id)
 
-    defp operator(_, false, _), do: {:ok, nil}
-
-    defp operator(staff, true, selected) do
+    defp operator(staff, selected) do
       with %{} = fixture <- ChatwootAdapter.fixture(),
            {:ok, config} <- Configuration.lock_inbox(inbox(fixture)),
            {:ok, rows} <- queue(config.binding.id),
@@ -244,9 +261,8 @@ defmodule VoelgoedAi.Support.Operations do
   else
     defp configuration, do: {:ok, nil}
     defp binding_history(_, _), do: {:ok, []}
-    defp operator(_, false, _), do: {:ok, nil}
 
-    defp operator(_, true, _),
+    defp operator(_, _),
       do: {:ok, %{rows: [], detail: nil, alerts: [], available: false, detail_denied: false}}
   end
 end

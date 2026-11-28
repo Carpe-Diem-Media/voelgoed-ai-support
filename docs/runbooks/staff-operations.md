@@ -18,7 +18,9 @@ rules. VGAS-28 supplies the purge and replay rules.
   exposure includes all reserved and UNKNOWN holds. The cap labels identify
   the generation and embedding configurations that supply those values.
   Disable automation stays available when the separately authorized
-  accounting read reports unavailable totals.
+  accounting read reports unavailable totals. Spend uses a single
+  read-only snapshot with a 750 ms deadline. It holds neither the staff
+  row nor the automation row while reading accounting tables.
 - A current support operator can inspect the qualified queue, delivery
   uncertainty and local attention history. Open a session by the internal
   reference in the queue. An unavailable session can indicate that the
@@ -26,6 +28,8 @@ rules. VGAS-28 supplies the purge and replay rules.
   their own route and socket grants. The operations stylesheet requires a
   current operations grant. PostgreSQL limits each queue projection query
   to 750 ms. If a query times out, the page reports that it could not load.
+  Staff with both grants retain the admin controls while the queue is
+  unavailable. The disable action checks the current admin grant again.
   Use **Refresh** after database contention clears.
 - To route locally, use **Route to staff locally**. This fences unsent work,
   advances the ownership epoch and records one audit and one terminal status

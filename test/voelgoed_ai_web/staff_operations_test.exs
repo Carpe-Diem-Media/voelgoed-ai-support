@@ -11,6 +11,7 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
   alias Ecto.Adapters.SQL
   alias VoelgoedAi.{Accounts, StaffEntraFixture, StaffFixtures}
   alias VoelgoedAi.{Repo, SupportDBCase}
+  alias VoelgoedAi.Governance.EmbeddingAccounting
 
   setup do
     StaffFixtures.setup()
@@ -121,13 +122,110 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
     assert {:ok, view, _} = live(page)
     assert has_element?(view, "h2", "Support queue")
 
+    with_locked_table("support_alert_episodes", fn ->
+      started_at = System.monotonic_time(:millisecond)
+      render_click(view, "refresh", %{})
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert has_element?(
+               view,
+               "[role=status]",
+               "The operations page could not load. Try Refresh."
+             )
+
+      assert elapsed < 3_000
+    end)
+
+    render_click(view, "refresh", %{})
+    assert has_element?(view, "h2", "Support queue")
+    refute has_element?(view, "[role=status]", "The operations page could not load. Try Refresh.")
+  end
+
+  test "a blocked accounting read times out without blocking the same admin from disabling" do
+    support = SupportDBCase.setup()
+    admin = support.admin
+
+    with_locked_table("usage_reservations", fn ->
+      projection = Task.async(fn -> EmbeddingAccounting.staff_exposure(admin) end)
+
+      try do
+        assert accounting_waiting?()
+
+        assert {:ok, _} =
+                 SQL.query(
+                   Repo,
+                   "SELECT id FROM automation_controls WHERE singleton FOR UPDATE NOWAIT"
+                 )
+
+        SupportDBCase.disable_automation(support)
+        assert {:error, :unavailable} = Task.await(projection, 3_000)
+
+        assert %{rows: [["disabled"]]} =
+                 SQL.query!(Repo, "SELECT status FROM automation_controls")
+      after
+        Task.shutdown(projection, :brutal_kill)
+      end
+    end)
+  end
+
+  test "a queue timeout leaves Disable automation available for dual-role staff" do
+    %{admin: admin, operator: operator} = SupportDBCase.setup()
+    assert {:ok, _} = Accounts.set_roles(admin, operator.id, [:admin, :support_operator])
+    assert {:ok, staff} = StaffFixtures.authenticate(operator.id)
+
+    on_exit(fn ->
+      SQL.query!(
+        Repo,
+        """
+        DELETE FROM audit_events
+        WHERE control_target_id IS NOT NULL AND actor_staff_id = $1 AND event = 'disable_automation'
+        """,
+        [Ecto.UUID.dump!(staff.id)]
+      )
+    end)
+
+    page = read_page(staff, "/staff/operations")
+    session = %{"staff" => {staff.id, staff.generation, staff.expiry, staff.binding}}
+    page = put_private(page, :live_view_connect_info, %{session: session})
+    assert {:ok, view, _} = live(page)
+    assert has_element?(view, "h2", "Support queue")
+    assert has_element?(view, "button[phx-click=disable]")
+
+    with_locked_table("support_alert_episodes", fn ->
+      render_click(view, "refresh", %{})
+      assert has_element?(view, "button[phx-click=disable]")
+      refute has_element?(view, "h2", "Support queue")
+      render_click(view, "disable", %{})
+      assert %{rows: [["disabled"]]} = SQL.query!(Repo, "SELECT status FROM automation_controls")
+    end)
+
+    render_click(view, "refresh", %{})
+    assert has_element?(view, "h2", "Support queue")
+  end
+
+  defp accounting_waiting? do
+    Enum.any?(1..75, fn _ ->
+      %{rows: [[waiting]]} =
+        SQL.query!(Repo, """
+        SELECT EXISTS (
+          SELECT 1 FROM pg_locks
+          WHERE relation = 'usage_reservations'::regclass AND NOT granted
+        )
+        """)
+
+      if not waiting, do: Process.sleep(10)
+      waiting
+    end)
+  end
+
+  defp with_locked_table(table, callback) do
     parent = self()
 
     holder =
       Task.async(fn ->
         Repo.transact(
           fn ->
-            SQL.query!(Repo, "LOCK TABLE support_alert_episodes IN ACCESS EXCLUSIVE MODE")
+            SQL.query!(Repo, "LOCK TABLE #{table} IN ACCESS EXCLUSIVE MODE")
             send(parent, :projection_locked)
 
             receive do
@@ -142,24 +240,10 @@ defmodule VoelgoedAiWeb.StaffOperationsTest do
 
     try do
       assert_receive :projection_locked, 3_000
-      started_at = System.monotonic_time(:millisecond)
-      render_click(view, "refresh", %{})
-      elapsed = System.monotonic_time(:millisecond) - started_at
-
-      assert has_element?(
-               view,
-               "[role=status]",
-               "The operations page could not load. Try Refresh."
-             )
-
-      assert elapsed < 3_000
+      callback.()
     after
       send(holder.pid, :release_projection)
       assert {:ok, :released} = Task.await(holder)
     end
-
-    render_click(view, "refresh", %{})
-    assert has_element?(view, "h2", "Support queue")
-    refute has_element?(view, "[role=status]", "The operations page could not load. Try Refresh.")
   end
 end

@@ -149,7 +149,10 @@ defmodule VoelgoedAiWeb.OperationsLive do
            socket.private[:operations_detail]
          ) do
       {:ok, data} ->
-        assign(socket, data: data, notice: nil, draft: nil)
+        notice =
+          if data.operator_unavailable, do: "The support queue could not load. Try Refresh."
+
+        assign(socket, data: data, notice: notice, draft: nil)
 
       {:error, :denied} ->
         deny(socket)
